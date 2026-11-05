@@ -7,8 +7,8 @@ require (
 	github.com/Masterminds/squirrel v1.5.4
 	github.com/Thunder-Compute/thunder-sdk v0.1.0
 	github.com/VictoriaMetrics/metrics v1.37.0
-	github.com/alicebob/miniredis/v2 v2.30.5
-	github.com/aws/aws-sdk-go-v2 v1.42.1
+	github.com/alicebob/miniredis/v2 v2.40.0
+	github.com/aws/aws-sdk-go-v2 v1.47.6
 	github.com/aws/aws-sdk-go-v2/config v1.32.17
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.17.58
@@ -187,7 +187,6 @@ require (
 	github.com/AdamKorcz/go-fuzz-headers v0.0.0-20210312213058-32f4d319f0d2 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
-	github.com/alicebob/gopher-json v0.0.0-20200520072559-a9ecdc9d1d3a // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/apex/log v1.4.0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.10 // indirect
@@ -202,7 +201,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.17 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.21 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1
-	github.com/aws/smithy-go v1.27.3
+	github.com/aws/smithy-go v1.28.8
 	github.com/beam-cloud/ristretto v0.0.0-20241013204426-d1403e359aa2
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bsm/redislock v0.9.4
@@ -210,7 +209,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
-	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
+	github.com/cyphar/filepath-securejoin v0.6.1
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa // indirect
 	github.com/deckarep/golang-set/v2 v2.8.0
@@ -265,7 +264,7 @@ require (
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/moby/sys/mountinfo v0.7.2
-	github.com/moby/sys/user v0.4.0 // indirect
+	github.com/moby/sys/user v0.4.0
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -299,7 +298,7 @@ require (
 	github.com/valyala/histogram v1.2.0 // indirect
 	github.com/vbatts/go-mtree v0.5.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	github.com/yuin/gopher-lua v1.1.0 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
