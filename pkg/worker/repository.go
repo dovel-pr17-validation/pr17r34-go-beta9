@@ -1,0 +1,124 @@
+package worker
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	common "github.com/beam-cloud/beta9/pkg/common"
+	types "github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+)
+
+const (
+	defaultGRPCMaxRetries = 3
+	defaultGRPCRetryDelay = time.Second
+	// gRPC client keepalive: actively ping the gateway so a connection broken by
+	// a gateway rollout or load-balancer idle timeout is detected and replaced,
+	// instead of leaving RPCs to hang until their deadline. Time must be >= the
+	// gateway's keepalive EnforcementPolicy MinTime to avoid "too_many_pings".
+	grpcClientKeepaliveTime    = 20 * time.Second
+	grpcClientKeepaliveTimeout = 10 * time.Second
+)
+
+// NewWorkerRepositoryClient creates a new worker repository client
+func NewWorkerRepositoryClient(ctx context.Context, config types.AppConfig, token string) (pb.WorkerRepositoryServiceClient, error) {
+	conn, err := newRepositoryConn(config, token)
+	if err != nil {
+		return nil, err
+	}
+
+	return pb.NewWorkerRepositoryServiceClient(conn), nil
+}
+
+// NewContainerRepositoryClient creates a new container repository client
+func NewContainerRepositoryClient(ctx context.Context, config types.AppConfig, token string) (pb.ContainerRepositoryServiceClient, error) {
+	conn, err := newRepositoryConn(config, token)
+	if err != nil {
+		return nil, err
+	}
+
+	return pb.NewContainerRepositoryServiceClient(conn), nil
+}
+
+// NewBackendRepositoryClient creates a new backend repository client
+func NewBackendRepositoryClient(ctx context.Context, config types.AppConfig, token string) (pb.BackendRepositoryServiceClient, error) {
+	conn, err := newRepositoryConn(config, token)
+	if err != nil {
+		return nil, err
+	}
+
+	return pb.NewBackendRepositoryServiceClient(conn), nil
+}
+
+// NewThunderServiceClient creates a new Thunder service client.
+func NewThunderServiceClient(ctx context.Context, config types.AppConfig, token string) (pb.ThunderServiceClient, error) {
+	conn, err := newRepositoryConn(config, token)
+	if err != nil {
+		return nil, err
+	}
+
+	return pb.NewThunderServiceClient(conn), nil
+}
+
+func newRepositoryConn(config types.AppConfig, token string) (*grpc.ClientConn, error) {
+	host := fmt.Sprintf("%s:%d", config.GatewayService.GRPC.ExternalHost, config.GatewayService.GRPC.ExternalPort)
+	return newGRPCConn(host, token)
+}
+
+// newGRPCConn creates a new gRPC connection (with or without TLS/Auth) to the provided host
+func newGRPCConn(host string, token string) (*grpc.ClientConn, error) {
+	creds := insecure.NewCredentials()
+	if strings.HasSuffix(host, "443") {
+		creds = credentials.NewTLS(&tls.Config{NextProtos: []string{"h2"}})
+	}
+
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoff.Config{
+			BaseDelay: defaultGRPCRetryDelay, Multiplier: backoff.DefaultConfig.Multiplier,
+			Jitter: backoff.DefaultConfig.Jitter, MaxDelay: types.WorkerKeepAliveInterval,
+		}, MinConnectTimeout: grpcClientKeepaliveTimeout}),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                grpcClientKeepaliveTime,
+			Timeout:             grpcClientKeepaliveTimeout,
+			PermitWithoutStream: true,
+		}),
+	}
+
+	if token != "" {
+		opts = append(opts, grpc.WithChainUnaryInterceptor(
+			common.GRPCClientRetryInterceptor(defaultGRPCMaxRetries, defaultGRPCRetryDelay),
+			common.GRPCClientAuthInterceptor(token),
+		))
+		opts = append(opts, grpc.WithStreamInterceptor(common.GRPCClientAuthStreamInterceptor(token)))
+	} else {
+		opts = append(opts, grpc.WithUnaryInterceptor(common.GRPCClientRetryInterceptor(defaultGRPCMaxRetries, defaultGRPCRetryDelay)))
+	}
+
+	return grpc.Dial(host, opts...)
+}
+
+// handleGRPCResponse handles a repository gRPC response and returns the response & an error if the response is not Ok
+func handleGRPCResponse[T interface {
+	GetOk() bool
+	GetErrorMsg() string
+}](response T, err error) (T, error) {
+	if err != nil {
+		return response, err
+	}
+
+	if !response.GetOk() {
+		return response, errors.New(response.GetErrorMsg())
+	}
+
+	return response, nil
+}

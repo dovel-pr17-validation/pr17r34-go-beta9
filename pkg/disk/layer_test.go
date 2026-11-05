@@ -1,0 +1,381 @@
+package disk
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	mathrand "math/rand/v2"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/types"
+)
+
+type memoryChunkStore struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func newMemoryChunkStore() *memoryChunkStore {
+	return &memoryChunkStore{objects: make(map[string][]byte)}
+}
+
+func (s *memoryChunkStore) WriteChunk(_ context.Context, key string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[key] = append([]byte(nil), data...)
+	return nil
+}
+
+func (s *memoryChunkStore) ReadChunk(_ context.Context, chunk types.DiskSnapshotChunk, dest []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, ok := s.objects[chunk.ObjectKey]
+	if !ok {
+		return fmt.Errorf("missing chunk %s", chunk.ObjectKey)
+	}
+	copy(dest, data)
+	return nil
+}
+
+func chunkKey(digest string) string {
+	return "chunks/" + digest
+}
+
+func TestUploadLayerRejectsTruncatedSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "layer.qcow2")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{1}, 64<<10), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := ScanLayer(context.Background(), path, chunkKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 1); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryChunkStore()
+	if err := UploadLayer(context.Background(), store, path, layer); !errors.Is(err, io.EOF) {
+		t.Fatalf("truncated layer must fail before upload, got %v", err)
+	}
+	if len(store.objects) != 0 {
+		t.Fatal("uploaded a partial chunk under the original content hash")
+	}
+}
+
+func TestSplitExtentRejectsTruncatedSource(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "layer.qcow2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := file.Truncate(chunkMinSize + 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := splitExtent(context.Background(), file, make([]byte, 4096), 0, chunkMinSize+4096); !errors.Is(err, io.EOF) {
+		t.Fatalf("truncated extent must fail, got %v", err)
+	}
+}
+
+type discardChunkSink struct{}
+
+func (discardChunkSink) WriteChunk(context.Context, string, []byte) error { return nil }
+
+func BenchmarkLayerScanUpload(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "layer.qcow2")
+	data := make([]byte, 64<<20)
+	mathrand.NewChaCha8([32]byte{'l', 'a', 'y', 'e', 'r'}).Read(data)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		layer, err := ScanLayer(context.Background(), path, chunkKey)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := UploadLayer(context.Background(), discardChunkSink{}, path, layer); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestLayerScanUploadFetchRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "layer.qcow2")
+
+	// Sparse layout: data at the start, a large hole, data in the middle of a
+	// chunk boundary, an explicit all-zero chunk, then a tail.
+	file, err := os.Create(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := make([]byte, 3000)
+	middle := make([]byte, LayerChunkSize/2)
+	tail := make([]byte, 12345)
+	rand.Read(head)
+	rand.Read(middle)
+	rand.Read(tail)
+	writeAt := func(data []byte, offset int64) {
+		if _, err := file.WriteAt(data, offset); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeAt(head, 0)
+	writeAt(middle, 10*LayerChunkSize+512)
+	writeAt(make([]byte, LayerChunkSize), 20*LayerChunkSize) // explicit zeros
+	writeAt(tail, 30*LayerChunkSize)
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	layer, err := ScanLayer(context.Background(), sourcePath, chunkKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layer.Chunks) == 0 {
+		t.Fatal("expected chunks")
+	}
+	for i, chunk := range layer.Chunks {
+		if chunk.OffsetBytes >= 20*LayerChunkSize && chunk.OffsetBytes < 21*LayerChunkSize {
+			t.Fatalf("all-zero chunk at %d was not skipped", chunk.OffsetBytes)
+		}
+		// The parallel scan must keep chunks offset-ordered and densely indexed.
+		if chunk.Index != int64(i) {
+			t.Fatalf("chunk %d has index %d", i, chunk.Index)
+		}
+		if i > 0 && chunk.OffsetBytes <= layer.Chunks[i-1].OffsetBytes {
+			t.Fatalf("chunks out of order at %d", i)
+		}
+	}
+
+	store := newMemoryChunkStore()
+	if err := UploadLayer(context.Background(), store, sourcePath, layer); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.objects) != len(layer.Chunks) {
+		t.Fatalf("uploaded %d objects, expected %d", len(store.objects), len(layer.Chunks))
+	}
+
+	destPath := filepath.Join(dir, "restored.qcow2")
+	if err := fetchLayer(context.Background(), store, layer, destPath, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(source, restored) {
+		t.Fatal("restored layer differs from source")
+	}
+}
+
+// Content-defined boundaries must survive shifts: a flatten relocates
+// unchanged disk content within the qcow2 file, and publish dedup relies on
+// those bytes keeping their chunk hashes.
+//
+// The gear hash's low chunkMeanMask bits depend on the last 22 bytes only,
+// so a shifted stream re-finds its boundaries as soon as one boundary
+// re-aligns. What delays that is the max-size clamp: with a 4 MiB mean and
+// 8 MiB max, ~17% of chunks are cut at chunkMaxSize (exp(-7/4)), and a
+// clamped cut is relative to the chunk start, not the content, so it
+// carries a misalignment into the next chunk. Only the run of chunks from
+// the insertion point to the first re-aligned boundary may differ; with
+// unseeded data that run is geometric and ~8% of the time long enough to
+// drop dedup below 3/4, so the input is seeded to keep the test stable.
+func TestScanLayerChunksSurviveContentShift(t *testing.T) {
+	dir := t.TempDir()
+	rng := mathrand.NewChaCha8([32]byte{'l', 'a', 'y', 'e', 'r', '-', 's', 'h', 'i', 'f', 't'})
+	base := make([]byte, 64<<20)
+	rng.Read(base)
+	pathA := filepath.Join(dir, "a.qcow2")
+	if err := os.WriteFile(pathA, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert 64 KiB at 8 MiB, shifting everything after it.
+	const insertAt = 8 << 20
+	inserted := make([]byte, 64<<10)
+	rng.Read(inserted)
+	shifted := append(append(append([]byte{}, base[:insertAt]...), inserted...), base[insertAt:]...)
+	pathB := filepath.Join(dir, "b.qcow2")
+	if err := os.WriteFile(pathB, shifted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	layerA, err := ScanLayer(context.Background(), pathA, chunkKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layerB, err := ScanLayer(context.Background(), pathB, chunkKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	digestsA := map[string]bool{}
+	for _, chunk := range layerA.Chunks {
+		digestsA[chunk.Digest] = true
+	}
+	// The chunks that miss must be one contiguous run starting at the chunk
+	// holding the insertion: everything before it is untouched, and once a
+	// boundary re-aligns every later boundary is content-defined from it.
+	var sharedBytes, totalBytes int64
+	firstMiss, lastMiss := -1, -1
+	for i, chunk := range layerB.Chunks {
+		totalBytes += chunk.SizeBytes
+		if digestsA[chunk.Digest] {
+			sharedBytes += chunk.SizeBytes
+			continue
+		}
+		if firstMiss == -1 {
+			firstMiss = i
+		} else if i != lastMiss+1 {
+			t.Fatalf("chunk %d at %d lost dedup after boundaries re-aligned at chunk %d", i, chunk.OffsetBytes, lastMiss+1)
+		}
+		lastMiss = i
+	}
+	if firstMiss == -1 {
+		t.Fatal("the chunk holding the inserted bytes cannot dedup")
+	}
+	if first := layerB.Chunks[firstMiss]; first.OffsetBytes > insertAt || first.OffsetBytes+first.SizeBytes <= insertAt {
+		t.Fatalf("chunk %d at %d lost dedup before the insertion at %d", firstMiss, first.OffsetBytes, insertAt)
+	}
+	// Each max-size clamp carries the shift one chunk further; with the seed
+	// above the missing run is short (logged for reference).
+	t.Logf("%d of %d bytes dedup after a 64KiB shift; %d chunks re-cut", sharedBytes, totalBytes, lastMiss-firstMiss+1)
+	if sharedBytes < totalBytes*3/4 {
+		t.Fatalf("only %d of %d bytes dedup after a 64KiB shift", sharedBytes, totalBytes)
+	}
+
+	// Chunk sizes must respect the configured bounds.
+	for _, chunk := range layerB.Chunks {
+		if chunk.SizeBytes > chunkMaxSize {
+			t.Fatalf("chunk of %d bytes exceeds the max", chunk.SizeBytes)
+		}
+	}
+}
+
+// blockingChunkStore records peak concurrent ReadChunk calls.
+type blockingChunkStore struct {
+	*memoryChunkStore
+	mu       sync.Mutex
+	inflight int
+	peak     int
+	entered  chan struct{}
+	release  <-chan struct{}
+}
+
+func (s *blockingChunkStore) ReadChunk(ctx context.Context, chunk types.DiskSnapshotChunk, dest []byte) error {
+	s.mu.Lock()
+	s.inflight++
+	if s.inflight > s.peak {
+		s.peak = s.inflight
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.inflight--
+		s.mu.Unlock()
+	}()
+	if s.entered != nil {
+		s.entered <- struct{}{}
+	}
+	if s.release != nil {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.memoryChunkStore.ReadChunk(ctx, chunk, dest)
+}
+
+func TestFetchLayerSharesChunkGateAcrossIndependentRestores(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	var workers sync.WaitGroup
+	dir := t.TempDir()
+	t.Cleanup(func() { cancel(); unblock(); workers.Wait() })
+	source := filepath.Join(dir, "source")
+	if err := os.WriteFile(source, []byte("chunk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := ScanLayer(ctx, source, chunkKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &blockingChunkStore{memoryChunkStore: newMemoryChunkStore(), entered: make(chan struct{}, 33), release: release}
+	if err := UploadLayer(ctx, store, source, layer); err != nil {
+		t.Fatal(err)
+	}
+	errors := make(chan error, 33)
+	for i := range 33 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			errors <- fetchLayer(ctx, store, layer, filepath.Join(dir, fmt.Sprint(i)), nil)
+		}()
+	}
+	for range 32 {
+		select {
+		case <-store.entered:
+		case <-ctx.Done():
+			t.Fatal("restores did not fill the 32-chunk budget")
+		}
+	}
+	select {
+	case <-store.entered:
+		t.Fatal("independent restore exceeded the shared 32-chunk budget")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unblock()
+	for range 33 {
+		if err := <-errors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFetchLayerRejectsCorruptChunks(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "layer.qcow2")
+	data := make([]byte, 5000)
+	rand.Read(data)
+	if err := os.WriteFile(sourcePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	layer, err := ScanLayer(context.Background(), sourcePath, chunkKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryChunkStore()
+	if err := UploadLayer(context.Background(), store, sourcePath, layer); err != nil {
+		t.Fatal(err)
+	}
+	for key := range store.objects {
+		store.objects[key][0] ^= 0xff
+	}
+
+	destPath := filepath.Join(dir, "restored.qcow2")
+	if err := fetchLayer(context.Background(), store, layer, destPath, nil); err == nil {
+		t.Fatal("expected digest mismatch error")
+	}
+	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		t.Fatal("corrupt fetch must not leave a layer file behind")
+	}
+}

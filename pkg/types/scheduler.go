@@ -1,0 +1,1267 @@
+package types
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/runtime/microvm"
+	pb "github.com/beam-cloud/beta9/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+const (
+	DefaultServeContainerTimeout = time.Minute * 10
+	DefaultCPUWorkerPoolName     = "default"
+	ContainerRuntimeTokenEnv     = "BETA9_TOKEN"
+)
+
+type WorkerStatus string
+
+const (
+	WorkerStatusAvailable WorkerStatus = "available"
+	WorkerStatusPending   WorkerStatus = "pending"
+	WorkerStatusDisabled  WorkerStatus = "disabled"
+	WorkerStateTtlS       int          = 60
+)
+
+const (
+	DefaultRuncStartConcurrency   int   = 32
+	DefaultGvisorStartConcurrency int   = 32
+	RuncStartConcurrencyPerCPU    int64 = 2
+	GvisorStartConcurrencyPerCPU  int64 = 4
+)
+
+const (
+	StubStateDegraded = "degraded"
+	StubStateWarning  = "warning"
+	StubStateHealthy  = "healthy"
+)
+
+type ContainerRequestStatus string
+type ContainerSchedulingFailureReason string
+
+const (
+	ContainerRequestStatusFailed ContainerRequestStatus = "failed"
+	ContainerRequestStatusTTL                           = 10 * time.Minute
+
+	ContainerSchedulingFailureBacklogPushFailed               ContainerSchedulingFailureReason = "backlog_push_failed"
+	ContainerSchedulingFailureNoController                    ContainerSchedulingFailureReason = "no_controller"
+	ContainerSchedulingFailureWorkerCapacityTimeout           ContainerSchedulingFailureReason = "worker_capacity_timeout"
+	ContainerSchedulingFailureProvisioningLimit               ContainerSchedulingFailureReason = "worker_provisioning_limit"
+	ContainerSchedulingFailureRetryLimit                      ContainerSchedulingFailureReason = "retry_limit"
+	ContainerSchedulingFailureManagedFallbackConcurrencyLimit ContainerSchedulingFailureReason = "managed_fallback_concurrency_limit"
+	ContainerSchedulingFailureManagedFallbackNoCapacity       ContainerSchedulingFailureReason = "managed_fallback_no_capacity"
+	// ContainerSchedulingFailureNoOpportunisticCapacity is reported when an
+	// OpportunisticOnly request finds no idle worker; it never waits or
+	// provisions.
+	ContainerSchedulingFailureNoOpportunisticCapacity ContainerSchedulingFailureReason = "no_opportunistic_capacity"
+)
+
+// @go2proto
+type Worker struct {
+	Id                   string       `json:"id" redis:"id"`
+	Status               WorkerStatus `json:"status" redis:"status"`
+	TotalCpu             int64        `json:"total_cpu" redis:"total_cpu"`
+	TotalMemory          int64        `json:"total_memory" redis:"total_memory"`
+	TotalGpuCount        uint32       `json:"total_gpu_count" redis:"total_gpu_count"`
+	FreeCpu              int64        `json:"free_cpu" redis:"free_cpu"`
+	FreeMemory           int64        `json:"free_memory" redis:"free_memory"`
+	FreeGpuCount         uint32       `json:"free_gpu_count" redis:"gpu_count"`
+	Gpu                  string       `json:"gpu" redis:"gpu"`
+	PoolName             string       `json:"pool_name" redis:"pool_name"`
+	MachineId            string       `json:"machine_id" redis:"machine_id"`
+	ResourceVersion      int64        `json:"resource_version" redis:"resource_version"`
+	RequiresPoolSelector bool         `json:"requires_pool_selector" redis:"requires_pool_selector"`
+	Priority             int32        `json:"priority" redis:"priority"`
+	Preemptable          bool         `json:"preemptable" redis:"preemptable"`
+	BuildVersion         string       `json:"build_version" redis:"build_version"`
+	ActiveContainers     []Container  `json:"active_containers" redis:"active_containers"`
+	Runtime              string       `json:"runtime" redis:"runtime"`
+	PoolSelector         string       `json:"pool_selector" redis:"pool_selector"`
+	// CordonRequested records explicit operator intent. Disabled workers without
+	// this flag may be recovered automatically after a transient failure.
+	CordonRequested bool `json:"cordon_requested" redis:"cordon_requested"`
+	// RolloutGeneration gates readiness while an agent worker is being replaced.
+	RolloutGeneration   string `json:"rollout_generation" redis:"rollout_generation"`
+	RolloutBuildVersion string `json:"rollout_build_version" redis:"-"`
+	WorkerImageOverride string `json:"worker_image_override" redis:"worker_image_override"`
+	// Evictable* is the share of used capacity held by evictable containers
+	// (managed endpoint replicas). Non-evictable requests may claim it; the
+	// scheduler stops the holders first.
+	EvictableCpu        int64  `json:"evictable_cpu" redis:"evictable_cpu"`
+	EvictableMemory     int64  `json:"evictable_memory" redis:"evictable_memory"`
+	EvictableGpuCount   uint32 `json:"evictable_gpu_count" redis:"evictable_gpu_count"`
+	WorkspaceId         string `json:"-" redis:"workspace_id" go2proto:"ignore"`
+	ControlPlaneManaged bool   `json:"-" redis:"control_plane_managed" go2proto:"ignore"`
+	// Keep internal fields after wire fields: go2proto numbers by struct position.
+	RolloutPreviousStatus      WorkerStatus `json:"-" redis:"rollout_previous_status" go2proto:"ignore"`
+	CheckpointCompatibilityKey string       `json:"-" redis:"checkpoint_compatibility_key" go2proto:"ignore"`
+}
+
+type WorkerKeepAlive struct {
+	MachineId                  string `json:"machine_id"`
+	CheckpointCompatibilityKey string `json:"checkpoint_compatibility_key"`
+}
+
+func StableStorageNodeID(machineID, workerID string) string {
+	if machineID = strings.TrimSpace(machineID); machineID != "" {
+		return machineID
+	}
+	return strings.TrimSpace(workerID)
+}
+
+func (w *Worker) ToProto() *pb.Worker {
+	containers := make([]*pb.Container, len(w.ActiveContainers))
+	for i, c := range w.ActiveContainers {
+		containers[i] = c.ToProto()
+	}
+
+	return &pb.Worker{
+		Id:                   w.Id,
+		Status:               string(w.Status),
+		TotalCpu:             w.TotalCpu,
+		TotalMemory:          w.TotalMemory,
+		TotalGpuCount:        w.TotalGpuCount,
+		FreeCpu:              w.FreeCpu,
+		FreeMemory:           w.FreeMemory,
+		FreeGpuCount:         w.FreeGpuCount,
+		EvictableCpu:         w.EvictableCpu,
+		EvictableMemory:      w.EvictableMemory,
+		EvictableGpuCount:    w.EvictableGpuCount,
+		Gpu:                  w.Gpu,
+		PoolName:             w.PoolName,
+		MachineId:            w.MachineId,
+		ResourceVersion:      w.ResourceVersion,
+		RequiresPoolSelector: w.RequiresPoolSelector,
+		Priority:             w.Priority,
+		Preemptable:          w.Preemptable,
+		BuildVersion:         w.BuildVersion,
+		ActiveContainers:     containers,
+		Runtime:              w.Runtime,
+		PoolSelector:         w.PoolSelector,
+		CordonRequested:      w.CordonRequested,
+		RolloutGeneration:    w.RolloutGeneration,
+		RolloutBuildVersion:  w.RolloutBuildVersion,
+		WorkerImageOverride:  w.WorkerImageOverride,
+	}
+}
+
+func NewWorkerFromProto(in *pb.Worker) *Worker {
+	containers := make([]Container, len(in.ActiveContainers))
+	for i, c := range in.ActiveContainers {
+		containers[i] = *NewContainerFromProto(c)
+	}
+
+	return &Worker{
+		Id:                   in.Id,
+		Status:               WorkerStatus(in.Status),
+		TotalCpu:             in.TotalCpu,
+		TotalMemory:          in.TotalMemory,
+		TotalGpuCount:        in.TotalGpuCount,
+		FreeCpu:              in.FreeCpu,
+		FreeMemory:           in.FreeMemory,
+		FreeGpuCount:         in.FreeGpuCount,
+		EvictableCpu:         in.EvictableCpu,
+		EvictableMemory:      in.EvictableMemory,
+		EvictableGpuCount:    in.EvictableGpuCount,
+		Gpu:                  in.Gpu,
+		PoolName:             in.PoolName,
+		MachineId:            in.MachineId,
+		ResourceVersion:      in.ResourceVersion,
+		RequiresPoolSelector: in.RequiresPoolSelector,
+		Priority:             in.Priority,
+		Preemptable:          in.Preemptable,
+		BuildVersion:         in.BuildVersion,
+		ActiveContainers:     containers,
+		Runtime:              in.Runtime,
+		PoolSelector:         in.PoolSelector,
+		CordonRequested:      in.CordonRequested,
+		RolloutGeneration:    in.RolloutGeneration,
+		RolloutBuildVersion:  in.RolloutBuildVersion,
+		WorkerImageOverride:  in.WorkerImageOverride,
+	}
+}
+
+type CapacityUpdateType int
+
+const (
+	AddCapacity CapacityUpdateType = iota
+	RemoveCapacity
+)
+
+const maxCPUShareMultiplier CPUShareMultiplier = 16
+
+// CPUShareMultiplier is the number of vCPUs a pool schedules per physical CPU,
+// where zero means 1. CPU limits, memory and billing stay physical.
+type CPUShareMultiplier float64
+
+func (m CPUShareMultiplier) Validate() error {
+	if m == 0 || (m >= 1 && m <= maxCPUShareMultiplier && float64(m) == float64(m.hundredths())/100) {
+		return nil
+	}
+	return fmt.Errorf("cpu share multiplier must be between 1 and %g with at most two decimals, got %g", float64(maxCPUShareMultiplier), float64(m))
+}
+
+// Schedulable converts physical CPU millicores into schedulable millicores.
+func (m CPUShareMultiplier) Schedulable(physical int64) int64 {
+	return physical * m.hundredths() / 100
+}
+
+func (m CPUShareMultiplier) hundredths() int64 {
+	if !(m >= 1 && m <= maxCPUShareMultiplier) {
+		return 100
+	}
+	return int64(math.Round(float64(m) * 100))
+}
+
+type ContainerStatus string
+
+const (
+	ContainerStatusPending  ContainerStatus = "PENDING"
+	ContainerStatusRunning  ContainerStatus = "RUNNING"
+	ContainerStatusStopping ContainerStatus = "STOPPING"
+)
+
+type ContainerAlreadyScheduledError struct {
+	Msg string
+}
+
+func (e *ContainerAlreadyScheduledError) Error() string {
+	return e.Msg
+}
+
+// @go2proto
+type ContainerState struct {
+	ContainerId string          `redis:"container_id" json:"container_id"`
+	StubId      string          `redis:"stub_id" json:"stub_id"`
+	Status      ContainerStatus `redis:"status" json:"status"`
+	ScheduledAt int64           `redis:"scheduled_at" json:"scheduled_at"`
+	WorkspaceId string          `redis:"workspace_id" json:"workspace_id"`
+	Gpu         string          `redis:"gpu" json:"gpu"`
+	GpuCount    uint32          `redis:"gpu_count" json:"gpu_count"`
+	Cpu         int64           `redis:"cpu" json:"cpu"`
+	Memory      int64           `redis:"memory" json:"memory"`
+	StartedAt   int64           `redis:"started_at" json:"started_at"`
+	WorkerId    string          `redis:"worker_id" json:"worker_id"`
+	MachineId   string          `redis:"machine_id" json:"machine_id"`
+	// Evictable mirrors ContainerRequest.Evictable: the scheduler may stop
+	// this container to place a non-evictable request.
+	Evictable bool `redis:"evictable" json:"evictable,omitempty"`
+	// Evicting is set once the scheduler has picked this container as a
+	// victim; its resources are no longer counted as held.
+	Evicting     bool   `redis:"evicting" json:"evicting,omitempty"`
+	DrainSeconds uint32 `redis:"drain_seconds" json:"drain_seconds,omitempty"`
+	EvictOrder   int32  `redis:"evict_order" json:"evict_order,omitempty"`
+}
+
+// @go2proto
+type Container struct {
+	ContainerId  string          `redis:"container_id" json:"container_id"`
+	StubId       string          `redis:"stub_id" json:"stub_id"`
+	Status       ContainerStatus `redis:"status" json:"status"`
+	ScheduledAt  time.Time       `redis:"scheduled_at" json:"scheduled_at"`
+	StartedAt    time.Time       `redis:"started_at" json:"started_at"`
+	WorkspaceId  string          `redis:"workspace_id" json:"workspace_id"`
+	WorkerId     string          `redis:"worker_id" json:"worker_id"`
+	MachineId    string          `redis:"machine_id" json:"machine_id"`
+	DeploymentId string          `redis:"deployment_id" json:"deployment_id"`
+}
+
+func (c *Container) ToProto() *pb.Container {
+	return &pb.Container{
+		ContainerId:  c.ContainerId,
+		StubId:       c.StubId,
+		Status:       string(c.Status),
+		ScheduledAt:  timestamppb.New(c.ScheduledAt),
+		StartedAt:    timestamppb.New(c.StartedAt),
+		WorkspaceId:  c.WorkspaceId,
+		WorkerId:     c.WorkerId,
+		MachineId:    c.MachineId,
+		DeploymentId: c.DeploymentId,
+	}
+}
+
+func NewContainerFromProto(in *pb.Container) *Container {
+	return &Container{
+		ContainerId: in.ContainerId,
+		StubId:      in.StubId,
+		Status:      ContainerStatus(in.Status),
+		ScheduledAt: in.ScheduledAt.AsTime(),
+		StartedAt:   in.StartedAt.AsTime(),
+		WorkspaceId: in.WorkspaceId,
+		WorkerId:    in.WorkerId,
+		MachineId:   in.MachineId,
+	}
+}
+
+// @go2proto
+type BuildOptions struct {
+	SourceImage      *string    `json:"source_image"`
+	Dockerfile       *string    `json:"dockerfile"`
+	BuildCtxObject   *string    `json:"build_context"`
+	SourceImageCreds string     `json:"source_image_creds"`
+	BuildSecrets     []string   `json:"build_secrets"`
+	GitSource        *GitSource `json:"git_source,omitempty"`
+}
+
+// GitSource builds an image from a git repository: the build worker clones
+// it as the build context and uses its Dockerfile, or generates one with
+// nixpacks when there is none.
+//
+// @go2proto
+type GitSource struct {
+	RepoURL        string `json:"repo_url"`
+	Ref            string `json:"ref"`
+	Commit         string `json:"commit"` // resolved by the gateway; the image id keys on it
+	Token          string `json:"token,omitempty"`
+	WorkingDir     string `json:"working_dir,omitempty"`
+	DockerfilePath string `json:"dockerfile_path,omitempty"`
+	StartCommand   string `json:"start_command,omitempty"`
+	BuildCommand   string `json:"build_command,omitempty"`
+	Dockerfile     string `json:"dockerfile,omitempty"` // built in the checkout ahead of any Dockerfile in it
+}
+
+func (g *GitSource) ToProto() *pb.GitSource {
+	if g == nil {
+		return nil
+	}
+	return &pb.GitSource{
+		RepoUrl:        g.RepoURL,
+		Ref:            g.Ref,
+		Commit:         g.Commit,
+		Token:          g.Token,
+		WorkingDir:     g.WorkingDir,
+		DockerfilePath: g.DockerfilePath,
+		StartCommand:   g.StartCommand,
+		BuildCommand:   g.BuildCommand,
+		Dockerfile:     g.Dockerfile,
+	}
+}
+
+func NewGitSourceFromProto(in *pb.GitSource) *GitSource {
+	if in == nil {
+		return nil
+	}
+	return &GitSource{
+		RepoURL:        in.RepoUrl,
+		Ref:            in.Ref,
+		Commit:         in.Commit,
+		Token:          in.Token,
+		WorkingDir:     in.WorkingDir,
+		DockerfilePath: in.DockerfilePath,
+		StartCommand:   in.StartCommand,
+		BuildCommand:   in.BuildCommand,
+		Dockerfile:     in.Dockerfile,
+	}
+}
+
+// SecretBinding stays on the worker; only its placeholder enters the guest.
+// @go2proto
+type SecretBinding struct {
+	EnvName     string   `json:"env_name"`
+	Placeholder string   `json:"placeholder"`
+	Hosts       []string `json:"hosts"`
+	Value       string   `json:"value,omitempty"`
+	SecretName  string   `json:"secret_name"`
+}
+
+// @go2proto
+type ContainerRequest struct {
+	ContainerId              string          `json:"container_id"`
+	EntryPoint               []string        `json:"entry_point"`
+	Env                      []string        `json:"env"`
+	Cpu                      int64           `json:"cpu"`
+	Memory                   int64           `json:"memory"`
+	Gpu                      string          `json:"gpu"`
+	GpuRequest               []string        `json:"gpu_request"`
+	GpuCount                 uint32          `json:"gpu_count"`
+	ImageId                  string          `json:"image_id"`
+	StubId                   string          `json:"stub_id"`
+	WorkspaceId              string          `json:"workspace_id"`
+	Workspace                Workspace       `json:"workspace"`
+	Stub                     StubWithRelated `json:"stub"`
+	Timestamp                time.Time       `json:"timestamp"`
+	Mounts                   []Mount         `json:"mounts"`
+	RetryCount               int             `json:"retry_count"`
+	PoolSelector             string          `json:"pool_selector"`
+	Preemptable              bool            `json:"preemptable"`
+	CheckpointEnabled        bool            `json:"checkpoint_enabled"`
+	BuildOptions             BuildOptions    `json:"build_options"`
+	Ports                    []uint32        `json:"ports"`
+	CostPerMs                float64         `json:"cost_per_ms"`
+	AppId                    string          `json:"app_id"`
+	Checkpoint               *Checkpoint     `json:"checkpoint"`
+	ConfigPath               string          `json:"config_path"`
+	ImageCredentials         string          `json:"image_credentials"`
+	BuildRegistryCredentials string          `json:"build_registry_credentials"`
+	BlockNetwork             bool            `json:"block_network"`
+	AllowList                []string        `json:"allow_list"`
+	DockerEnabled            bool            `json:"docker_enabled"` // Enable Docker-in-Docker
+	RuntimeSecretNames       []string        `json:"runtime_secret_names,omitempty"`
+	RuntimeTokenRequired     bool            `json:"runtime_token_required,omitempty"`
+	// Proto field 33 was allow_marketplace. go2proto numbers fields by struct
+	// position, so this blank keeps the wire numbering of everything below it.
+	_ struct{}
+	// MachineId pins scheduling to a single agent machine; empty means any
+	// machine. The scheduler fills it in after placement on agent pools.
+	MachineId         string             `json:"machine_id,omitempty"`
+	CheckpointTrigger *CheckpointTrigger `json:"checkpoint_trigger,omitempty"`
+	TaskId            string             `json:"task_id,omitempty"`
+	DeliveryToken     string             `json:"-" go2proto:"ignore"`
+	// Hostname preserved across checkpoint and restore.
+	Hostname             string `json:"hostname,omitempty"`
+	ProvisioningAttempts int    `json:"provisioning_attempts,omitempty" go2proto:"ignore"`
+	// Evictable marks a container that the scheduler may stop to make room for
+	// a non-evictable request (managed endpoint replicas).
+	Evictable bool `json:"evictable,omitempty"`
+	// OpportunisticOnly restricts placement to capacity that is already free:
+	// the request never triggers pool scale-up or provisioning.
+	OpportunisticOnly bool `json:"opportunistic_only,omitempty"`
+	// EvictContainerIds lists evictable containers the worker must stop before
+	// starting this one. Set by the scheduler, never by callers.
+	EvictContainerIds []string `json:"evict_container_ids,omitempty"`
+	// EvictDrainSeconds is how long the worker lets the victims in
+	// EvictContainerIds drain after SIGTERM before killing them. Set by the
+	// scheduler from the victims' own DrainSeconds.
+	EvictDrainSeconds uint32 `json:"evict_drain_seconds,omitempty"`
+	// DrainSeconds is the grace this container gets to finish in-flight work
+	// when it is evicted. Only meaningful with Evictable.
+	DrainSeconds uint32 `json:"drain_seconds,omitempty"`
+	// EvictOrder ranks evictable containers on a worker: lower values are
+	// evicted first. Ties fall to the most recently started container.
+	EvictOrder int32 `json:"evict_order,omitempty"`
+	// UseVM asks for a microvm pool: the sandbox boots in its own virtual
+	// machine. Only such requests are ever scheduled onto microvm workers, and
+	// they never fall back to a container runtime.
+	UseVM          bool            `json:"use_vm,omitempty"`
+	SecretBindings []SecretBinding `json:"secret_bindings,omitempty"`
+}
+
+// @go2proto
+type CheckpointTrigger struct {
+	Type            string `json:"type,omitempty"`
+	HttpPath        string `json:"http_path,omitempty"`
+	HttpPort        uint32 `json:"http_port,omitempty"`
+	TimeoutSeconds  uint32 `json:"timeout_seconds,omitempty"`
+	IntervalSeconds uint32 `json:"interval_seconds,omitempty"`
+}
+
+func (t *CheckpointTrigger) ToProto() *pb.CheckpointTrigger {
+	if t == nil {
+		return nil
+	}
+	return &pb.CheckpointTrigger{
+		Type:            t.Type,
+		HttpPath:        t.HttpPath,
+		HttpPort:        t.HttpPort,
+		TimeoutSeconds:  t.TimeoutSeconds,
+		IntervalSeconds: t.IntervalSeconds,
+	}
+}
+
+func NewCheckpointTriggerFromProto(in *pb.CheckpointTrigger) *CheckpointTrigger {
+	if in == nil {
+		return nil
+	}
+	return &CheckpointTrigger{
+		Type:            in.Type,
+		HttpPath:        in.HttpPath,
+		HttpPort:        in.HttpPort,
+		TimeoutSeconds:  in.TimeoutSeconds,
+		IntervalSeconds: in.IntervalSeconds,
+	}
+}
+
+type ContainerNetworkPolicy string
+
+const (
+	ContainerNetworkPolicyOpen      ContainerNetworkPolicy = "open"
+	ContainerNetworkPolicyBlock     ContainerNetworkPolicy = "block"
+	ContainerNetworkPolicyAllowList ContainerNetworkPolicy = "allowlist"
+)
+
+func (c *ContainerRequest) RequiresGPU() bool {
+	for _, gpu := range c.GpuRequest {
+		if gpu != "" && gpu != string(NO_GPU) {
+			return true
+		}
+	}
+	return c.Gpu != "" && c.Gpu != string(NO_GPU)
+}
+
+// Keyless GPU restores can use idle capacity, but cannot evict workloads
+// before the runtime has validated their compatibility.
+func (c *ContainerRequest) MayEvict() bool {
+	if c == nil || c.Evictable || c.OpportunisticOnly {
+		return false
+	}
+	if c.Stub.Type.IsDeployment() || !c.RequiresGPU() {
+		return true
+	}
+	checkpoint := c.Checkpoint
+	return checkpoint == nil || checkpoint.Status != string(CheckpointStatusAvailable) ||
+		checkpoint.IsFilesystemOnly() || checkpoint.CompatibilityKey != ""
+}
+
+func WorkerStartConcurrencyForPool(poolConfig WorkerPoolConfig, globalRuntime, runtimeType string, workerCPU int64) int {
+	if runtimeType == "" {
+		runtimeType = poolConfig.ContainerRuntime
+	}
+	if runtimeType == "" {
+		runtimeType = globalRuntime
+	}
+	if runtimeType == "" {
+		runtimeType = ContainerRuntimeRunc.String()
+	}
+
+	limit := DefaultRuncStartConcurrency
+	perCPU := RuncStartConcurrencyPerCPU
+	if runtimeType == ContainerRuntimeGvisor.String() {
+		limit = DefaultGvisorStartConcurrency
+		perCPU = GvisorStartConcurrencyPerCPU
+	}
+	if poolConfig.ContainerStartConcurrency > 0 {
+		limit = poolConfig.ContainerStartConcurrency
+	}
+
+	if workerCPU <= 0 {
+		return limit
+	}
+
+	maxStarts := int((workerCPU*perCPU + 999) / 1000)
+	if maxStarts < 1 {
+		maxStarts = 1
+	}
+	if limit > maxStarts {
+		return maxStarts
+	}
+	return limit
+}
+
+func WorkerStartConcurrency(workerConfig WorkerConfig, worker *Worker) int {
+	if worker == nil {
+		return DefaultRuncStartConcurrency
+	}
+
+	poolConfig := workerConfig.Pools[worker.PoolName]
+	return WorkerStartConcurrencyForPool(poolConfig, workerConfig.ContainerRuntime, worker.Runtime, worker.TotalCpu)
+}
+
+// CapacityMemory includes runtime overhead in MiB without changing the
+// requested application budget. Native VMs reserve their control RAM and VMM.
+func (c *ContainerRequest) CapacityMemory() int64 {
+	if c.Memory <= 0 {
+		return c.Memory
+	}
+	memory := (c.Memory*125 + 99) / 100
+	if c.UseVM {
+		guest := (c.Memory + (microvm.GuestMemoryHeadroom >> 20) + 1) / 2 * 2
+		memory = max(memory, guest+(microvm.HostMemoryHeadroom>>20))
+	}
+	return memory
+}
+
+// IsBuildRequest reports whether the request builds a container image.
+func (c *ContainerRequest) IsBuildRequest() bool {
+	return c.BuildOptions.SourceImage != nil || c.BuildOptions.Dockerfile != nil || c.BuildOptions.GitSource != nil
+}
+
+func (c *ContainerRequest) VolumeCacheCompatible() bool {
+	if c.IsBuildRequest() || c.CheckpointEnabled || c.StorageAvailable() {
+		return false
+	}
+	return c.Workspace.VolumeCacheEnabled
+}
+
+func (c *ContainerRequest) StorageAvailable() bool {
+	return c.Workspace.StorageAvailable()
+}
+
+func (c *ContainerRequest) NetworkPolicy() ContainerNetworkPolicy {
+	if c == nil {
+		return ContainerNetworkPolicyOpen
+	}
+	if len(c.EgressAllowList()) > 0 {
+		return ContainerNetworkPolicyAllowList
+	}
+	if c.BlockNetwork {
+		return ContainerNetworkPolicyBlock
+	}
+	return ContainerNetworkPolicyOpen
+}
+
+func (c *ContainerRequest) EgressAllowList() []string {
+	if len(c.AllowList) > 0 || !c.BlockNetwork {
+		return c.AllowList
+	}
+	var hosts []string
+	for _, binding := range c.SecretBindings {
+		hosts = append(hosts, binding.Hosts...)
+	}
+	return uniqueStrings(hosts)
+}
+
+func (c *ContainerRequest) NetworkRestricted() bool {
+	return c.NetworkPolicy() != ContainerNetworkPolicyOpen
+}
+
+func (c *ContainerRequest) HasDurableDiskMount() bool {
+	if c == nil {
+		return false
+	}
+	for _, mount := range c.Mounts {
+		if mount.MountType == StorageModeDurableDisk || mount.DurableDisk != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ContainerRequest) Clone() *ContainerRequest {
+	if c == nil {
+		return nil
+	}
+
+	cloned := *c
+	cloned.EntryPoint = append([]string(nil), c.EntryPoint...)
+	cloned.Env = append([]string(nil), c.Env...)
+	cloned.GpuRequest = append([]string(nil), c.GpuRequest...)
+	cloned.Mounts = cloneMounts(c.Mounts)
+	cloned.Ports = append([]uint32(nil), c.Ports...)
+	cloned.AllowList = append([]string(nil), c.AllowList...)
+	cloned.BuildOptions.BuildSecrets = append([]string(nil), c.BuildOptions.BuildSecrets...)
+	if c.BuildOptions.GitSource != nil {
+		gitSource := *c.BuildOptions.GitSource
+		cloned.BuildOptions.GitSource = &gitSource
+	}
+	cloned.SecretBindings = CloneSecretBindings(c.SecretBindings)
+	cloned.RuntimeSecretNames = append([]string(nil), c.RuntimeSecretNames...)
+	return &cloned
+}
+
+func (c *ContainerRequest) PrivateWorkerRequest() *ContainerRequest {
+	request := c.Clone()
+	if request == nil {
+		return nil
+	}
+
+	secretNames := c.runtimeSecretNames()
+	tokenRequired := c.runtimeTokenRequired()
+
+	for i := range request.SecretBindings {
+		request.SecretBindings[i].Value = ""
+	}
+	request.RuntimeSecretNames = secretNames
+	request.RuntimeTokenRequired = tokenRequired
+	request.Workspace = request.Workspace.WithoutPrivateCredentials()
+	request.Env = c.privateWorkerEnv(secretNames, tokenRequired)
+	request.Mounts = request.privateWorkerMounts()
+	request.ImageCredentials = ""
+	request.BuildRegistryCredentials = ""
+	request.BuildOptions.SourceImageCreds = ""
+	request.BuildOptions.BuildSecrets = nil
+	if request.BuildOptions.GitSource != nil {
+		request.BuildOptions.GitSource.Token = ""
+	}
+	return request
+}
+
+func (c *ContainerRequest) privateWorkerEnv(secretNames []string, tokenRequired bool) []string {
+	if c == nil {
+		return nil
+	}
+
+	secretNameSet := stringSet(secretNames)
+	env := make([]string, 0, len(c.Env))
+	for _, item := range c.Env {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			env = append(env, item)
+			continue
+		}
+		if tokenRequired && key == ContainerRuntimeTokenEnv {
+			continue
+		}
+		brokered := false
+		for _, binding := range c.SecretBindings {
+			if key == binding.EnvName {
+				brokered = true
+				break
+			}
+		}
+		if _, ok := secretNameSet[key]; ok && !brokered {
+			continue
+		}
+		env = append(env, item)
+	}
+	return env
+}
+
+func (c *ContainerRequest) runtimeSecretNames() []string {
+	if len(c.RuntimeSecretNames) > 0 {
+		return uniqueStrings(c.RuntimeSecretNames)
+	}
+
+	names := make([]string, 0)
+	if c.Stub.Config != "" {
+		if stubConfig, err := c.Stub.UnmarshalConfig(); err == nil && stubConfig != nil {
+			for _, secret := range stubConfig.Secrets {
+				if secret.Name != "" {
+					names = append(names, secret.Name)
+				}
+			}
+		}
+	}
+	return uniqueStrings(names)
+}
+
+func (c *ContainerRequest) runtimeTokenRequired() bool {
+	// An explicitly bound token is a workspace secret, not a runtime token.
+	if c.Stub.Type.IsSandbox() {
+		if config, err := c.Stub.UnmarshalConfig(); err == nil && config != nil {
+			for _, secret := range config.Secrets {
+				if secret.EnvVarName() == ContainerRuntimeTokenEnv {
+					return false
+				}
+			}
+		}
+	}
+	if c.RuntimeTokenRequired {
+		return true
+	}
+	for _, item := range c.Env {
+		key, _, ok := strings.Cut(item, "=")
+		if ok && key == ContainerRuntimeTokenEnv {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	return set
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func (c *ContainerRequest) privateWorkerMounts() []Mount {
+	mounts := cloneMounts(c.Mounts)
+	for i := range mounts {
+		if mounts[i].MountPointConfig == nil {
+			continue
+		}
+		config := mounts[i].MountPointConfig.WithoutCredentials()
+		mounts[i].MountPointConfig = &config
+	}
+	return mounts
+}
+
+func (c *ContainerRequest) ToProto() *pb.ContainerRequest {
+	mounts := make([]*pb.Mount, len(c.Mounts))
+	for i, m := range c.Mounts {
+		mounts[i] = m.ToProto()
+	}
+
+	var buildOptions *pb.BuildOptions
+	if c.IsBuildRequest() {
+		sourceImage := getStringOrDefault(c.BuildOptions.SourceImage)
+		dockerfile := getStringOrDefault(c.BuildOptions.Dockerfile)
+		buildCtxObject := getStringOrDefault(c.BuildOptions.BuildCtxObject)
+
+		buildOptions = &pb.BuildOptions{
+			SourceImage:      sourceImage,
+			Dockerfile:       dockerfile,
+			BuildCtxObject:   buildCtxObject,
+			SourceImageCreds: c.BuildOptions.SourceImageCreds,
+			BuildSecrets:     c.BuildOptions.BuildSecrets,
+			GitSource:        c.BuildOptions.GitSource.ToProto(),
+		}
+	}
+
+	var checkpoint *pb.Checkpoint
+	if c.Checkpoint != nil {
+		checkpoint = c.Checkpoint.ToProto()
+	}
+
+	return &pb.ContainerRequest{
+		ContainerId:              c.ContainerId,
+		EntryPoint:               c.EntryPoint,
+		Env:                      c.Env,
+		Cpu:                      c.Cpu,
+		Memory:                   c.Memory,
+		Gpu:                      c.Gpu,
+		GpuRequest:               c.GpuRequest,
+		GpuCount:                 c.GpuCount,
+		ImageId:                  c.ImageId,
+		Mounts:                   mounts,
+		StubId:                   c.StubId,
+		TaskId:                   c.TaskId,
+		AppId:                    c.AppId,
+		WorkspaceId:              c.WorkspaceId,
+		Workspace:                c.Workspace.ToProto(),
+		Stub:                     c.Stub.ToProto(),
+		RetryCount:               int64(c.RetryCount),
+		PoolSelector:             c.PoolSelector,
+		Preemptable:              c.Preemptable,
+		Timestamp:                timestamppb.New(c.Timestamp),
+		BuildOptions:             buildOptions,
+		ImageCredentials:         c.ImageCredentials,
+		Ports:                    c.Ports,
+		CheckpointEnabled:        c.CheckpointEnabled,
+		Checkpoint:               checkpoint,
+		BuildRegistryCredentials: c.BuildRegistryCredentials,
+		BlockNetwork:             c.BlockNetwork,
+		AllowList:                c.AllowList,
+		DockerEnabled:            c.DockerEnabled,
+		MachineId:                c.MachineId,
+		RuntimeSecretNames:       c.RuntimeSecretNames,
+		RuntimeTokenRequired:     c.RuntimeTokenRequired,
+		CheckpointTrigger:        c.CheckpointTrigger.ToProto(),
+		Hostname:                 c.Hostname,
+		Evictable:                c.Evictable,
+		OpportunisticOnly:        c.OpportunisticOnly,
+		EvictContainerIds:        c.EvictContainerIds,
+		EvictDrainSeconds:        c.EvictDrainSeconds,
+		DrainSeconds:             c.DrainSeconds,
+		EvictOrder:               c.EvictOrder,
+		UseVm:                    c.UseVM,
+		SecretBindings:           SecretBindingsToProto(c.SecretBindings),
+	}
+}
+
+func NewContainerRequestFromProto(in *pb.ContainerRequest) *ContainerRequest {
+	mounts := make([]Mount, len(in.Mounts))
+	for i, m := range in.Mounts {
+		mounts[i] = *NewMountFromProto(m)
+	}
+
+	var bo BuildOptions
+	if in.BuildOptions != nil {
+		bo = BuildOptions{
+			SourceImage:      getPointerOrNil(in.BuildOptions.SourceImage),
+			Dockerfile:       getPointerOrNil(in.BuildOptions.Dockerfile),
+			BuildCtxObject:   getPointerOrNil(in.BuildOptions.BuildCtxObject),
+			SourceImageCreds: in.BuildOptions.SourceImageCreds,
+			BuildSecrets:     in.BuildOptions.BuildSecrets,
+			GitSource:        NewGitSourceFromProto(in.BuildOptions.GitSource),
+		}
+	}
+
+	var checkpoint *Checkpoint
+	if in.Checkpoint != nil {
+		checkpoint = NewCheckpointFromProto(in.Checkpoint)
+	}
+
+	return &ContainerRequest{
+		ContainerId:              in.ContainerId,
+		EntryPoint:               in.EntryPoint,
+		Env:                      in.Env,
+		Cpu:                      in.Cpu,
+		Memory:                   in.Memory,
+		Gpu:                      in.Gpu,
+		GpuRequest:               in.GpuRequest,
+		GpuCount:                 in.GpuCount,
+		ImageId:                  in.ImageId,
+		Mounts:                   mounts,
+		WorkspaceId:              in.WorkspaceId,
+		AppId:                    in.AppId,
+		Workspace:                *NewWorkspaceFromProto(in.Workspace),
+		Stub:                     *NewStubWithRelatedFromProto(in.Stub),
+		StubId:                   in.StubId,
+		TaskId:                   in.TaskId,
+		Timestamp:                in.GetTimestamp().AsTime(),
+		RetryCount:               int(in.RetryCount),
+		CheckpointEnabled:        in.CheckpointEnabled,
+		Preemptable:              in.Preemptable,
+		PoolSelector:             in.PoolSelector,
+		BuildOptions:             bo,
+		ImageCredentials:         in.ImageCredentials,
+		Ports:                    in.Ports,
+		Checkpoint:               checkpoint,
+		BuildRegistryCredentials: in.BuildRegistryCredentials,
+		BlockNetwork:             in.BlockNetwork,
+		AllowList:                in.AllowList,
+		DockerEnabled:            in.DockerEnabled,
+		MachineId:                in.MachineId,
+		RuntimeSecretNames:       in.RuntimeSecretNames,
+		RuntimeTokenRequired:     in.RuntimeTokenRequired,
+		CheckpointTrigger:        NewCheckpointTriggerFromProto(in.CheckpointTrigger),
+		Hostname:                 in.Hostname,
+		Evictable:                in.Evictable,
+		OpportunisticOnly:        in.OpportunisticOnly,
+		EvictContainerIds:        in.EvictContainerIds,
+		EvictDrainSeconds:        in.EvictDrainSeconds,
+		DrainSeconds:             in.DrainSeconds,
+		EvictOrder:               in.EvictOrder,
+		UseVM:                    in.UseVm,
+		SecretBindings:           SecretBindingsFromProto(in.SecretBindings),
+	}
+}
+
+func getPointerOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func getStringOrDefault(s *string) string {
+	if s != nil {
+		return *s
+	}
+	return ""
+}
+
+func cloneMounts(mounts []Mount) []Mount {
+	out := append([]Mount(nil), mounts...)
+	for i := range out {
+		if out[i].MountPointConfig == nil {
+			continue
+		}
+		config := *out[i].MountPointConfig
+		out[i].MountPointConfig = &config
+	}
+	return out
+}
+
+const (
+	ContainerExitCodeTTL       = 5 * time.Minute
+	ContainerFailureHistoryTTL = time.Hour
+	ContainerFailureCooldown   = time.Minute
+)
+
+const (
+	ContainerDurationEmissionInterval      time.Duration = 5 * time.Second
+	ContainerResourceUsageEmissionInterval time.Duration = 3 * time.Second
+)
+const ContainerStateTtlSWhilePending int64 = 1800
+const ContainerStateTtlSWhileStopping int64 = 300
+const ContainerStateTtlS int64 = 120
+
+// Managed endpoint processes are long-lived and report engine liveness through
+// their controller. Keep their ownership record across a bounded gateway outage;
+// explicit stops still use the ordinary STOPPING lease and finalization barrier.
+const ContainerStateTtlSManagedEndpoint int64 = 1800
+const WorkspaceQuotaTtlS int64 = 600
+
+const containerStateNotFoundPrefix = "container state not found: "
+
+type ErrContainerStateNotFound struct {
+	ContainerId string
+}
+
+func (e *ErrContainerStateNotFound) Error() string {
+	return fmt.Sprintf("%s%s", containerStateNotFoundPrefix, e.ContainerId)
+}
+
+func (e *ErrContainerStateNotFound) From(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if strings.HasPrefix(err.Error(), containerStateNotFoundPrefix) {
+		e.ContainerId = strings.TrimPrefix(err.Error(), containerStateNotFoundPrefix)
+		return true
+	}
+
+	return false
+}
+
+type ErrInvalidWorkerStatus struct {
+}
+
+func (e *ErrInvalidWorkerStatus) Error() string {
+	return "invalid worker status"
+}
+
+type ErrNoSuitableWorkerFound struct {
+}
+
+func (e *ErrNoSuitableWorkerFound) Error() string {
+	return "no suitable worker found for request"
+}
+
+const workerNotFoundPrefix = "worker not found: "
+
+type ErrWorkerNotFound struct {
+	WorkerId string
+}
+
+func (e *ErrWorkerNotFound) Error() string {
+	return fmt.Sprintf("%s%s", workerNotFoundPrefix, e.WorkerId)
+}
+
+func (e *ErrWorkerNotFound) From(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if strings.HasPrefix(err.Error(), workerNotFoundPrefix) {
+		e.WorkerId = strings.TrimPrefix(err.Error(), workerNotFoundPrefix)
+		return true
+	}
+
+	return false
+}
+
+const workerPoolStateNotFoundPrefix = "worker pool state not found: "
+
+type ErrWorkerPoolStateNotFound struct {
+	PoolName string
+}
+
+func (e *ErrWorkerPoolStateNotFound) Error() string {
+	return fmt.Sprintf("%s%s", workerPoolStateNotFoundPrefix, e.PoolName)
+}
+
+func (e *ErrWorkerPoolStateNotFound) From(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if strings.HasPrefix(err.Error(), workerPoolStateNotFoundPrefix) {
+		e.PoolName = strings.TrimPrefix(err.Error(), workerPoolStateNotFoundPrefix)
+		return true
+	}
+
+	return false
+}
+
+// @go2proto
+type WorkerPoolState struct {
+	Status             WorkerPoolStatus `redis:"status" json:"status"`
+	SchedulingLatency  int64            `redis:"scheduling_latency" json:"scheduling_latency"`
+	FreeGpu            uint             `redis:"free_gpu" json:"free_gpu"`
+	FreeCpu            int64            `redis:"free_cpu" json:"free_cpu"`
+	FreeMemory         int64            `redis:"free_memory" json:"free_memory"`
+	PendingWorkers     int64            `redis:"pending_workers" json:"pending_workers"`
+	AvailableWorkers   int64            `redis:"available_workers" json:"available_workers"`
+	PendingContainers  int64            `redis:"pending_containers" json:"pending_containers"`
+	RunningContainers  int64            `redis:"running_containers" json:"running_containers"`
+	RegisteredMachines int64            `redis:"registered_machines" json:"registered_machines"`
+	PendingMachines    int64            `redis:"pending_machines" json:"pending_machines"`
+	ReadyMachines      int64            `redis:"ready_machines" json:"ready_machines"`
+}
+
+func (w *WorkerPoolState) ToProto() *pb.WorkerPoolState {
+	return &pb.WorkerPoolState{
+		Status:             string(w.Status),
+		SchedulingLatency:  w.SchedulingLatency,
+		FreeGpu:            uint32(w.FreeGpu),
+		FreeCpu:            w.FreeCpu,
+		FreeMemory:         w.FreeMemory,
+		PendingWorkers:     w.PendingWorkers,
+		AvailableWorkers:   w.AvailableWorkers,
+		PendingContainers:  w.PendingContainers,
+		RunningContainers:  w.RunningContainers,
+		RegisteredMachines: w.RegisteredMachines,
+		PendingMachines:    w.PendingMachines,
+	}
+}
+
+type WorkerPoolStatus string
+
+const (
+	WorkerPoolStatusHealthy  WorkerPoolStatus = "HEALTHY"
+	WorkerPoolStatusDegraded WorkerPoolStatus = "DEGRADED"
+)
+
+type WorkerPoolSizingConfig struct {
+	MinFreeCpu            int64
+	MinFreeMemory         int64
+	MinFreeGpu            uint
+	DefaultWorkerCpu      int64
+	DefaultWorkerMemory   int64
+	DefaultWorkerGpuType  string
+	DefaultWorkerGpuCount uint32
+}
+
+func NewWorkerPoolSizingConfig() *WorkerPoolSizingConfig {
+	return &WorkerPoolSizingConfig{
+		MinFreeCpu:            0,
+		MinFreeMemory:         0,
+		MinFreeGpu:            0,
+		DefaultWorkerCpu:      1000,
+		DefaultWorkerMemory:   1 * 1024, // 1Gi
+		DefaultWorkerGpuType:  "",
+		DefaultWorkerGpuCount: 0,
+	}
+}
+
+type ThrottledByConcurrencyLimitError struct {
+	Reason string
+}
+
+func (e *ThrottledByConcurrencyLimitError) Error() string {
+	return "concurrency_limit_reached: " + e.Reason
+}
+
+// InsufficientCreditsError is returned when a workspace has no prepaid credit
+// (or has been blocked by billing) and so may not run serverless workloads.
+type InsufficientCreditsError struct {
+	WorkspaceId string
+	Code        string
+	Reason      string
+}
+
+func (e *InsufficientCreditsError) Error() string {
+	code := e.Code
+	if code == "" {
+		code = "insufficient_credits"
+	}
+	if e.Reason == "" {
+		return code
+	}
+	return code + ": " + e.Reason
+}
+
+// CreditStatus is a workspace's prepaid-credit position as the gate sees it.
+type CreditStatus struct {
+	OK             bool   `json:"ok"`
+	AvailableCents int64  `json:"available_cents"`
+	RequiredCents  int64  `json:"required_cents"`
+	Code           string `json:"code,omitempty"`
+	Message        string `json:"message,omitempty"`
+}
+
+type QuotaDoesNotExistError struct{}
+
+func (e *QuotaDoesNotExistError) Error() string {
+	return "quota_does_not_exist"
+}
+
+type CheckpointStatus string
+
+const (
+	CheckpointStatusAvailable        CheckpointStatus = "available"
+	CheckpointStatusCheckpointFailed CheckpointStatus = "checkpoint_failed"
+	CheckpointStatusRestoreFailed    CheckpointStatus = "restore_failed"
+	CheckpointStatusNotFound         CheckpointStatus = "not_found"
+)
+
+type ErrCheckpointNotFound struct {
+	CheckpointId string
+}
+
+func (e *ErrCheckpointNotFound) Error() string {
+	return fmt.Sprintf("checkpoint state not found: %s", e.CheckpointId)
+}
+
+type StopContainerReason string
+
+const (
+	// StopContainerReasonTtl is used when a container is stopped due to some TTL expiration
+	StopContainerReasonTtl StopContainerReason = "TTL"
+	// StopContainerReasonUser is used when a container is stopped by a user request
+	StopContainerReasonUser StopContainerReason = "USER"
+	// StopContainerReasonScheduler is used when a container is stopped by the scheduler
+	StopContainerReasonScheduler StopContainerReason = "SCHEDULER"
+	// StopContainerReasonAdmin is used when a container is stopped by an admin request (i.e. draining a worker)
+	StopContainerReasonAdmin StopContainerReason = "ADMIN"
+	// StopContainerReasonInsufficientCredits is used when the scheduler stops a
+	// container because its workspace has run out of prepaid credit
+	StopContainerReasonInsufficientCredits StopContainerReason = "INSUFFICIENT_CREDITS"
+	// StopContainerReasonEvicted is used when the scheduler stops an evictable
+	// container to make room for a non-evictable request
+	StopContainerReasonEvicted StopContainerReason = "EVICTED"
+
+	StopContainerReasonUnknown StopContainerReason = "UNKNOWN"
+)
+
+type StopContainerArgs struct {
+	ContainerId string              `json:"container_id"`
+	Force       bool                `json:"force"`
+	Reason      StopContainerReason `json:"reason"`
+}
+
+// ExitCode returns the terminal code shared by assigned and pending stops.
+func (r StopContainerReason) ExitCode() (ContainerExitCode, bool) {
+	switch r {
+	case StopContainerReasonScheduler:
+		return ContainerExitCodeScheduler, true
+	case StopContainerReasonTtl:
+		return ContainerExitCodeTtl, true
+	case StopContainerReasonUser:
+		return ContainerExitCodeUser, true
+	case StopContainerReasonAdmin, StopContainerReasonInsufficientCredits:
+		return ContainerExitCodeAdmin, true
+	case StopContainerReasonEvicted:
+		return ContainerExitCodeEvicted, true
+	default:
+		return ContainerExitCodeSuccess, false
+	}
+}
+
+func (a StopContainerArgs) ToMap() (map[string]any, error) {
+	data, err := json.Marshal(a)
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func ToStopContainerArgs(m map[string]any) (*StopContainerArgs, error) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+
+	var result StopContainerArgs
+	if err = json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func SecretBindingsToProto(bindings []SecretBinding) []*pb.SecretBinding {
+	out := make([]*pb.SecretBinding, len(bindings))
+	for i, b := range bindings {
+		out[i] = &pb.SecretBinding{EnvName: b.EnvName, Placeholder: b.Placeholder, Hosts: b.Hosts, Value: b.Value, SecretName: b.SecretName}
+	}
+	return out
+}
+func SecretBindingsFromProto(bindings []*pb.SecretBinding) []SecretBinding {
+	out := make([]SecretBinding, len(bindings))
+	for i, b := range bindings {
+		out[i] = SecretBinding{EnvName: b.EnvName, Placeholder: b.Placeholder, Hosts: b.Hosts, Value: b.Value, SecretName: b.SecretName}
+	}
+	return out
+}
+
+func CloneSecretBindings(bindings []SecretBinding) []SecretBinding {
+	cloned := append([]SecretBinding(nil), bindings...)
+	for i := range cloned {
+		cloned[i].Hosts = append([]string(nil), cloned[i].Hosts...)
+	}
+	return cloned
+}

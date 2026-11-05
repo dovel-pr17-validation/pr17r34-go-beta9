@@ -1,0 +1,31 @@
+---
+apiVersion: builtin
+kind: HelmChartInflationGenerator
+metadata:
+  name: &name localstack
+releaseName: *name
+name: localstack
+repo: https://localstack.github.io/helm-charts
+version: 0.6.8
+namespace: beta9
+includeCRDs: true
+skipTests: true
+valuesInline:
+  image:
+    # The last release that runs without a LocalStack account; later releases
+    # need an auth token. Durable disks need S3 If-Match, added in 4.0.3.
+    tag: "4.14.0"
+  extraEnvVars:
+  - name: SERVICES
+    value: s3
+  enableStartupScripts: true
+  startupScriptContent: |
+    #!/bin/bash
+    awslocal s3 mb s3://logs
+    awslocal s3 mb s3://beta9-images
+  persistence:
+    enabled: true
+    storageClass: local-path
+    accessModes:
+    - ReadWriteOnce
+    size: 50Gi

@@ -1,0 +1,885 @@
+package disk
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeHost emulates the side effects of the external tools an attach drives:
+// the daemon writes its pidfile and sockets, nbd-client publishes the kernel's
+// connection state under sysfs, and everything else succeeds silently.
+type fakeHost struct {
+	sysBlock string
+	mu       sync.Mutex
+	commands []string
+}
+
+func (h *fakeHost) run(_ context.Context, name string, args ...string) ([]byte, error) {
+	h.mu.Lock()
+	h.commands = append(h.commands, name+" "+strings.Join(args, " "))
+	h.mu.Unlock()
+	switch name {
+	case "qemu-img":
+		if args[0] == "create" {
+			return nil, os.WriteFile(args[len(args)-2], []byte("qcow2-stub"), 0o600)
+		}
+		if args[0] == "convert" {
+			return nil, os.WriteFile(args[len(args)-1], []byte("qcow2-stub"), 0o600)
+		}
+	case "qemu-storage-daemon":
+		for i, arg := range args {
+			switch {
+			case arg == "--pidfile":
+				if err := os.WriteFile(args[i+1], []byte("4242\n"), 0o600); err != nil {
+					return nil, err
+				}
+			case strings.HasPrefix(arg, "socket,path="):
+				path := strings.SplitN(strings.TrimPrefix(arg, "socket,path="), ",", 2)[0]
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					return nil, err
+				}
+			case strings.HasPrefix(arg, "addr.type=unix,addr.path="):
+				if err := os.WriteFile(strings.TrimPrefix(arg, "addr.type=unix,addr.path="), nil, 0o600); err != nil {
+					return nil, err
+				}
+			case strings.HasPrefix(arg, "type=vhost-user-blk,"):
+				_, socket, ok := strings.Cut(arg, "addr.path=")
+				if ok {
+					socket, _, _ = strings.Cut(socket, ",")
+					if err := os.WriteFile(socket, nil, 0o600); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	case "nbd-client":
+		if args[0] == "-d" {
+			return nil, os.Remove(filepath.Join(h.sysBlock, filepath.Base(args[1]), "pid"))
+		}
+		device := filepath.Base(args[4])
+		if err := os.WriteFile(filepath.Join(h.sysBlock, device, "pid"), []byte("4243\n"), 0o644); err != nil {
+			return nil, err
+		}
+	case "mknod":
+		return nil, os.WriteFile(args[2], nil, 0o600)
+	case "stat":
+		return []byte("6180:2b:" + strings.TrimPrefix(filepath.Base(args[len(args)-1]), "nbd") + "\n"), nil
+	}
+	return nil, nil
+}
+
+func (h *fakeHost) ran(prefix string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var matches []string
+	for _, command := range h.commands {
+		if strings.HasPrefix(command, prefix) {
+			matches = append(matches, command)
+		}
+	}
+	return matches
+}
+
+const testSpareSize = int64(1 << 30)
+
+// newSpareTestManager exposes enough NBD devices for one attached volume and a
+// full spare pool on top of the device reserve.
+func newSpareTestManager(t *testing.T) (*Manager, *fakeHost) {
+	t.Helper()
+	return newSpareTestManagerWithDevices(t, spareDeviceReserve+spareTarget+2)
+}
+
+func newSpareTestManagerWithDevices(t *testing.T, devices int) (*Manager, *fakeHost) {
+	t.Helper()
+	// Unix socket paths are limited to ~104 bytes; keep the root short.
+	root, err := os.MkdirTemp("", "qd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	sysBlock, dev := filepath.Join(root, "sys"), filepath.Join(root, "dev")
+	for i := 0; i < devices; i++ {
+		name := "nbd" + strconv.Itoa(i)
+		writeTestNBDDevice(t, sysBlock, name, "43:"+strconv.Itoa(i))
+		if err := os.WriteFile(filepath.Join(sysBlock, name, "size"), []byte(strconv.FormatInt(testSpareSize/sectorSize, 10)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	host := &fakeHost{sysBlock: sysBlock}
+	manager := NewManager(Config{Root: filepath.Join(root, "r"), SysBlockPath: sysBlock, DevPath: dev, Runner: host.run})
+	return manager, host
+}
+
+func waitForSpares(t *testing.T, manager *Manager, size int64, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		got := len(manager.spares[size])
+		manager.mu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("spare pool did not reach %d volumes", want)
+}
+
+func TestAttachAdoptsSpareAndReplenishes(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	ctx := context.Background()
+	spare, err := manager.buildSpare(ctx, testSpareSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(host.ran("mkfs.ext4")) != 1 || len(host.ran("mount")) != 0 {
+		t.Fatalf("a spare must be formatted but not mounted: %v", host.commands)
+	}
+	manager.spares[testSpareSize] = []*Volume{spare}
+	spareKey, spareDir := spare.state.Key, spare.dir
+	realSpareDir, _ := filepath.EvalSymlinks(spareDir)
+
+	mountpoint := filepath.Join(manager.root, "mnt")
+	volume, err := manager.Attach(ctx, AttachSpec{Key: "disk", VirtualSizeBytes: testSpareSize, Mountpoint: mountpoint}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume != spare || volume.state.Key != "disk" || volume.Mountpoint() != mountpoint {
+		t.Fatalf("attach must hand out the rekeyed spare, got %+v", volume.state)
+	}
+	if got := host.ran("mount"); len(got) != 1 || !strings.Contains(got[0], mountpoint) {
+		t.Fatalf("adoption must mount once at %s, ran %v", mountpoint, got)
+	}
+	// The pool refill runs concurrently and connects its own devices, so only
+	// connects against the adopted volume's sockets count here.
+	var connects []string
+	for _, command := range host.ran("nbd-client -unix") {
+		if strings.Contains(command, manager.runtimeDir(spareKey)+"/") || strings.Contains(command, manager.runtimeDir("disk")+"/") {
+			connects = append(connects, command)
+		}
+	}
+	if len(connects) != 1 {
+		t.Fatalf("adoption must not connect a second device: %v", connects)
+	}
+	if target, err := filepath.EvalSymlinks(manager.volumeDir("disk")); err != nil || target != realSpareDir {
+		t.Fatalf("volumes/disk must index the spare directory %s, got %s (%v)", spareDir, target, err)
+	}
+	if fileExists(manager.runtimeDir(spareKey)) || !fileExists(filepath.Join(manager.runtimeDir("disk"), "qmp.sock")) {
+		t.Fatal("runtime directory must move under the adopted key")
+	}
+	saved, err := loadVolumeState(spareDir)
+	if err != nil || saved.Key != "disk" || !saved.Attached || saved.QMPSocket != volume.qsd.qmpSocket {
+		t.Fatalf("persisted state = %+v, %v", saved, err)
+	}
+
+	// The pool refills in the background, and a second attach reuses the
+	// adopted volume's state through the index instead of taking a spare.
+	waitForSpares(t, manager, testSpareSize, spareTarget)
+	if err := manager.Detach(ctx, "disk"); err != nil {
+		t.Fatal(err)
+	}
+	reattached, err := manager.Attach(ctx, AttachSpec{Key: "disk", VirtualSizeBytes: testSpareSize, Mountpoint: mountpoint}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reattached.dir != realSpareDir || reattached.state.HeadPath != saved.HeadPath {
+		t.Fatalf("re-attach must reuse the adopted directory, got %s", reattached.dir)
+	}
+	manager.mu.Lock()
+	remaining := len(manager.spares[testSpareSize])
+	manager.mu.Unlock()
+	if remaining != spareTarget {
+		t.Fatalf("re-attach must not consume a spare, pool = %d", remaining)
+	}
+	manager.destroySpares()
+}
+
+func TestAttachWithoutSpareBuildsFreshVolume(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	ctx := context.Background()
+	mountpoint := filepath.Join(manager.root, "mnt")
+	volume, err := manager.Attach(ctx, AttachSpec{Key: "disk", VirtualSizeBytes: testSpareSize, Mountpoint: mountpoint}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume.dir != manager.volumeDir("disk") || !volume.state.Formatted {
+		t.Fatalf("fresh attach must build in place, got %+v", volume.state)
+	}
+	// Spare replenishment runs mkfs concurrently, so count the disk's own image.
+	created := 0
+	for _, command := range host.ran("qemu-img create") {
+		if strings.Contains(command, manager.volumeDir("disk")) {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("fresh attach creates the volume image exactly once: %v", host.commands)
+	}
+	waitForSpares(t, manager, testSpareSize, spareTarget)
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if len(manager.spares[testSpareSize]) != 0 || !manager.closed {
+		t.Fatal("Close must destroy the spare pool")
+	}
+}
+
+func TestVMAdoptsFormattedSpareWithoutMountOrSecondFormat(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	ctx := context.Background()
+	spare, err := manager.buildSpare(ctx, testSpareSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.spares[testSpareSize] = []*Volume{spare}
+	// Keep background replenishment out of the formatting count.
+	manager.spareBuilds[testSpareSize] = true
+	head := spare.state.HeadPath
+	frozen := false
+	volume, err := manager.Attach(ctx, AttachSpec{Key: "vm-root", VirtualSizeBytes: testSpareSize,
+		Export: ExportVhostUser, Mountpoint: "/ignored-for-vm", Owner: "vm", Freeze: func(context.Context) (func(), error) {
+			frozen = true
+			return func() {}, nil
+		}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume != spare || volume.state.HeadPath != head || !volume.state.Formatted || volume.nbd != nil {
+		t.Fatal("VM must own the formatted spare head and release its NBD device")
+	}
+	if len(host.ran("mkfs.ext4")) != 1 || len(host.ran("mount")) != 0 || len(host.ran("nbd-client -d")) != 1 {
+		t.Fatalf("unexpected adoption commands: %v", host.commands)
+	}
+	if volume.ExportSocket() == "" || volume.state.exportMode() != ExportVhostUser || volume.owner != "vm" {
+		t.Fatalf("VM export not ready: %+v", volume.state)
+	}
+	if thaw, err := volume.quiesce(ctx); err != nil {
+		t.Fatal(err)
+	} else {
+		thaw()
+	}
+	if !frozen {
+		t.Fatal("adopted export lost its guest freeze hook")
+	}
+	saved, err := loadVolumeState(volume.dir)
+	if err != nil || saved.Key != "vm-root" || !saved.Attached || saved.ExportSocket == "" {
+		t.Fatalf("adoption was not persisted: %+v, %v", saved, err)
+	}
+	if err := manager.Detach(ctx, "vm-root"); err != nil {
+		t.Fatal(err)
+	}
+	reattached, err := manager.Attach(ctx, AttachSpec{Key: "vm-root", VirtualSizeBytes: testSpareSize, Export: ExportVhostUser}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reattached.state.HeadPath != head || len(host.ran("mkfs.ext4")) != 1 {
+		t.Fatal("reattach must retain the head and filesystem")
+	}
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func spareCount(manager *Manager, size int64) int {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	return len(manager.spares[size])
+}
+
+func TestAttachReclaimsSpareWhenDevicesExhausted(t *testing.T) {
+	// Spares hold every device. They are built directly because replenish
+	// would stop at the reserve.
+	manager, host := newSpareTestManagerWithDevices(t, spareTarget)
+	ctx := context.Background()
+	for i := 0; i < spareTarget; i++ {
+		spare, err := manager.buildSpare(ctx, testSpareSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager.spares[testSpareSize] = append(manager.spares[testSpareSize], spare)
+	}
+	if free := manager.freeNBDDevices(); free != 0 {
+		t.Fatalf("spares must consume every device, %d free", free)
+	}
+
+	// Existing local state makes the attach non-fresh, so it cannot adopt a
+	// spare and must find a device of its own.
+	if err := os.MkdirAll(manager.volumeDir("disk"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveVolumeState(manager.volumeDir("disk"), &volumeState{Key: "disk"}); err != nil {
+		t.Fatal(err)
+	}
+	volume, err := manager.Attach(ctx, AttachSpec{Key: "disk", VirtualSizeBytes: testSpareSize, Mountpoint: filepath.Join(manager.root, "mnt")}, nil)
+	if err != nil {
+		t.Fatalf("attach must reclaim a spare's device, got %v", err)
+	}
+	if volume.dir != manager.volumeDir("disk") || volume.nbd == nil {
+		t.Fatalf("attach must build in place on a reclaimed device, got %+v", volume.state)
+	}
+	if got := spareCount(manager, testSpareSize); got != spareTarget-1 {
+		t.Fatalf("exactly one spare must be released, pool = %d", got)
+	}
+	if got := host.ran("nbd-client -d"); len(got) != 1 {
+		t.Fatalf("exactly one spare must be disconnected, ran %v", got)
+	}
+	manager.destroySpares()
+}
+
+func TestReplenishStopsAtDeviceReserve(t *testing.T) {
+	manager, _ := newSpareTestManagerWithDevices(t, spareDeviceReserve+1)
+	manager.replenishSpares(testSpareSize)
+
+	// Wait for the builder to exit; only one build fits above the reserve.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		building := manager.spareBuilds[testSpareSize]
+		manager.mu.Unlock()
+		if !building {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	manager.mu.Lock()
+	building := manager.spareBuilds[testSpareSize]
+	manager.mu.Unlock()
+	if building {
+		t.Fatal("spare builder must stop at the device reserve")
+	}
+	if got := spareCount(manager, testSpareSize); got > 1 {
+		t.Fatalf("at most one spare fits above the reserve, pool = %d", got)
+	}
+	if free := manager.freeNBDDevices(); free < spareDeviceReserve {
+		t.Fatalf("spares must leave %d devices free, %d free", spareDeviceReserve, free)
+	}
+	manager.destroySpares()
+}
+
+func TestRecoverRemovesUnadoptedSpares(t *testing.T) {
+	manager, _ := newSpareTestManager(t)
+	spareDir := manager.volumeDir(sparePrefix + "abc")
+	if err := os.MkdirAll(spareDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveVolumeState(spareDir, &volumeState{Key: sparePrefix + "abc", Attached: true, QSDPid: 1 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	// An adopted spare keeps its directory name but carries the real key, and
+	// must be treated like any other volume.
+	adoptedDir := manager.volumeDir(sparePrefix + "def")
+	if err := os.MkdirAll(adoptedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveVolumeState(adoptedDir, &volumeState{Key: "disk", Attached: true, QSDPid: 1 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(adoptedDir, manager.volumeDir("disk")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(spareDir) {
+		t.Fatal("unadopted spare directory must be removed")
+	}
+	state, err := loadVolumeState(adoptedDir)
+	if err != nil || state == nil || state.Attached {
+		t.Fatalf("adopted volume must be kept and marked detached, got %+v (%v)", state, err)
+	}
+	dir, err := manager.resolveVolumeDir("disk")
+	if realAdoptedDir, _ := filepath.EvalSymlinks(adoptedDir); err != nil || dir != realAdoptedDir {
+		t.Fatalf("index must still resolve to %s, got %s (%v)", adoptedDir, dir, err)
+	}
+}
+
+func TestResolveVolumeDirDropsDanglingIndex(t *testing.T) {
+	manager, _ := newSpareTestManager(t)
+	if err := os.MkdirAll(filepath.Join(manager.root, "volumes"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(manager.root, "volumes", "gone"), manager.volumeDir("disk")); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := manager.resolveVolumeDir("disk")
+	if err != nil || dir != manager.volumeDir("disk") {
+		t.Fatalf("resolveVolumeDir = %s, %v", dir, err)
+	}
+	if _, err := os.Lstat(manager.volumeDir("disk")); !os.IsNotExist(err) {
+		t.Fatal("dangling index must be removed")
+	}
+}
+
+func TestRecoverRebuildsSparesForRememberedSizes(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	ctx := context.Background()
+	if _, err := manager.Attach(ctx, AttachSpec{Key: "disk", VirtualSizeBytes: testSpareSize, Mountpoint: filepath.Join(manager.root, "mnt")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitForSpares(t, manager, testSpareSize, spareTarget)
+	manager.rememberSpareSize(7)
+	manager.rememberSpareSize(testSpareSize) // re-recording moves it to the front
+	if got := manager.rememberedSpareSizes(); len(got) != 2 || got[0] != testSpareSize || got[1] != 7 {
+		t.Fatalf("remembered sizes = %v", got)
+	}
+	manager.Close(ctx)
+
+	// A restarted worker with the same root warms the pool during Recover.
+	restarted := NewManager(Config{Root: manager.root, SysBlockPath: manager.sysBlockPath, DevPath: manager.devPath, Runner: host.run})
+	before := len(host.ran("mkfs.ext4"))
+	if err := restarted.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForSpares(t, restarted, testSpareSize, spareTarget)
+	if len(host.ran("mkfs.ext4")) < before+spareTarget {
+		t.Fatalf("recover must build %d spares, ran %v", spareTarget, host.commands)
+	}
+	restarted.Close(ctx)
+}
+
+// pooledSpare builds one spare and places it in the pool so the next fresh
+// attach of that size adopts it.
+func pooledSpare(t *testing.T, manager *Manager) *Volume {
+	t.Helper()
+	spare, err := manager.buildSpare(context.Background(), testSpareSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.spares[testSpareSize] = append(manager.spares[testSpareSize], spare)
+	manager.mu.Unlock()
+	return spare
+}
+
+func TestAdoptIndexResolvesUnderRelativeRoot(t *testing.T) {
+	base, err := os.MkdirTemp("", "qd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	t.Chdir(base)
+	sysBlock, dev := filepath.Join(base, "sys"), filepath.Join(base, "dev")
+	for i := 0; i < 2; i++ {
+		name := "nbd" + strconv.Itoa(i)
+		writeTestNBDDevice(t, sysBlock, name, "43:"+strconv.Itoa(i))
+		if err := os.WriteFile(filepath.Join(sysBlock, name, "size"), []byte(strconv.FormatInt(testSpareSize/sectorSize, 10)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	host := &fakeHost{sysBlock: sysBlock}
+	manager := NewManager(Config{Root: "r", SysBlockPath: sysBlock, DevPath: dev, Runner: host.run})
+	spare := pooledSpare(t, manager)
+
+	volume, err := manager.Attach(context.Background(), AttachSpec{Key: "disk", VirtualSizeBytes: testSpareSize, Mountpoint: "mnt"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume != spare {
+		t.Fatal("attach must adopt the pooled spare")
+	}
+	if target, err := os.Readlink(manager.volumeDir("disk")); err != nil || target != filepath.Base(spare.dir) {
+		t.Fatalf("index must link to the sibling spare directory, got %q (%v)", target, err)
+	}
+	dir, err := manager.resolveVolumeDir("disk")
+	if want, _ := filepath.EvalSymlinks(spare.dir); err != nil || dir != want {
+		t.Fatalf("index must resolve to %s, got %s (%v)", want, dir, err)
+	}
+	manager.destroySpares()
+}
+
+func TestRememberSpareSizePersistsOnlyChanges(t *testing.T) {
+	manager, _ := newSpareTestManager(t)
+	if err := os.MkdirAll(manager.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager.rememberSpareSize(1 << 30)
+	manager.rememberSpareSize(2 << 30)
+	path := filepath.Join(manager.root, spareSizesFile)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 100 {
+		manager.rememberSpareSize(2 << 30)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("unchanged sizes replaced the shared file: %v", err)
+	}
+	manager.rememberSpareSize(1 << 30)
+	if got := manager.rememberedSpareSizes(); !slices.Equal(got, []int64{1 << 30, 2 << 30}) {
+		t.Fatalf("most recent size was not persisted: %v", got)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	manager.rememberSpareSize(1 << 30)
+	if got := manager.rememberedSpareSizes(); !slices.Equal(got, []int64{1 << 30}) {
+		t.Fatalf("missing size record was not rebuilt: %v", got)
+	}
+}
+
+func TestRememberSpareSizeSurvivesConcurrentAttaches(t *testing.T) {
+	manager, _ := newSpareTestManager(t)
+	if err := os.MkdirAll(manager.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sizes := []int64{1 << 30, 2 << 30, 3 << 30, 4 << 30} // exactly spareSizesKept distinct sizes
+	var group sync.WaitGroup
+	for round := 0; round < 25; round++ {
+		for _, size := range sizes {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				manager.rememberSpareSize(size)
+			}()
+		}
+	}
+	group.Wait()
+
+	got := manager.rememberedSpareSizes()
+	if len(got) != len(sizes) {
+		t.Fatalf("concurrent records lost sizes: remembered %v", got)
+	}
+	for _, size := range sizes {
+		if !slices.Contains(got, size) {
+			t.Fatalf("size %d was lost: remembered %v", size, got)
+		}
+	}
+	if fileExists(filepath.Join(manager.root, spareSizesFile+".tmp")) {
+		t.Fatal("atomic write must not leave its temporary file behind")
+	}
+}
+
+func TestCloseWaitsForInFlightSpareBuild(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	formatting := make(chan struct{}, 1)
+	manager.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "mkfs.ext4" {
+			select {
+			case formatting <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return host.run(ctx, name, args...)
+	}
+	manager.replenishSpares(testSpareSize)
+	select {
+	case <-formatting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("spare builder never reached mkfs")
+	}
+
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	building, pooled := manager.spareBuilds[testSpareSize], len(manager.spares[testSpareSize])
+	manager.mu.Unlock()
+	if building || pooled != 0 {
+		t.Fatalf("Close returned with a builder running (%v) or spares pooled (%d)", building, pooled)
+	}
+	entries, _ := os.ReadDir(filepath.Join(manager.root, "volumes"))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), sparePrefix) {
+			t.Fatalf("aborted spare build left %s behind", entry.Name())
+		}
+	}
+	if runs, _ := os.ReadDir(filepath.Join(manager.root, "run")); len(runs) != 0 {
+		t.Fatalf("aborted spare build left runtime directories behind: %d", len(runs))
+	}
+}
+
+func TestBuildSpareFailureLeavesNoRuntimeDir(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	manager.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "mkfs.ext4" {
+			return nil, errors.New("mkfs failed")
+		}
+		return host.run(ctx, name, args...)
+	}
+	if _, err := manager.buildSpare(context.Background(), testSpareSize); err == nil {
+		t.Fatal("buildSpare must fail when mkfs fails")
+	}
+	if runs, _ := os.ReadDir(filepath.Join(manager.root, "run")); len(runs) != 0 {
+		t.Fatalf("failed spare build must remove its runtime directory, found %d", len(runs))
+	}
+	if volumes, _ := os.ReadDir(filepath.Join(manager.root, "volumes")); len(volumes) != 0 {
+		t.Fatalf("failed spare build must remove its volume directory, found %d", len(volumes))
+	}
+}
+
+func TestReclaimSpareReportsDeviceStillConnected(t *testing.T) {
+	manager, host := newSpareTestManagerWithDevices(t, 1)
+	spare := pooledSpare(t, manager)
+	manager.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "nbd-client" && args[0] == "-d" {
+			return nil, errors.New("device is in use") // the kernel keeps the pid file
+		}
+		return host.run(ctx, name, args...)
+	}
+
+	if manager.reclaimSpare() {
+		t.Fatal("reclaim must not report a freed device while the kernel still holds it")
+	}
+	if got := spareCount(manager, testSpareSize); got != 0 {
+		t.Fatalf("the victim must leave the pool, pool = %d", got)
+	}
+	if fileExists(spare.dir) {
+		t.Fatal("the destroyed spare's directory must be removed")
+	}
+	if !manager.nbdDeviceBusy("nbd0") {
+		t.Fatal("test setup: the device was expected to stay connected")
+	}
+}
+
+func TestAdoptReplacesLeftoverRuntimeDir(t *testing.T) {
+	manager, _ := newSpareTestManager(t)
+	spare := pooledSpare(t, manager)
+	// A crash between adopt's runtime rename and its state save leaves the
+	// renamed directory behind under the real key with no record of it.
+	leftover := manager.runtimeDir("disk")
+	if err := os.MkdirAll(leftover, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leftover, "stale"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	volume, err := manager.Attach(context.Background(), AttachSpec{Key: "disk", VirtualSizeBytes: testSpareSize, Mountpoint: filepath.Join(manager.root, "mnt")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume != spare {
+		t.Fatal("a leftover runtime directory must not force a slow fresh build")
+	}
+	if fileExists(filepath.Join(leftover, "stale")) || !fileExists(filepath.Join(leftover, "qmp.sock")) {
+		t.Fatal("the adopted spare's runtime directory must replace the leftover")
+	}
+	manager.destroySpares()
+}
+
+func TestAttachRejectsReservedSpareKeys(t *testing.T) {
+	manager, _ := newSpareTestManager(t)
+	key := sparePrefix + "abc"
+	_, err := manager.Attach(context.Background(), AttachSpec{Key: key, VirtualSizeBytes: testSpareSize, Mountpoint: filepath.Join(manager.root, "mnt")}, nil)
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("attach with a spare-prefixed key must be rejected, got %v", err)
+	}
+	if fileExists(manager.volumeDir(key)) {
+		t.Fatal("a rejected key must not create a volume directory")
+	}
+}
+
+func TestWarmSparesPreparesFirstFreshRootBeforeDelivery(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	ctx := context.Background()
+	defer manager.Close(ctx)
+	if err := manager.WarmSpares(ctx, testSpareSize); err != nil {
+		t.Fatal(err)
+	}
+	if spareCount(manager, testSpareSize) != spareTarget {
+		t.Fatal("startup returned before fresh roots were formatted")
+	}
+	formatted := len(host.ran("mkfs.ext4"))
+	// Suppress replenishment to isolate the first real root attachment.
+	manager.mu.Lock()
+	manager.spareBuilds[testSpareSize] = true
+	manager.mu.Unlock()
+	volume, err := manager.Attach(ctx, AttachSpec{Key: "first-root", VirtualSizeBytes: testSpareSize, Export: ExportVhostUser}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !volume.state.Formatted || len(host.ran("mkfs.ext4")) != formatted {
+		t.Fatal("first root was formatted on the launch path")
+	}
+}
+
+func TestWarmSparesDoesNotBlockWorkerShutdown(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	formatting := make(chan struct{})
+	manager.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "mkfs.ext4" {
+			close(formatting)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return host.run(ctx, name, args...)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer manager.Close(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- manager.WarmSpares(ctx, testSpareSize) }()
+	select {
+	case <-formatting:
+	case <-time.After(time.Second):
+		t.Fatal("root formatting never started")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("startup cancellation was lost: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker startup ignored cancellation")
+	}
+}
+
+func TestPreparedVhostSpareAdoptsWithoutRestartingOrFormatting(t *testing.T) {
+	manager, host := newSpareTestManagerWithDevices(t, 0)
+	manager.spareExport = ExportVhostUser
+	ctx := context.Background()
+	defer manager.Close(ctx)
+	if err := manager.WarmSpares(ctx, testSpareSize); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	spare := manager.spares[testSpareSize][0]
+	manager.spares[testSpareSize] = []*Volume{spare}
+	manager.spareBuilds[testSpareSize] = true // Isolate adoption from refill.
+	manager.mu.Unlock()
+	if spare.nbd != nil || spare.state.exportMode() != ExportVhostUser || !spare.state.Formatted {
+		t.Fatal("the spare must already serve a formatted vhost-user root")
+	}
+	before := len(host.ran("qemu-storage-daemon"))
+	formatted := len(host.ran("mkfs.ext4"))
+	connected := len(host.ran("nbd-client"))
+	if connected != 0 {
+		t.Fatal("VM spare preparation must not attach a kernel NBD device")
+	}
+	freezeCalls := 0
+	volume, err := manager.Attach(ctx, AttachSpec{Key: "vm-root", Owner: "vm-c1", VirtualSizeBytes: testSpareSize, Export: ExportVhostUser, Freeze: func(context.Context) (func(), error) { freezeCalls++; return func() {}, nil }}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume != spare || len(host.ran("qemu-storage-daemon")) != before || len(host.ran("mkfs.ext4")) != formatted || len(host.ran("nbd-client")) != connected {
+		t.Fatal("adoption must retain the running export, without formatting or reconnecting")
+	}
+	want := filepath.Join(manager.runtimeDir("vm-root"), "vhost-user-blk.sock")
+	if volume.ExportSocket() != want || !fileExists(want) {
+		t.Fatalf("adopted export socket = %s, want %s", volume.ExportSocket(), want)
+	}
+	saved, err := loadVolumeState(volume.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.ExportSocket != want || saved.Owner != "vm-c1" || !saved.Attached {
+		t.Fatalf("durable state must record the new owner and socket: %+v", saved)
+	}
+	if _, err := volume.freeze(ctx); err != nil || freezeCalls != 1 {
+		t.Fatal("adoption must install this guest's freeze hook")
+	}
+}
+
+func TestVhostSpareDoesNotDisplaceNBDConsumer(t *testing.T) {
+	manager, _ := newSpareTestManager(t)
+	manager.spareExport = ExportVhostUser
+	ctx := context.Background()
+	defer manager.Close(ctx)
+	if err := manager.WarmSpares(ctx, testSpareSize); err != nil {
+		t.Fatal(err)
+	}
+	before := spareCount(manager, testSpareSize)
+	volume, err := manager.Attach(ctx, AttachSpec{Key: "host-disk", VirtualSizeBytes: testSpareSize, Mountpoint: filepath.Join(manager.root, "mnt")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume.nbd == nil || volume.state.exportMode() != ExportNBD || spareCount(manager, testSpareSize) != before {
+		t.Fatal("host disks must retain their NBD mount and leave VM spares available")
+	}
+	if manager.reclaimSpare() || spareCount(manager, testSpareSize) != before {
+		t.Fatal("a spare with no NBD device must not be destroyed to reclaim one")
+	}
+}
+
+func TestPreparedVhostSpareConversionFailureCleansUp(t *testing.T) {
+	manager, host := newSpareTestManager(t)
+	manager.spareExport = ExportVhostUser
+	manager.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "qemu-storage-daemon" {
+			for _, arg := range args {
+				if strings.Contains(arg, "type=vhost-user-blk") {
+					return nil, errors.New("export failed")
+				}
+			}
+		}
+		return host.run(ctx, name, args...)
+	}
+	if _, err := manager.buildSpare(context.Background(), testSpareSize); err == nil {
+		t.Fatal("conversion must propagate the failure")
+	}
+	for _, dir := range []string{"volumes", "run"} {
+		entries, err := os.ReadDir(filepath.Join(manager.root, dir))
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("failed conversion left %s resources: %v %v", dir, entries, err)
+		}
+	}
+}
+
+func TestPreparedRootsCoverConcurrentVMBursts(t *testing.T) {
+	manager, host := newSpareTestManagerWithDevices(t, 0)
+	manager.spareExport = ExportVhostUser
+	manager.spareCount = 100
+	ctx := context.Background()
+	defer manager.Close(ctx)
+	for wave := range 2 {
+		if err := manager.WarmSpares(ctx, testSpareSize); err != nil {
+			t.Fatal(err)
+		}
+		if got := spareCount(manager, testSpareSize); got != 100 {
+			t.Fatalf("prepared %d roots, want 100", got)
+		}
+		// Keep replenishment out of the measured launch path.
+		manager.mu.Lock()
+		manager.spareBuilds[testSpareSize] = true
+		manager.mu.Unlock()
+		formatted, daemons := len(host.ran("mkfs.ext4")), len(host.ran("qemu-storage-daemon"))
+		var wg sync.WaitGroup
+		for i := range 100 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				key := "burst-" + strconv.Itoa(wave) + "-" + strconv.Itoa(i)
+				volume, err := manager.Attach(ctx, AttachSpec{Key: key, Owner: key, VirtualSizeBytes: testSpareSize, Export: ExportVhostUser}, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if !volume.state.Formatted {
+					t.Error("unformatted root")
+				}
+				if _, owned := manager.VolumeOwned(key, key); !owned {
+					t.Error("lost root ownership")
+				}
+				if err := manager.DetachOwned(ctx, key, key); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+		if len(host.ran("mkfs.ext4")) != formatted || len(host.ran("qemu-storage-daemon")) != daemons {
+			t.Fatal("burst performed formatting or daemon startup on the launch path")
+		}
+		if len(host.ran("nbd-client")) != 0 {
+			t.Fatal("native root spares consumed NBD devices")
+		}
+		manager.mu.Lock()
+		delete(manager.spareBuilds, testSpareSize)
+		manager.mu.Unlock()
+	}
+}

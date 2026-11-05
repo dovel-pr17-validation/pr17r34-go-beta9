@@ -1,0 +1,357 @@
+package pod
+
+import (
+	"context"
+	"fmt"
+
+	"math/rand"
+	"time"
+
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/singleflight"
+)
+
+// errUnavailable is a user-facing reason no container can start yet: the stub's
+// GPU has no supporting pool, or its failed containers hold it in cooldown.
+type errUnavailable string
+
+func (e errUnavailable) Error() string { return string(e) }
+
+type podInstance struct {
+	*abstractions.AutoscaledInstance
+	buffer                    *PodProxyBuffer
+	durableDiskPlacementRepos abstractions.DurableDiskPlacementRepos
+	readyChecks               singleflight.Group
+}
+
+func (i *podInstance) ConsumeContainerEvent(event types.ContainerEvent) {
+	i.AutoscaledInstance.ConsumeContainerEvent(event)
+	if i.buffer == nil || i.ContainerRepo == nil || event.ContainerId == "" {
+		return
+	}
+	if event.Change < 0 {
+		i.buffer.retireAvailableContainer(event.ContainerId)
+		return
+	}
+
+	state, err := i.ContainerRepo.GetContainerState(event.ContainerId)
+	if err != nil {
+		i.buffer.signalDiscovery()
+		return
+	}
+	if state.Status == types.ContainerStatusStopping {
+		i.buffer.retireAvailableContainer(event.ContainerId)
+	}
+}
+
+// ensureReadyForRequest starts a container when none is running or pending.
+// Requests that arrive together share one check, so a cold burst costs one.
+func (i *podInstance) ensureReadyForRequest() error {
+	_, err, _ := i.readyChecks.Do("", func() (any, error) {
+		return nil, i.ensureReady()
+	})
+	return err
+}
+
+func (i *podInstance) ensureReady() error {
+	if reason := i.UnschedulableReason(); reason != "" {
+		return errUnavailable(reason)
+	}
+	if i.StubConfig.IsPersistentVM() {
+		return nil
+	}
+
+	state, err := i.State()
+	if err != nil {
+		return err
+	}
+	if state.RunningContainers+state.PendingContainers > 0 {
+		return nil
+	}
+	// Scaling would only cancel this instance, and the next request would rebuild it.
+	if i.FailedContainerThreshold > 0 && len(state.FailedContainers) >= i.FailedContainerThreshold {
+		return errUnavailable("containers failed repeatedly; a new one starts after a cooldown")
+	}
+	if err := i.Sync(); err != nil {
+		return err
+	}
+
+	desiredContainers := 1
+	if i.Stub.Type == types.StubType(types.StubTypePodDeployment) {
+		desiredContainers = desiredPodDeploymentContainers(
+			i.StubConfig,
+			1,
+			i.AppConfig.GatewayService.StubLimits.MaxReplicas,
+		)
+	}
+	if desiredContainers <= 0 {
+		return nil
+	}
+
+	err = i.HandleScalingEvent(desiredContainers)
+	if common.IsRedisLockNotObtained(err) {
+		if i.Autoscaler != nil {
+			i.Autoscaler.Trigger()
+		}
+		return nil
+	}
+	return err
+}
+
+func (i *podInstance) startContainers(containersToRun int) error {
+	if i.StubConfig.IsPersistentVM() {
+		return fmt.Errorf("persistent VM runtimes must be started by the VM service")
+	}
+	poolSelector := i.StubConfig.PoolSelector()
+	if err := abstractions.ConfigureDurableDiskPlacement(i.Ctx, i.durableDiskPlacementRepos, i.Workspace, i.StubConfig); err != nil {
+		return err
+	}
+	if poolSelector != i.StubConfig.PoolSelector() && i.Stub != nil && i.BackendRepo != nil {
+		if err := i.BackendRepo.UpdateStubConfig(i.Ctx, i.Stub.Id, i.StubConfig); err != nil {
+			return err
+		}
+	}
+
+	secrets, err := abstractions.ConfigureContainerRequestSecrets(i.Ctx, i.BackendRepo, i.Workspace, *i.StubConfig, i.Stub.Type.IsSandbox())
+	if err != nil {
+		return err
+	}
+
+	env := []string{}
+	env = append(i.StubConfig.Env, env...)
+	env = append(secrets.Env, env...)
+	if !i.Stub.Type.IsSandbox() {
+		env = append(env, fmt.Sprintf("BETA9_TOKEN=%s", i.Token.Key))
+	}
+	env = append(env, []string{
+		fmt.Sprintf("STUB_ID=%s", i.Stub.ExternalId),
+		fmt.Sprintf("STUB_TYPE=%s", i.Stub.Type),
+		fmt.Sprintf("KEEP_WARM_SECONDS=%d", i.StubConfig.KeepWarmSeconds),
+	}...)
+
+	gpuRequest := types.GpuTypesToStrings(i.StubConfig.Runtime.Gpus)
+	if i.StubConfig.Runtime.Gpu != "" {
+		gpuRequest = append(gpuRequest, i.StubConfig.Runtime.Gpu.String())
+	}
+
+	gpuCount := i.StubConfig.Runtime.GpuCount
+	if i.StubConfig.RequiresGPU() && gpuCount == 0 {
+		gpuCount = 1
+	}
+
+	checkpointEnabled := i.StubConfig.CheckpointEnabled
+	if gpuCount > 1 {
+		checkpointEnabled = false
+	}
+
+	ports := []uint32{}
+	if len(i.StubConfig.Ports) > 0 {
+		ports = i.StubConfig.Ports
+	}
+
+	for c := 0; c < containersToRun; c++ {
+		if err := i.CheckConcurrencyLimit(); err != nil {
+			return err
+		}
+
+		containerId := i.genContainerId()
+		mounts, err := abstractions.ConfigureContainerRequestMounts(
+			containerId,
+			i.Stub,
+			i.Workspace,
+			*i.StubConfig,
+		)
+		if err != nil {
+			return err
+		}
+
+		runRequest := &types.ContainerRequest{
+			ContainerId:       containerId,
+			Env:               env,
+			SecretBindings:    secrets.Bindings,
+			Cpu:               i.StubConfig.Runtime.Cpu,
+			Memory:            i.StubConfig.Runtime.Memory,
+			GpuRequest:        gpuRequest,
+			GpuCount:          uint32(gpuCount),
+			ImageId:           i.StubConfig.Runtime.ImageId,
+			StubId:            i.Stub.ExternalId,
+			AppId:             i.Stub.App.ExternalId,
+			WorkspaceId:       i.Workspace.ExternalId,
+			Workspace:         *i.Workspace,
+			EntryPoint:        i.EntryPoint,
+			Mounts:            mounts,
+			Stub:              *i.Stub,
+			CheckpointEnabled: checkpointEnabled,
+			CheckpointTrigger: i.StubConfig.CheckpointTrigger,
+			Ports:             ports,
+			PoolSelector:      i.StubConfig.PoolSelector(),
+			Hostname:          i.StubConfig.Hostname,
+		}
+		if err := abstractions.ConfigureContainerRequestNetwork(runRequest, *i.StubConfig); err != nil {
+			return err
+		}
+
+		if i.StubConfig.KeepWarmSeconds != 0 {
+			setPodKeepWarmLock(
+				context.Background(),
+				i.ContainerRepo,
+				i.Workspace.Name,
+				i.Stub.ExternalId,
+				runRequest.ContainerId,
+				i.StubConfig.KeepWarmSeconds,
+			)
+		}
+
+		err = i.Scheduler.Run(runRequest)
+		if err != nil {
+			if i.StubConfig.KeepWarmSeconds != 0 {
+				setPodKeepWarmLock(
+					context.Background(),
+					i.ContainerRepo,
+					i.Workspace.Name,
+					i.Stub.ExternalId,
+					runRequest.ContainerId,
+					0,
+				)
+			}
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("unable to run container")
+			return err
+		}
+
+		continue
+	}
+
+	return nil
+}
+
+func (i *podInstance) stopContainers(containersToStop int) error {
+	if i.StubConfig.IsPersistentVM() {
+		return fmt.Errorf("persistent VM runtimes must be stopped by the VM service")
+	}
+	src := rand.NewSource(time.Now().UnixNano())
+	rnd := rand.New(src)
+
+	containerIds, err := i.stoppableContainers()
+	if err != nil {
+		return err
+	}
+
+	stopped := 0
+	for stopped < containersToStop && len(containerIds) > 0 {
+		idx := rnd.Intn(len(containerIds))
+		containerId := containerIds[idx]
+		containerIds = append(containerIds[:idx], containerIds[idx+1:]...)
+
+		if !i.retireContainerForStop(containerId) {
+			continue
+		}
+
+		err := i.Scheduler.Stop(&types.StopContainerArgs{ContainerId: containerId, Force: true, Reason: types.StopContainerReasonScheduler})
+		if err != nil {
+			if i.buffer != nil {
+				i.buffer.cancelContainerRetirement(containerId)
+			}
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("unable to stop container")
+			return err
+		}
+		stopped++
+	}
+
+	return nil
+}
+
+func (i *podInstance) retireContainerForStop(containerId string) bool {
+	if i.buffer == nil {
+		return true
+	}
+
+	// Retire the proxy route before stopping the backend so a new request is
+	// queued for a replacement instead of reusing an idle connection.
+	i.buffer.retireAvailableContainer(containerId)
+	if !i.IsActive {
+		return true
+	}
+	if i.buffer.containerConnectionCount(containerId) > 0 {
+		i.buffer.cancelContainerRetirement(containerId)
+		return false
+	}
+
+	connections, err := i.buffer.sharedContainerConnectionCount(containerId)
+	if err != nil || connections > 0 {
+		i.buffer.cancelContainerRetirement(containerId)
+		return false
+	}
+
+	return true
+}
+
+func (i *podInstance) stoppableContainers() ([]string, error) {
+	containers, err := i.ContainerRepo.GetActiveContainersByStubId(i.Stub.ExternalId)
+	if err != nil {
+		return nil, err
+	}
+	stopAll := !i.IsActive
+	if !stopAll && i.FailedContainerThreshold > 0 {
+		failedContainers, err := i.ContainerRepo.GetFailedContainersByStubId(i.Stub.ExternalId)
+		if err != nil {
+			return nil, err
+		}
+		stopAll = len(failedContainers) >= i.FailedContainerThreshold
+	}
+
+	keys := make([]string, 0, len(containers))
+	for _, container := range containers {
+		if container.Status == types.ContainerStatusStopping {
+			continue
+		}
+
+		// Circuit breaking must cancel pending replacements and ignore keep-warm.
+		if stopAll {
+			keys = append(keys, container.ContainerId)
+			continue
+		}
+		if container.Status == types.ContainerStatusPending {
+			continue
+		}
+
+		// Skip containers with keep warm locks
+		keepWarm, err := i.ContainerRepo.PodKeepWarmLockExists(context.TODO(), i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)
+		if err != nil {
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting keep warm lock for container")
+			continue
+		}
+
+		if keepWarm {
+			continue
+		}
+
+		if i.buffer != nil && i.buffer.pendingKeepWarmLockExists(container.ContainerId) {
+			continue
+		}
+
+		if i.buffer != nil && i.buffer.containerConnectionCount(container.ContainerId) > 0 {
+			continue
+		}
+
+		connectionsVal, err := sharedPodContainerConnections(context.TODO(), i.Rdb, i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)
+		if err != nil {
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting connections for container")
+			continue
+		}
+		if connectionsVal > 0 {
+			continue
+		}
+
+		keys = append(keys, container.ContainerId)
+	}
+
+	return keys, nil
+}
+
+func (i *podInstance) genContainerId() string {
+	return fmt.Sprintf("%s-%s-%s", podContainerPrefix, i.Stub.ExternalId, uuid.New().String()[:8])
+}

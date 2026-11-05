@@ -1,0 +1,73 @@
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../base
+components:
+- ../../components/nvidia-device-plugin
+- ../../components/monitoring
+- ../../components/redis
+- ../../components/postgresql
+- ../../components/localstack
+- ../../components/beta9-gateway
+patches:
+# Remove resources from beta9 components
+- target:
+    kind: Deployment
+    name: beta9-gateway
+  patch: |-
+    - op: remove
+      path: /spec/template/spec/containers/0/resources
+# Scale monitoring components for local development
+- target:
+    kind: Deployment
+    name: victoria-metrics-agent
+  patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 1
+- target:
+    kind: StatefulSet
+    name: victoria-metrics-single
+  patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 1
+- target:
+    kind: StatefulSet
+    name: victoria-logs-single
+  patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 1
+- target:
+    kind: Deployment
+    name: grafana
+  patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 1
+
+# Replace RollingUpdate with Recreate for all Deployments in this overlay
+- target:
+    kind: Deployment
+  patch: |
+    - op: add
+      path: /spec/strategy
+      value:
+        type: Recreate
+
+- target:
+    kind: Service
+    name: grafana
+  patch: |-
+    - op: replace
+      path: /spec/type
+      value: LoadBalancer
+    - op: replace
+      path: /spec/ports
+      value:
+        - name: service
+          port: 3000
+          targetPort: 3000
+          protocol: TCP

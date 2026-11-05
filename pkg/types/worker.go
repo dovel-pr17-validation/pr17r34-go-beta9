@@ -1,0 +1,243 @@
+package types
+
+import (
+	"fmt"
+	"runtime"
+	"slices"
+	"time"
+
+	pb "github.com/beam-cloud/beta9/proto"
+)
+
+const (
+	WorkerLifecycleStatsKey                  string        = "beta9.worker.usage.spawner.lifecycle"
+	WorkerDurationStatsKey                   string        = "beta9.worker.usage.spawner.duration"
+	WorkerEventHeartbeatID                   string        = "__heartbeat__"
+	WorkerUserCodeVolume                     string        = "/mnt/code"
+	WorkerUserOutputVolume                   string        = "/outputs"
+	WorkerContainerVolumePath                string        = "/volumes"
+	WorkerContainerUploadsHostPath           string        = "/tmp/container-uploads"
+	WorkerContainerUploadsMountPath          string        = "/tmp/.beta9"
+	WorkerDurationEmissionInterval           time.Duration = 30 * time.Second
+	WorkerKeepAliveInterval                  time.Duration = 10 * time.Second
+	WorkerShellPort                          int32         = 2222
+	WorkerSandboxProcessManagerPort          int32         = 7111
+	WorkerSandboxProcessManagerWorkerPath    string        = "/usr/local/bin/goproc"
+	WorkerSandboxProcessManagerContainerPath string        = "/usr/bin/goproc"
+	WorkerSandboxFilesystemWorkerPath        string        = "/bin/busybox"
+	WorkerSandboxFilesystemContainerPath     string        = "/usr/lib/beta9/busybox"
+)
+
+const (
+	BuildContainerPrefix string = "build-"
+)
+
+func TempContainerWorkspace(containerId string) string {
+	return fmt.Sprintf("/tmp/%s/workspace", containerId)
+}
+
+type ContainerResourceUsage struct {
+	ContainerID       string `json:"ContainerID"`
+	CpuMillicoresUsed int64  `json:"CpuMillicoresUsed"`
+	MemoryUsed        int    `json:"MemoryUsed"`
+	GpuMemoryUsed     int64  `json:"GpuMemoryUsed"`
+	GpuMemoryTotal    int64  `json:"GpuMemoryTotal"`
+	GpuType           string `json:"GpuType"`
+}
+
+type ContainerIpAssignment struct {
+	ContainerID string `json:"container_id"`
+	IPAddress   string `json:"ip_address"`
+}
+
+// @go2proto
+type Mount struct {
+	LocalPath        string                  `json:"local_path"`
+	MountPath        string                  `json:"mount_path"`
+	LinkPath         string                  `json:"link_path"`
+	ReadOnly         bool                    `json:"read_only"`
+	MountType        string                  `json:"mount_type"`
+	MountPointConfig *MountPointConfig       `json:"mountpoint_config"`
+	DurableDisk      *DurableDiskMountConfig `json:"durable_disk,omitempty"`
+}
+
+// @go2proto
+type DurableDiskMountConfig struct {
+	Name       string `json:"name"`
+	Size       string `json:"size"`
+	Filesystem string `json:"filesystem"`
+	Driver     string `json:"driver"`
+	// Snapshot used to seed a new disk.
+	SourceSnapshotId string `json:"source_snapshot_id,omitempty"`
+}
+
+func NewDurableDiskMountConfigFromProto(in *pb.DurableDisk) *DurableDiskMountConfig {
+	if in == nil {
+		return nil
+	}
+
+	config := &DurableDiskMountConfig{
+		Name:             in.Name,
+		Size:             in.Size,
+		Filesystem:       in.Filesystem,
+		Driver:           in.Driver,
+		SourceSnapshotId: in.SourceSnapshotId,
+	}
+
+	return config
+}
+
+func (m *Mount) ToProto() *pb.Mount {
+	var mountPointConfig *pb.MountPointConfig
+	if m.MountPointConfig != nil {
+		mountPointConfig = m.MountPointConfig.ToProto()
+	}
+
+	var durableDisk *pb.DurableDiskMountConfig
+	if m.DurableDisk != nil {
+		durableDisk = &pb.DurableDiskMountConfig{
+			Name:             m.DurableDisk.Name,
+			Size:             m.DurableDisk.Size,
+			Filesystem:       m.DurableDisk.Filesystem,
+			Driver:           m.DurableDisk.Driver,
+			SourceSnapshotId: m.DurableDisk.SourceSnapshotId,
+		}
+	}
+
+	return &pb.Mount{
+		LocalPath:        m.LocalPath,
+		MountPath:        m.MountPath,
+		LinkPath:         m.LinkPath,
+		ReadOnly:         m.ReadOnly,
+		MountType:        m.MountType,
+		MountPointConfig: mountPointConfig,
+		DurableDisk:      durableDisk,
+	}
+}
+
+func NewMountFromProto(in *pb.Mount) *Mount {
+	var mountPointConfig *MountPointConfig
+	if in.MountPointConfig != nil {
+		mountPointConfig = NewMountPointConfigFromProto(in.MountPointConfig)
+	}
+
+	var durableDisk *DurableDiskMountConfig
+	if in.DurableDisk != nil {
+		durableDisk = &DurableDiskMountConfig{
+			Name:             in.DurableDisk.Name,
+			Size:             in.DurableDisk.Size,
+			Filesystem:       in.DurableDisk.Filesystem,
+			Driver:           in.DurableDisk.Driver,
+			SourceSnapshotId: in.DurableDisk.SourceSnapshotId,
+		}
+	}
+
+	return &Mount{
+		LocalPath:        in.LocalPath,
+		MountPath:        in.MountPath,
+		LinkPath:         in.LinkPath,
+		ReadOnly:         in.ReadOnly,
+		MountType:        in.MountType,
+		MountPointConfig: mountPointConfig,
+		DurableDisk:      durableDisk,
+	}
+}
+
+type ExitCodeError struct {
+	ExitCode ContainerExitCode
+}
+
+func (e *ExitCodeError) Error() string {
+	return fmt.Sprintf("exit code error: %s", WorkerContainerExitCodes[e.ExitCode])
+}
+
+type ContainerExitCode int
+
+func (c ContainerExitCode) IsFailed() bool {
+	// A terminal container OOM must participate in autoscaler failure cooldowns.
+	// Sandbox process OOMs do not set a container exit code.
+	return !slices.Contains(
+		[]ContainerExitCode{
+			ContainerExitCodeSuccess,
+			ContainerExitCodeScheduler,
+			ContainerExitCodeTtl,
+			ContainerExitCodeUser,
+			ContainerExitCodeAdmin,
+			ContainerExitCodeEvicted,
+		},
+		c,
+	)
+}
+
+const (
+	ContainerExitCodeInvalidCustomImage ContainerExitCode = 555
+	ContainerExitCodeIncorrectImageArch ContainerExitCode = 556
+	ContainerExitCodeIncorrectImageOs   ContainerExitCode = 557
+	ContainerExitCodeUnknownError       ContainerExitCode = 1
+	ContainerExitCodeSuccess            ContainerExitCode = 0
+	ContainerExitCodeOomKill            ContainerExitCode = 137 // 128 + 9 (base value + SIGKILL), used to indicate OOM kill
+	ContainerExitCodeSigterm            ContainerExitCode = 143 // 128 + 15 (base value + SIGTERM), used to indicate a graceful termination
+	ContainerExitCodeScheduler          ContainerExitCode = 558
+	ContainerExitCodeTtl                ContainerExitCode = 559
+	ContainerExitCodeUser               ContainerExitCode = 560
+	ContainerExitCodeAdmin              ContainerExitCode = 561
+	// ContainerExitCodeEvicted is reported for evictable containers the
+	// scheduler stopped to make room for a non-evictable request.
+	ContainerExitCodeEvicted       ContainerExitCode = 562
+	ContainerExitCodeStartupFailed ContainerExitCode = 563
+)
+
+const (
+	WorkerContainerExitCodeOomKillMessage   = "Container killed due to an out-of-memory error"
+	WorkerContainerExitCodeSchedulerMessage = "Container stopped"
+	WorkerContainerExitCodeTtlMessage       = "Container stopped due to TTL expiration"
+	WorkerContainerExitCodeUserMessage      = "Container stopped by user"
+	WorkerContainerExitCodeAdminMessage     = "Container stopped by admin"
+	WorkerContainerExitCodeEvictedMessage   = "Container evicted to make room for a higher priority workload"
+)
+
+var ExitCodeMessages = map[ContainerExitCode]string{
+	ContainerExitCodeOomKill:   WorkerContainerExitCodeOomKillMessage,
+	ContainerExitCodeScheduler: WorkerContainerExitCodeSchedulerMessage,
+	ContainerExitCodeTtl:       WorkerContainerExitCodeTtlMessage,
+	ContainerExitCodeUser:      WorkerContainerExitCodeUserMessage,
+	ContainerExitCodeAdmin:     WorkerContainerExitCodeAdminMessage,
+	ContainerExitCodeEvicted:   WorkerContainerExitCodeEvictedMessage,
+}
+
+var WorkerContainerExitCodes = map[ContainerExitCode]string{
+	ContainerExitCodeSuccess:            "Success",
+	ContainerExitCodeUnknownError:       "UnknownError: An unknown error occurred.",
+	ContainerExitCodeStartupFailed:      "StartupFailed: Container failed to start. Check the container logs.",
+	ContainerExitCodeIncorrectImageArch: "InvalidArch: Image must be built for the " + runtime.GOARCH + " architecture.",
+	ContainerExitCodeInvalidCustomImage: "InvalidCustomImage: Custom image not found. Check your image reference and registry credentials.",
+	ContainerExitCodeIncorrectImageOs:   "InvalidOS: Image must be built for Linux.",
+}
+
+const (
+	// Used specifically for runc states.
+	// Not the same as the scheduler container states.
+	RuncContainerStatusCreated string = "created"
+	RuncContainerStatusRunning string = "running"
+	RuncContainerStatusPaused  string = "paused"
+	RuncContainerStatusStopped string = "stopped"
+)
+
+type SandboxStatus string
+
+const (
+	SandboxStatusPending  SandboxStatus = "pending"
+	SandboxStatusRunning  SandboxStatus = "running"
+	SandboxStatusStopping SandboxStatus = "stopping"
+	SandboxStatusExited   SandboxStatus = "exited"
+)
+
+// @go2proto
+type ProcessInfo struct {
+	Running  bool     `json:"running"`
+	PID      int32    `json:"pid"`
+	Cmd      string   `json:"cmd"`
+	Cwd      string   `json:"cwd"`
+	Env      []string `json:"env"`
+	ExitCode int32    `json:"exit_code"`
+}

@@ -1,0 +1,400 @@
+package endpoint
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	jsoniter "github.com/json-iterator/go"
+
+	"github.com/labstack/echo/v4"
+
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/network"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/scheduler"
+	"github.com/beam-cloud/beta9/pkg/task"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+)
+
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+type EndpointService interface {
+	pb.EndpointServiceServer
+	StartEndpointServe(ctx context.Context, req *pb.StartEndpointServeRequest) (*pb.StartEndpointServeResponse, error)
+}
+
+type HttpEndpointService struct {
+	pb.UnimplementedEndpointServiceServer
+	ctx               context.Context
+	mu                sync.Mutex
+	config            types.AppConfig
+	rdb               *common.RedisClient
+	keyEventManager   *common.KeyEventManager
+	scheduler         *scheduler.Scheduler
+	backendRepo       repository.BackendRepository
+	workspaceRepo     repository.WorkspaceRepository
+	containerRepo     repository.ContainerRepository
+	eventRepo         repository.EventRepository
+	requestStats      *requestStats
+	usageMetricsRepo  repository.UsageMetricsRepository
+	taskRepo          repository.TaskRepository
+	endpointInstances *common.SafeMap[*endpointInstance]
+	tailscale         *network.Tailscale
+	taskDispatcher    *task.Dispatcher
+	controller        *abstractions.InstanceController
+}
+
+var (
+	DefaultEndpointRequestTimeoutS int    = 600 // 10 minutes
+	DefaultEndpointRequestTTL      uint32 = 600 // 10 minutes
+	ASGIRoutePrefix                string = "/asgi"
+
+	endpointContainerPrefix           string        = "endpoint"
+	endpointRoutePrefix               string        = "/endpoint"
+	endpointRequestHeartbeatInterval  time.Duration = 5 * time.Second
+	endpointRequestHeartbeatKeepAlive time.Duration = 30 * time.Second
+	endpointMinRequestBufferSize      int           = 10
+)
+
+type EndpointServiceOpts struct {
+	Config           types.AppConfig
+	RedisClient      *common.RedisClient
+	BackendRepo      repository.BackendRepository
+	WorkspaceRepo    repository.WorkspaceRepository
+	TaskRepo         repository.TaskRepository
+	ContainerRepo    repository.ContainerRepository
+	Scheduler        *scheduler.Scheduler
+	RouteGroup       *echo.Group
+	Tailscale        *network.Tailscale
+	TaskDispatcher   *task.Dispatcher
+	EventRepo        repository.EventRepository
+	UsageMetricsRepo repository.UsageMetricsRepository
+}
+
+func NewHTTPEndpointService(
+	ctx context.Context,
+	opts EndpointServiceOpts,
+) (EndpointService, error) {
+	keyEventManager := common.NewKeyEventManager(opts.RedisClient)
+
+	es := &HttpEndpointService{
+		ctx:               ctx,
+		mu:                sync.Mutex{},
+		config:            opts.Config,
+		rdb:               opts.RedisClient,
+		keyEventManager:   keyEventManager,
+		scheduler:         opts.Scheduler,
+		backendRepo:       opts.BackendRepo,
+		workspaceRepo:     opts.WorkspaceRepo,
+		containerRepo:     opts.ContainerRepo,
+		taskRepo:          opts.TaskRepo,
+		endpointInstances: common.NewSafeMap[*endpointInstance](),
+		tailscale:         opts.Tailscale,
+		taskDispatcher:    opts.TaskDispatcher,
+		eventRepo:         opts.EventRepo,
+		requestStats:      newRequestStats(ctx, opts.EventRepo),
+		usageMetricsRepo:  opts.UsageMetricsRepo,
+	}
+
+	// Listen for container events with a certain prefix
+	// For example if a container is created, destroyed, or updated
+	eventManager, err := abstractions.NewContainerEventManager(ctx, []string{endpointContainerPrefix}, keyEventManager, es.InstanceFactory)
+	if err != nil {
+		return nil, err
+	}
+	eventManager.Listen()
+
+	es.controller = abstractions.NewInstanceController(
+		ctx,
+		es.InstanceFactory,
+		es.GetInstance,
+		[]string{types.StubTypeEndpointDeployment, types.StubTypeASGIDeployment},
+		es.backendRepo,
+		es.containerRepo,
+		es.rdb,
+	)
+	err = es.controller.Init()
+	if err != nil {
+		return nil, err
+	}
+
+	// Register task dispatcher
+	es.taskDispatcher.Register(string(types.ExecutorEndpoint), es.endpointTaskFactory)
+
+	// Register HTTP routes
+	authMiddleware := auth.AuthMiddleware(es.backendRepo, es.workspaceRepo)
+	registerEndpointRoutes(opts.RouteGroup.Group(endpointRoutePrefix, authMiddleware), es)
+	registerASGIRoutes(opts.RouteGroup.Group(ASGIRoutePrefix, authMiddleware), es)
+
+	return es, nil
+}
+
+func (es *HttpEndpointService) endpointTaskFactory(ctx context.Context, msg types.TaskMessage) (types.TaskInterface, error) {
+	return &EndpointTask{
+		es:  es,
+		msg: &msg,
+	}, nil
+}
+
+func (es *HttpEndpointService) IsPublic(stubId string) (*types.Workspace, error) {
+	instance, err := es.getOrCreateEndpointInstance(es.ctx, stubId)
+	if err != nil {
+		return nil, err
+	}
+
+	if instance.StubConfig.Authorized {
+		return nil, errors.New("unauthorized")
+	}
+
+	return instance.Workspace, nil
+}
+
+// Forward request to endpoint
+func (es *HttpEndpointService) forwardRequest(
+	ctx echo.Context,
+	authInfo *auth.AuthInfo,
+	stubId string,
+) error {
+	instance, err := es.getOrCreateEndpointInstance(ctx.Request().Context(), stubId)
+	if err != nil {
+		return err
+	}
+
+	if ctx.Param("subPath") != "health" {
+		start := time.Now()
+		defer func() {
+			appId := ""
+			if instance.Stub != nil && instance.Stub.App != nil {
+				appId = instance.Stub.App.ExternalId
+			}
+			es.requestStats.record(stubId, instance.Workspace.ExternalId, appId, ctx.Response().Status, time.Since(start))
+		}()
+	}
+
+	// Fail fast instead of queueing until timeout when the stub's GPU has no
+	// supporting pool; requests start succeeding as soon as capacity joins.
+	if reason := instance.UnschedulableReason(); reason != "" {
+		return ctx.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": reason,
+		})
+	}
+
+	tasksInFlight, err := es.taskRepo.TasksInFlight(ctx.Request().Context(), instance.Workspace.Name, stubId)
+	if err != nil {
+		return ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
+			"error": err.Error(),
+		})
+	}
+
+	if tasksInFlight >= int(instance.StubConfig.MaxPendingTasks) {
+		err := types.ErrExceededTaskLimit{MaxPendingTasks: instance.StubConfig.MaxPendingTasks}
+		return ctx.JSON(http.StatusTooManyRequests, map[string]interface{}{
+			"error": err.Error(),
+		})
+	}
+
+	// Needed for backwards compatibility
+	ttl := instance.StubConfig.TaskPolicy.TTL
+	if ttl == 0 {
+		ttl = DefaultEndpointRequestTTL
+	}
+
+	task, err := es.taskDispatcher.Send(ctx.Request().Context(), string(types.ExecutorEndpoint), &auth.AuthInfo{
+		Workspace: instance.Workspace,
+		Token:     instance.Token,
+	}, stubId, &types.TaskPayload{}, types.TaskPolicy{
+		MaxRetries: 0,
+		Timeout:    instance.StubConfig.TaskPolicy.Timeout,
+		Expires:    time.Now().Add(time.Duration(ttl) * time.Second),
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx.Response().Header().Set("Access-Control-Expose-Headers", "X-Task-Id")
+	ctx.Response().Header().Set("X-Task-Id", task.Message().TaskId)
+	return task.Execute(ctx.Request().Context(), ctx, authInfo)
+}
+
+func (es *HttpEndpointService) forwardASGIHealthRequest(ctx echo.Context, stubId string) error {
+	ctx.Response().Header().Set("X-Beta9-Stub-Id", stubId)
+	instance, err := es.getOrCreateEndpointInstance(ctx.Request().Context(), stubId)
+	if err != nil {
+		return err
+	}
+
+	if err := instance.ensureReadyForTasklessRequest(); err != nil {
+		return err
+	}
+
+	return instance.buffer.ForwardRequest(ctx, nil)
+}
+
+func (es *HttpEndpointService) InstanceFactory(ctx context.Context, stubId string, options ...func(abstractions.IAutoscaledInstance)) (abstractions.IAutoscaledInstance, error) {
+	return es.getOrCreateEndpointInstance(ctx, stubId)
+}
+
+func (es *HttpEndpointService) GetInstance(stubId string) (abstractions.IAutoscaledInstance, bool) {
+	instance, exists := es.endpointInstances.Get(stubId)
+	if !exists {
+		return nil, false
+	}
+	return instance, true
+}
+
+func (es *HttpEndpointService) getOrCreateEndpointInstance(ctx context.Context, stubId string, options ...func(*endpointInstance)) (*endpointInstance, error) {
+	instance, exists := es.endpointInstances.Get(stubId)
+	if exists && instance.Ctx.Err() == nil {
+		return instance, nil
+	}
+
+	// The reason we lock here, and then check again -- is because if the instance does not exist, we may have two separate
+	// goroutines trying to create the instance. So, we check first, then get the mutex. If another
+	// routine got the lock, it should have created the instance, so we check once again. That way
+	// we don't create two instances of the same stub, but we also ensure that we return quickly if the instance
+	// _does_ already exist.
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	instance, exists = es.endpointInstances.Get(stubId)
+	if exists && instance.Ctx.Err() == nil {
+		return instance, nil
+	}
+	if exists {
+		es.endpointInstances.Delete(stubId)
+	}
+
+	stub, err := es.backendRepo.GetStubByExternalId(es.ctx, stubId)
+	if err != nil {
+		return nil, errors.New("invalid stub id")
+	}
+
+	// Container events are matched by id prefix, so a foreign stub can reach
+	// this factory; never autoscale a stub this service does not own.
+	if kind := stub.Type.Kind(); kind != types.StubTypeEndpoint && kind != types.StubTypeASGI {
+		return nil, fmt.Errorf("stub %s is not an endpoint (%s)", stubId, stub.Type)
+	}
+
+	var stubConfig *types.StubConfigV1 = &types.StubConfigV1{}
+	err = json.Unmarshal([]byte(stub.Config), stubConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	token, err := es.backendRepo.RetrieveActiveToken(es.ctx, stub.Workspace.Id, types.TokenTypeWorkspacePrimary)
+	if err != nil {
+		return nil, err
+	}
+
+	requestBufferSize := int(stubConfig.MaxPendingTasks) + 1
+	if requestBufferSize < endpointMinRequestBufferSize {
+		requestBufferSize = endpointMinRequestBufferSize
+	}
+
+	// Create endpoint instance to hold endpoint specific methods/fields
+	instance = &endpointInstance{}
+
+	// Create base autoscaled instance
+	autoscaledInstance, err := abstractions.NewAutoscaledInstance(es.ctx, &abstractions.AutoscaledInstanceConfig{
+		Name:                fmt.Sprintf("%s-%s", stub.Name, stub.ExternalId),
+		AppConfig:           es.config,
+		Rdb:                 es.rdb,
+		Stub:                stub,
+		StubConfig:          stubConfig,
+		Object:              &stub.Object,
+		Workspace:           &stub.Workspace,
+		Token:               token,
+		Scheduler:           es.scheduler,
+		ContainerRepo:       es.containerRepo,
+		BackendRepo:         es.backendRepo,
+		EventRepo:           es.eventRepo,
+		TaskRepo:            es.taskRepo,
+		UsageMetricsRepo:    es.usageMetricsRepo,
+		InstanceLockKey:     Keys.endpointInstanceLock(stub.Workspace.Name, stubId),
+		StartContainersFunc: instance.startContainers,
+		StopContainersFunc:  instance.stopContainers,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if stub.Type.Kind() == types.StubTypeASGI {
+		instance.isASGI = true
+	}
+
+	// Embed autoscaled instance struct
+	instance.AutoscaledInstance = autoscaledInstance
+
+	// Set all options on the instance
+	for _, o := range options {
+		o(instance)
+	}
+
+	if instance.Autoscaler == nil {
+		if stub.Type.IsDeployment() {
+			instance.Autoscaler = abstractions.NewAutoscaler(instance, endpointSampleFunc, endpointDeploymentScaleFunc)
+		} else if stub.Type.IsServe() {
+			instance.Autoscaler = abstractions.NewAutoscaler(instance, endpointSampleFunc, endpointServeScaleFunc)
+		}
+	}
+
+	instance.buffer = NewRequestBuffer(autoscaledInstance.Ctx, es.rdb, &stub.Workspace, stubId, requestBufferSize, es.containerRepo, es.keyEventManager, stubConfig, es.tailscale, es.config.Tailscale, instance.isASGI)
+	if instance.Autoscaler != nil {
+		instance.buffer.onTaskQueued = instance.Autoscaler.Trigger
+	}
+
+	if len(instance.EntryPoint) == 0 {
+		instance.EntryPoint = []string{instance.StubConfig.PythonVersion, "-m", "beta9.runner.endpoint"}
+	}
+
+	es.endpointInstances.Set(stubId, instance)
+
+	// Monitor and then clean up the instance once it's done
+	go instance.Monitor()
+	go func(i *endpointInstance) {
+		<-i.Ctx.Done()
+		es.deleteEndpointInstance(stubId, i)
+	}(instance)
+
+	return instance, nil
+}
+
+func (es *HttpEndpointService) deleteEndpointInstance(stubId string, instance *endpointInstance) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	if current, exists := es.endpointInstances.Get(stubId); exists && current == instance {
+		es.endpointInstances.Delete(stubId)
+	}
+}
+
+var Keys = &keys{}
+
+type keys struct{}
+
+func (k *keys) endpointKeepWarmLock(workspaceName, stubId, containerId string) string {
+	return common.RedisKeys.EndpointKeepWarmLock(workspaceName, stubId, containerId)
+}
+
+func (k *keys) endpointInstanceLock(workspaceName, stubId string) string {
+	return common.RedisKeys.EndpointInstanceLock(workspaceName, stubId)
+}
+
+func (k *keys) endpointRequestTokens(workspaceName, stubId, containerId string) string {
+	return common.RedisKeys.EndpointRequestTokens(workspaceName, stubId, containerId)
+}
+
+func (k *keys) endpointRequestHeartbeat(workspaceName, stubId, taskId, containerId string) string {
+	return common.RedisKeys.EndpointRequestHeartbeat(workspaceName, stubId, taskId, containerId)
+}
+
+func (k *keys) endpointRequestRelease(workspaceName, stubId, taskId, containerId string) string {
+	return common.RedisKeys.EndpointRequestRelease(workspaceName, stubId, taskId, containerId)
+}

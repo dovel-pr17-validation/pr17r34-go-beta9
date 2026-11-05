@@ -1,0 +1,435 @@
+package managedendpoint
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/types"
+
+	"github.com/labstack/echo/v4"
+)
+
+// Transport: how a response body is relayed to the caller and read for usage
+// on the way through.
+
+const (
+	maxBody                 = 64 << 20
+	replicaDialTimeout      = 5 * time.Second
+	streamKeepaliveInterval = 10 * time.Second
+	providerName            = "beam"
+)
+
+// relayStream forwards SSE as it arrives, keeping a silent reasoning step
+// connected with comments that count as neither output nor completion.
+// finalize runs on the terminal marker before it is relayed, so a response
+// that cannot be accounted fails visibly instead of looking complete.
+func relayStream(w *echo.Response, body io.Reader, requestID string, sentAt time.Time, finalize func(*types.Work, time.Duration) error) (*types.Work, time.Duration, error) {
+	return relayStreamWithKeepalive(w, body, requestID, sentAt, finalize, streamKeepaliveInterval)
+}
+
+func relayStreamWithKeepalive(w *echo.Response, body io.Reader, requestID string, sentAt time.Time, finalize func(*types.Work, time.Duration) error, interval time.Duration) (*types.Work, time.Duration, error) {
+	type eventRead struct {
+		event []byte
+		err   error
+	}
+	reads := make(chan eventRead, 1)
+	stop := make(chan struct{})
+	defer func() {
+		close(stop)
+		if closer, ok := body.(io.Closer); ok {
+			_ = closer.Close() // unblocks a reader waiting on the next event
+		}
+	}()
+	go func() {
+		reader := bufio.NewReaderSize(body, 64<<10)
+		for {
+			event, err := readSSEEvent(reader, maxBody)
+			select {
+			case reads <- eventRead{event, err}:
+			case <-stop:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	write := func(event []byte) error {
+		if _, err := w.Write(event); err != nil {
+			return err
+		}
+		if err := http.NewResponseController(w.Writer).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		return nil
+	}
+	const keepalive = ": keepalive\n\n"
+	var usage *types.Work
+	var ttft time.Duration
+	toolChoices := make(map[int]bool)
+	if err := write([]byte(keepalive)); err != nil {
+		return usage, ttft, err
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := write([]byte(keepalive)); err != nil {
+				return usage, ttft, err
+			}
+		case result := <-reads:
+			if result.err != nil {
+				if errors.Is(result.err, io.EOF) {
+					return usage, ttft, io.ErrUnexpectedEOF
+				}
+				return usage, ttft, result.err
+			}
+			payload, data := sseEventData(result.event)
+			if data && len(bytes.TrimSpace(payload)) > 0 {
+				if bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
+					if finalize != nil {
+						if err := finalize(usage, ttft); err != nil {
+							return usage, ttft, err
+						}
+					}
+					return usage, ttft, write(result.event)
+				}
+				if err := streamPayloadError(payload); err != nil {
+					// One canonical terminal error chunk: never relay an engine
+					// error and then emit a second gateway error.
+					return usage, ttft, err
+				}
+				line := append([]byte("data: "), payload...)
+				if ttft == 0 && generatesOutput(line) {
+					ttft = time.Since(sentAt)
+				}
+				if next := tokenUsage(payload); next != nil {
+					usage = next
+				}
+				result.event = replaceSSEData(result.event, bytes.TrimSuffix(stampSSE(line, requestID, toolChoices), []byte("\n")))
+			}
+			if err := write(result.event); err != nil {
+				return usage, ttft, err
+			}
+		}
+	}
+}
+
+// readSSEEvent bounds one event, including a line with no newline, without
+// buffering the entire generation. Only complete events reach the client.
+func readSSEEvent(reader *bufio.Reader, limit int) ([]byte, error) {
+	var event []byte
+	lineStart := 0
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(event)+len(fragment) > limit {
+			return nil, errors.New("upstream SSE event exceeds response limit")
+		}
+		event = append(event, fragment...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(bytes.TrimRight(event[lineStart:], "\r\n")) == 0 {
+			return event, nil
+		}
+		lineStart = len(event)
+	}
+}
+
+// sseEventData joins consecutive data fields with a newline, as SSE does.
+func sseEventData(event []byte) ([]byte, bool) {
+	var payload []byte
+	found := false
+	for line := range bytes.SplitSeq(event, []byte("\n")) {
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		value, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok && !bytes.Equal(line, []byte("data")) {
+			continue
+		}
+		if found {
+			payload = append(payload, '\n')
+		}
+		payload = append(payload, bytes.TrimPrefix(value, []byte(" "))...)
+		found = true
+	}
+	return payload, found
+}
+
+func replaceSSEData(event, replacement []byte) []byte {
+	var out []byte
+	inserted := false
+	for _, line := range bytes.SplitAfter(event, []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("data:")) || bytes.Equal(bytes.TrimRight(line, "\r\n"), []byte("data")) {
+			if !inserted {
+				out = append(out, replacement...)
+				out = append(out, '\n')
+				inserted = true
+			}
+			continue
+		}
+		out = append(out, line...)
+	}
+	return out
+}
+
+// generatesOutput excludes role/opening/usage frames and includes generated
+// reasoning and nonempty tool deltas when measuring the first output token.
+func generatesOutput(line []byte) bool {
+	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+	var chunk struct {
+		Choices []struct {
+			Text  string `json:"text"`
+			Delta struct {
+				Content          string            `json:"content"`
+				Reasoning        string            `json:"reasoning"`
+				ReasoningContent string            `json:"reasoning_content"`
+				ReasoningDetails []json.RawMessage `json:"reasoning_details"`
+				ToolCalls        []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(payload, &chunk) != nil {
+		return false
+	}
+	for _, c := range chunk.Choices {
+		d := c.Delta
+		if c.Text != "" || d.Content != "" || d.Reasoning != "" || d.ReasoningContent != "" || len(d.ReasoningDetails) > 0 || len(d.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// stampSSE sets the generation id and corrects completed tool-call finish
+// reasons; RawMessage preserves nested fields and large integers exactly.
+func stampSSE(line []byte, requestID string, toolChoices map[int]bool) []byte {
+	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+	var chunk map[string]json.RawMessage
+	if json.Unmarshal(payload, &chunk) != nil || chunk == nil {
+		return line
+	}
+	chunk["id"], _ = json.Marshal(requestID)
+	normalizeToolFinishReasons(chunk, toolChoices)
+	out, err := json.Marshal(chunk)
+	if err != nil {
+		return line
+	}
+	return append(append([]byte("data: "), out...), '\n')
+}
+
+// usageCounter distinguishes an omitted counter from an explicit zero and
+// rejects null or non-integer values at the JSON boundary.
+type usageCounter struct {
+	value   int64
+	present bool
+}
+
+func (c *usageCounter) UnmarshalJSON(data []byte) error {
+	var value *int64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if value == nil {
+		return errors.New("token count must be a non-null integer")
+	}
+	*c = usageCounter{value: *value, present: true}
+	return nil
+}
+
+// tokenUsage maps either prompt/completion or input/output usage into billing
+// counters. A missing, malformed or ambiguous usage object is not reported work.
+func tokenUsage(body []byte) *types.Work {
+	var env struct {
+		Usage *struct {
+			PromptTokens        usageCounter    `json:"prompt_tokens"`
+			CompletionTokens    usageCounter    `json:"completion_tokens"`
+			InputTokens         usageCounter    `json:"input_tokens"`
+			OutputTokens        usageCounter    `json:"output_tokens"`
+			PromptTokensDetails json.RawMessage `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Usage == nil {
+		return nil
+	}
+	usage := env.Usage
+	prompt, completion := usage.PromptTokens, usage.CompletionTokens
+	switch {
+	case usage.InputTokens.present || usage.OutputTokens.present:
+		// Both counters are required, and the two formats cannot be mixed.
+		if !usage.InputTokens.present || !usage.OutputTokens.present || prompt.present || completion.present || usage.PromptTokensDetails != nil {
+			return nil
+		}
+		prompt, completion = usage.InputTokens, usage.OutputTokens
+	case !prompt.present && !completion.present:
+		return nil
+	}
+	// Embedding responses may omit completion usage; an omitted counter is zero.
+	w := &types.Work{PromptTokens: prompt.value, CompletionTokens: completion.value}
+	if usage.PromptTokensDetails != nil {
+		var details struct {
+			CachedTokens usageCounter `json:"cached_tokens"`
+		}
+		if json.Unmarshal(usage.PromptTokensDetails, &details) != nil {
+			return nil
+		}
+		w.CachedTokens = details.CachedTokens.value
+	}
+	if !w.Valid() {
+		return nil
+	}
+	return w
+}
+
+// decorateJSON stamps the generation id and provider and adds the cost to the usage object.
+func decorateJSON(body []byte, requestID string, priced bool, costMicro int64) []byte {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
+		return body
+	}
+	payload["id"], _ = json.Marshal(requestID)
+	payload["provider"], _ = json.Marshal(providerName)
+	normalizeToolFinishReasons(payload, nil)
+	if priced {
+		var reported map[string]json.RawMessage
+		if json.Unmarshal(payload["usage"], &reported) == nil && reported != nil {
+			reported["cost"], _ = json.Marshal(costUSD(costMicro))
+			payload["usage"], _ = json.Marshal(reported)
+		}
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// normalizeToolFinishReasons rewrites "stop" to "tool_calls" on choices that
+// produced tool calls, as OpenAI clients need to continue the tool loop.
+// Streamed calls can arrive before the final reason, independently per choice.
+func normalizeToolFinishReasons(payload map[string]json.RawMessage, toolChoices map[int]bool) {
+	var choices []json.RawMessage
+	if json.Unmarshal(payload["choices"], &choices) != nil {
+		return
+	}
+	changed := false
+	for i, raw := range choices {
+		var choice struct {
+			Index        int    `json:"index"`
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"message"`
+			Delta struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal(raw, &choice) != nil {
+			continue
+		}
+		hasTools := len(choice.Message.ToolCalls) > 0
+		if toolChoices != nil {
+			if len(choice.Delta.ToolCalls) > 0 {
+				toolChoices[choice.Index] = true
+			}
+			hasTools = toolChoices[choice.Index]
+		}
+		if !hasTools || choice.FinishReason != "stop" {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil || fields == nil {
+			continue
+		}
+		fields["finish_reason"] = json.RawMessage(`"tool_calls"`)
+		choices[i], _ = json.Marshal(fields)
+		changed = true
+	}
+	if changed {
+		payload["choices"], _ = json.Marshal(choices)
+	}
+}
+
+type streamFailure struct {
+	status  int
+	message string
+	code    string
+}
+
+func (e *streamFailure) Error() string { return e.message }
+
+func (e *streamFailure) Unwrap() error { return io.ErrUnexpectedEOF }
+
+func streamFailureFor(err error) *streamFailure {
+	var failure *streamFailure
+	var rerr *routeError
+	switch {
+	case errors.As(err, &failure):
+		return failure
+	case errors.As(err, &rerr):
+		return &streamFailure{rerr.Status, rerr.Message, rerr.Code}
+	}
+	return &streamFailure{http.StatusBadGateway, "Upstream inference stream ended before completion", "upstream_stream_interrupted"}
+}
+
+func streamPayloadError(payload []byte) error {
+	var frame struct {
+		Error   json.RawMessage `json:"error"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(payload, &frame) != nil {
+		return fmt.Errorf("invalid upstream SSE JSON: %w", io.ErrUnexpectedEOF)
+	}
+	if len(frame.Error) > 0 && !bytes.Equal(frame.Error, []byte("null")) {
+		failure := streamFailureFor(nil)
+		var reported struct {
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
+		}
+		if json.Unmarshal(frame.Error, &reported) == nil {
+			var status int
+			if json.Unmarshal(reported.Code, &status) == nil && status >= 400 && status <= 599 {
+				failure.status = status
+				if status < 500 && reported.Message != "" {
+					failure.message = reported.Message
+				}
+			}
+		}
+		switch failure.status {
+		case http.StatusTooManyRequests:
+			failure.code = "rate_limit_exceeded"
+		case http.StatusBadRequest:
+			failure.code = "invalid_request_error"
+		}
+		return failure
+	}
+	for _, choice := range frame.Choices {
+		if choice.FinishReason == "error" {
+			return streamFailureFor(nil)
+		}
+	}
+	return nil
+}
+
+func writeStreamError(w *echo.Response, requestID, model string, failure *streamFailure) {
+	frame := map[string]any{
+		"id": requestID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "provider": providerName,
+		"error":   map[string]any{"code": failure.status, "message": failure.message, "metadata": map[string]string{"error_type": failure.code}},
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]string{"content": ""}, "finish_reason": "error"}},
+	}
+	body, _ := json.Marshal(frame)
+	_, _ = w.Write(append(append([]byte("data: "), body...), '\n', '\n'))
+	w.Flush()
+}

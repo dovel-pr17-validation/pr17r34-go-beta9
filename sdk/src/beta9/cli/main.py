@@ -1,0 +1,171 @@
+import os
+
+os.environ["GRPC_VERBOSITY"] = os.getenv("GRPC_VERBOSITY") or "NONE"
+
+import shutil
+import sys
+from types import ModuleType
+from typing import Any, Optional
+
+import click
+import grpc
+
+from .. import terminal
+from ..channel import handle_grpc_error, prompt_first_auth
+from ..config import SDKSettings, is_config_empty, set_settings
+from ..exceptions import ImageBuildError
+from . import (
+    config,
+    container,
+    database,
+    deployment,
+    dev,
+    disk,
+    endpoints,
+    image,
+    login,
+    logs,
+    machine,
+    mcp,
+    pool,
+    run,
+    secret,
+    serve,
+    setup,
+    shell,
+    status,
+    task,
+    token,
+    volume,
+    vm,
+    worker,
+)
+from .extraclick import CLICK_CONTEXT_SETTINGS, ClickCommonGroup, CommandGroupCollection
+
+click.formatting.FORCED_WIDTH = shutil.get_terminal_size().columns
+
+
+class CLI:
+    """
+    The CLI application.
+
+    This is used to dynamically register commands. Commands are of type
+    click.Group and are named either "common" or "management".
+    """
+
+    def __init__(
+        self,
+        settings: Optional[SDKSettings] = None,
+        context_settings: Optional[dict] = None,
+    ) -> None:
+        self.settings = SDKSettings() if settings is None else settings
+        set_settings(self.settings)
+
+        if context_settings is None:
+            context_settings = CLICK_CONTEXT_SETTINGS
+
+        self.management_group = ClickCommonGroup()
+        self.common_group = CommandGroupCollection(
+            sources=[self.management_group],
+            context_settings=context_settings,
+            help="Run code, deploy services, and manage your workspace.",
+        )
+
+    def __call__(self, **kwargs) -> Any:
+        # Wrapping CLIs such as `beam` call this directly; handling these here
+        # gives them the same reports, JSON errors in machine mode included.
+        try:
+            return self.common_group.main(prog_name=self.settings.name.lower(), **kwargs)
+        except grpc.RpcError as error:
+            handle_grpc_error(error=error)
+        except ImageBuildError as error:
+            terminal.error(str(error))
+
+    def register(self, module: ModuleType) -> None:
+        if hasattr(module, "common"):
+            self.common_group.add_command(module.common)
+        if hasattr(module, "management"):
+            self.management_group.add_command(module.management)
+
+    # Commands that work without credentials or establish them; the first-run
+    # prompt would only get in their way.
+    NO_FIRST_AUTH_PROMPT = ("mcp", "login", "setup", "config", "configure")
+
+    def check_config(self) -> None:
+        if os.getenv("CI") or any(
+            arg in ("--help", "-h", "--help-all", "--version", "--json") for arg in sys.argv[1:]
+        ):
+            return
+        if sys.argv[1:2] and sys.argv[1] in self.NO_FIRST_AUTH_PROMPT:
+            return
+        # Resolve an explicit context after Click parses it. First-time browser
+        # sign-in must target that context, rather than the default cluster.
+        if any(arg in ("--context", "-c") or arg.startswith("--context=") for arg in sys.argv[1:]):
+            return
+        # A pipe (an agent, a script) cannot answer prompts; let the command
+        # fail with a NOT_AUTHENTICATED error that says how to sign in.
+        if not sys.stdin.isatty():
+            return
+        if is_config_empty(self.settings.config_path):
+            prompt_first_auth(self.settings)
+
+    def load_version(self, package_name: Optional[str] = None):
+        """
+        Adds a version parameter to the top-level command.
+
+        If an version parameter already exists, it'll be replaced
+        with a new one. Setting package_name tells thie CLI
+        to use your package's version instead of this one.
+
+        Args:
+            package_name: Name of Python package. Defaults to None.
+        """
+        option = click.version_option(package_name=package_name)
+
+        for i, param in enumerate(self.common_group.params):
+            if param.name == "version":
+                self.common_group.params.pop(i)
+                break
+
+        self.common_group = option(self.common_group)
+
+
+def load_cli(check_config=True, **kwargs: Any) -> CLI:
+    cli = CLI(**kwargs)
+    cli.register(task)
+    cli.register(status)
+    cli.register(mcp)
+    cli.register(deployment)
+    cli.register(database)
+    cli.register(serve)
+    cli.register(volume)
+    cli.register(vm)
+    cli.register(disk)
+    cli.register(image)
+    cli.register(logs)
+    cli.register(config)
+    cli.register(pool)
+    cli.register(container)
+    cli.register(machine)
+    cli.register(secret)
+    cli.register(token)
+    cli.register(worker)
+    cli.register(shell)
+    cli.register(run)
+    cli.register(dev)
+    cli.register(endpoints)
+    cli.register(login)
+    cli.register(setup)
+
+    if check_config:
+        cli.check_config()
+
+    cli.load_version()
+
+    return cli
+
+
+def start():
+    """Used as entrypoint in Poetry"""
+    cli = load_cli()
+    cli()

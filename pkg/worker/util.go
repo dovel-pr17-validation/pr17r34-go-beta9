@@ -1,0 +1,512 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/opencontainers/runtime-spec/specs-go"
+)
+
+func tarCommandError(action string, err error, stderr bytes.Buffer) error {
+	message := stderr.String()
+	if message == "" {
+		return fmt.Errorf("%s: %w", action, err)
+	}
+	return fmt.Errorf("%s: %w: %s", action, err, message)
+}
+
+func writeFileNoFollow(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// Creates a symlink, but will remove any existing symlinks, files, or directories
+// before doing so.
+func forceSymlink(source, link string) error {
+	err := os.RemoveAll(link)
+	if err != nil {
+		return fmt.Errorf("error removing existing file or directory: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
+		return fmt.Errorf("error creating symlink parent directory: %v", err)
+	}
+
+	return os.Symlink(source, link)
+}
+
+func copyDirectory(src, dst string, excludePaths []string) error {
+	return copyDirectoryContext(context.Background(), src, dst, excludePaths)
+}
+
+func copyDirectoryContext(ctx context.Context, src, dst string, excludePaths []string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return fmt.Errorf("create destination directory %s: %w", dst, err)
+	}
+
+	rootExcludes := map[string]struct{}{}
+	for _, excludePath := range excludePaths {
+		cleanPath := filepath.ToSlash(filepath.Clean(excludePath))
+		if cleanPath == "." || cleanPath == "" {
+			continue
+		}
+		if strings.Contains(cleanPath, "/") {
+			return copyDirectoryWalkContext(ctx, src, dst, excludePaths)
+		}
+		rootExcludes[cleanPath] = struct{}{}
+	}
+
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("read source directory %s: %w", src, err)
+	}
+
+	tarArgs := append(tarXattrArgs(), "-cf", "-", "-C", src, "--")
+	for _, entry := range entries {
+		if _, excluded := rootExcludes[entry.Name()]; excluded {
+			continue
+		}
+		tarArgs = append(tarArgs, "./"+entry.Name())
+	}
+	if len(tarArgs) == len(tarXattrArgs())+5 {
+		return nil
+	}
+
+	reader, writer := io.Pipe()
+	archiveCmd := exec.CommandContext(ctx, "tar", tarArgs...)
+	extractCmd := exec.CommandContext(ctx, "tar", append(tarXattrArgs(), "-xf", "-", "-C", dst)...)
+	var archiveStderr, extractStderr bytes.Buffer
+	archiveCmd.Stdout = writer
+	archiveCmd.Stderr = &archiveStderr
+	extractCmd.Stdin = reader
+	extractCmd.Stderr = &extractStderr
+
+	if err := extractCmd.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return fmt.Errorf("start directory extraction: %w", err)
+	}
+	if err := archiveCmd.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		_ = extractCmd.Wait()
+		return fmt.Errorf("start directory archive: %w", err)
+	}
+
+	archiveDone := make(chan error, 1)
+	go func() {
+		err := archiveCmd.Wait()
+		_ = writer.CloseWithError(err)
+		archiveDone <- err
+	}()
+
+	extractErr := extractCmd.Wait()
+	_ = reader.Close()
+	archiveErr := <-archiveDone
+
+	if archiveErr != nil {
+		return tarCommandError(fmt.Sprintf("archive directory %s", src), archiveErr, archiveStderr)
+	}
+	if extractErr != nil {
+		return tarCommandError(fmt.Sprintf("extract directory to %s", dst), extractErr, extractStderr)
+	}
+	return nil
+}
+
+// archiveDirectoryContext writes the contents of src to a tar archive without
+// first materializing them in another directory. This matters for raw overlay
+// upper layers: whiteouts are character devices and some cache filesystems do
+// not permit mknod, even though they can safely store a regular tar file that
+// describes one.
+func archiveDirectoryContext(ctx context.Context, src, destTar string, excludePaths []string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	rootExcludes := map[string]struct{}{}
+	for _, excludePath := range excludePaths {
+		cleanPath := filepath.ToSlash(filepath.Clean(excludePath))
+		if cleanPath == "." || cleanPath == "" {
+			continue
+		}
+		if strings.Contains(cleanPath, "/") {
+			return fmt.Errorf("archive exclusion %q must name a root entry", excludePath)
+		}
+		rootExcludes[cleanPath] = struct{}{}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destTar), 0755); err != nil {
+		return fmt.Errorf("create archive directory %s: %w", filepath.Dir(destTar), err)
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(destTar), "."+filepath.Base(destTar)+"-*")
+	if err != nil {
+		return fmt.Errorf("create temporary archive for %s: %w", destTar, err)
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temporary archive %s: %w", tmpPath, err)
+	}
+	defer os.Remove(tmpPath)
+
+	tarArgs := tarXattrArgs()
+	for excluded := range rootExcludes {
+		tarArgs = append(tarArgs, "--exclude=./"+excluded)
+	}
+	tarArgs = append(tarArgs, "-cf", tmpPath, "-C", src, ".")
+
+	cmd := exec.CommandContext(ctx, "tar", tarArgs...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return tarCommandError(fmt.Sprintf("archive directory %s", src), err, stderr)
+	}
+	if err := os.Rename(tmpPath, destTar); err != nil {
+		return fmt.Errorf("publish directory archive %s: %w", destTar, err)
+	}
+	return nil
+}
+
+func extractDirectoryArchiveContext(ctx context.Context, srcTar, destDir string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("create archive destination %s: %w", destDir, err)
+	}
+	cmd := exec.CommandContext(ctx, "tar", append(tarXattrArgs(), "-xf", srcTar, "-C", destDir)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return tarCommandError(fmt.Sprintf("extract directory archive %s", srcTar), err, stderr)
+	}
+	return nil
+}
+
+func normalizedCopyExcludePaths(excludePaths []string) map[string]struct{} {
+	excludes := map[string]struct{}{}
+	for _, excludePath := range excludePaths {
+		cleanPath := filepath.ToSlash(filepath.Clean(excludePath))
+		if cleanPath == "." || cleanPath == "" {
+			continue
+		}
+		excludes[cleanPath] = struct{}{}
+	}
+	return excludes
+}
+
+func copyDirectoryWalk(src, dst string, excludePaths []string) error {
+	return copyDirectoryWalkContext(context.Background(), src, dst, excludePaths)
+}
+
+func copyDirectoryWalkContext(ctx context.Context, src, dst string, excludePaths []string) error {
+	excludes := normalizedCopyExcludePaths(excludePaths)
+
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		if _, excluded := excludes[relPath]; excluded {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		dstPath := filepath.Join(dst, relPath)
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, info.Mode())
+		}
+		if info.Mode()&os.ModeSocket != 0 {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("read symlink %s: %w", path, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+				return fmt.Errorf("create symlink parent %s: %w", filepath.Dir(dstPath), err)
+			}
+			_ = os.Remove(dstPath)
+			return os.Symlink(linkTarget, dstPath)
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		return copyFile(path, dstPath)
+	})
+}
+
+// createFileNoFollow creates path afresh: whatever is there is removed first,
+// so a symlink a container planted in its own tree is replaced, not written
+// through.
+func createFileNoFollow(path string, perm os.FileMode) (*os.File, error) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, perm)
+}
+
+// readFileNoFollow reads path, refusing a symlink at its last component.
+func readFileNoFollow(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+func copyFile(src, dst string) error {
+	srcFile, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open source file %s: %w", src, err)
+	}
+	defer srcFile.Close()
+
+	info, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source file %s: %w", src, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return fmt.Errorf("create destination parent %s: %w", filepath.Dir(dst), err)
+	}
+
+	dstFile, err := createFileNoFollow(dst, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("open destination file %s: %w", dst, err)
+	}
+
+	_, copyErr := io.Copy(dstFile, srcFile)
+	closeErr := dstFile.Close()
+	if copyErr != nil {
+		return fmt.Errorf("copy %s to %s: %w", src, dst, copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close destination file %s: %w", dst, closeErr)
+	}
+
+	return nil
+}
+
+func createTar(srcDir, destTar string) error {
+	_, _, err := createTarWithSHA256(srcDir, destTar)
+	return err
+}
+
+func createTarWithSHA256(srcDir, destTar string) (string, int64, error) {
+	return createTarWithSHA256Progress(context.Background(), srcDir, destTar, nil)
+}
+
+func createTarWithSHA256Progress(ctx context.Context, srcDir, destTar string, progress func(int64)) (string, int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		_ = os.Remove(destTar)
+
+		out, err := os.OpenFile(destTar, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return "", 0, err
+		}
+
+		hasher := sha256.New()
+		counter := &countingWriter{progress: progress}
+		// RAM checkpoints compress well. Two encoder workers overlap compression
+		// with tar reads while checkpoint admission bounds total CPU use.
+		encoder, err := zstd.NewWriter(io.MultiWriter(out, hasher, counter),
+			zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(2))
+		if err != nil {
+			_ = out.Close()
+			_ = os.Remove(destTar)
+			return "", 0, err
+		}
+		tarArgs := append(tarSparseArgs(), "-cf", "-", "-C", filepath.Dir(srcDir), filepath.Base(srcDir))
+		cmd := exec.CommandContext(ctx, "tar", tarArgs...)
+		var stderr bytes.Buffer
+		cmd.Stdout = encoder
+		cmd.Stderr = &stderr
+
+		runErr := cmd.Run()
+		if err := encoder.Close(); runErr == nil {
+			runErr = err
+		}
+		closeErr := out.Close()
+		if runErr != nil {
+			_ = os.Remove(destTar)
+			lastErr = tarCommandError(fmt.Sprintf("archive directory %s", srcDir), runErr, stderr)
+			if err := waitForRetry(ctx, time.Duration(attempt+1)*250*time.Millisecond); err != nil {
+				return "", 0, err
+			}
+			continue
+		}
+		if closeErr != nil {
+			_ = os.Remove(destTar)
+			lastErr = fmt.Errorf("close tar archive %s: %w", destTar, closeErr)
+			if err := waitForRetry(ctx, time.Duration(attempt+1)*250*time.Millisecond); err != nil {
+				return "", 0, err
+			}
+			continue
+		}
+
+		return hex.EncodeToString(hasher.Sum(nil)), counter.n, nil
+	}
+
+	return "", 0, lastErr
+}
+
+type countingWriter struct {
+	n        int64
+	progress func(int64)
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.n += int64(len(p))
+	if w.progress != nil {
+		w.progress(w.n)
+	}
+	return len(p), nil
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func tarXattrArgs() []string {
+	args := []string{"--xattrs"}
+	if runtime.GOOS == "linux" {
+		args = append(args, "--xattrs-include=*")
+	}
+	return args
+}
+
+// tarSparseArgs stores holes as holes (GNU tar only); VM checkpoints carry
+// mostly-empty root disk and memory images.
+func tarSparseArgs() []string {
+	args := tarXattrArgs()
+	if runtime.GOOS == "linux" {
+		args = append(args, "--sparse")
+	}
+	return args
+}
+
+func untarTar(srcTar, destDir string) error {
+	archive, err := os.Open(srcTar)
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+	return untarCheckpointReader(context.Background(), archive, destDir)
+}
+
+type FileLock struct {
+	file *os.File
+	path string
+}
+
+func NewFileLock(path string) *FileLock {
+	return &FileLock{path: path}
+}
+
+func (fl *FileLock) Acquire() error {
+	file, err := os.OpenFile(fl.path, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return err
+	}
+
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		file.Close()
+		return err
+	}
+
+	fl.file = file
+	return nil
+}
+
+func (fl *FileLock) Release() error {
+	if fl.file == nil {
+		return fmt.Errorf("file lock not acquired")
+	}
+
+	if err := syscall.Flock(int(fl.file.Fd()), syscall.LOCK_UN); err != nil {
+		return err
+	}
+
+	err := fl.file.Close()
+	fl.file = nil
+	if err != nil {
+		return err
+	}
+	// Keep the lock file stable so every contender continues locking the same inode.
+	return nil
+}
+
+// Adds extra env vars to an existing OCI spec
+func addEnvToSpec(specPath string, extraEnv []string) error {
+	f, err := os.OpenFile(specPath, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var spec specs.Spec
+	if err := json.NewDecoder(f).Decode(&spec); err != nil {
+		return err
+	}
+
+	spec.Process.Env = append(spec.Process.Env, extraEnv...)
+
+	f.Seek(0, 0)
+	f.Truncate(0)
+	return json.NewEncoder(f).Encode(&spec)
+}

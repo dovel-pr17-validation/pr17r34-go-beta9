@@ -1,0 +1,1804 @@
+syntax = "proto3";
+
+option go_package = "github.com/beam-cloud/beta9/proto";
+import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
+import "types.proto";
+
+package gateway;
+
+service GatewayService {
+  // Auth
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse) {
+    option (google.api.http) = {
+      post : "/auth/authorize"
+    };
+  }
+  rpc SignPayload(SignPayloadRequest) returns (SignPayloadResponse) {
+    option (google.api.http) = {
+      post : "/auth/sign"
+      body : "*"
+    };
+  }
+
+  // Objects
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse) {
+    option (google.api.http) = {
+      get : "/objects/{hash}"
+    };
+  }
+  rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse) {
+    option (google.api.http) = {
+      post : "/objects"
+      body : "*"
+    };
+  }
+  rpc PutObjectStream(stream PutObjectRequest) returns (PutObjectResponse) {}
+  rpc CompleteObjectUpload(CompleteObjectUploadRequest) returns (CompleteObjectUploadResponse) {}
+  rpc CreateObjectDelta(CreateObjectDeltaRequest) returns (CreateObjectDeltaResponse) {}
+  rpc CommitObjectDelta(CommitObjectDeltaRequest) returns (CommitObjectDeltaResponse) {}
+
+  // Containers
+  rpc CheckpointContainer(CheckpointContainerRequest)
+      returns (CheckpointContainerResponse) {}
+
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse) {
+    option (google.api.http) = {
+      get : "/containers"
+    };
+  }
+  rpc StopContainer(StopContainerRequest) returns (StopContainerResponse) {
+    option (google.api.http) = {
+      post : "/containers/{container_id}/stop"
+    };
+  }
+  rpc AttachToContainer(stream ContainerStreamMessage)
+      returns (stream AttachToContainerResponse) {}
+
+  // Tasks
+  rpc StartTask(StartTaskRequest) returns (StartTaskResponse) {
+    option (google.api.http) = {
+      post : "/tasks/start"
+      body : "*"
+    };
+  }
+  rpc EndTask(EndTaskRequest) returns (EndTaskResponse) {
+    option (google.api.http) = {
+      post : "/tasks/end"
+      body : "*"
+    };
+  }
+  rpc StopTasks(StopTasksRequest) returns (StopTasksResponse) {
+    option (google.api.http) = {
+      post : "/tasks/stop"
+      body : "*"
+    };
+  }
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse) {
+    option (google.api.http) = {
+      get : "/tasks"
+    };
+  }
+
+  // Stubs
+  rpc GetOrCreateStub(GetOrCreateStubRequest)
+      returns (GetOrCreateStubResponse) {
+    option (google.api.http) = {
+      post : "/stubs"
+      body : "*"
+    };
+  }
+  rpc DeployStub(DeployStubRequest) returns (DeployStubResponse) {
+    option (google.api.http) = {
+      post : "/stubs/deploy"
+      body : "*"
+    };
+  }
+  rpc GetURL(GetURLRequest) returns (GetURLResponse) {
+    option (google.api.http) = {
+      get : "/stubs/{stub_id}/url"
+    };
+  }
+
+  // Deployments
+  rpc ListDeployments(ListDeploymentsRequest)
+      returns (ListDeploymentsResponse) {
+    option (google.api.http) = {
+      get : "/deployments"
+    };
+  }
+  rpc StopDeployment(StopDeploymentRequest) returns (StopDeploymentResponse) {
+    option (google.api.http) = {
+      post : "/deployments/{id}/stop"
+    };
+  }
+  rpc StartDeployment(StartDeploymentRequest)
+      returns (StartDeploymentResponse) {
+    option (google.api.http) = {
+      post : "/deployments/{id}/start"
+    };
+  }
+  rpc ScaleDeployment(ScaleDeploymentRequest)
+      returns (ScaleDeploymentResponse) {
+    option (google.api.http) = {
+      post : "/deployments/{id}/scale"
+      body : "*"
+    };
+  }
+  rpc DeleteDeployment(DeleteDeploymentRequest)
+      returns (DeleteDeploymentResponse) {
+    option (google.api.http) = {
+      delete : "/deployments/{id}"
+    };
+  }
+
+  // Pools
+  rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse) {
+    option (google.api.http) = {
+      get : "/pools"
+    };
+  }
+
+  // Private compute pools
+  rpc ListPoolOffers(ListPoolOffersRequest)
+      returns (ListPoolOffersResponse) {
+    option (google.api.http) = {
+      post : "/pools:offers"
+      body : "*"
+    };
+  }
+  rpc LaunchPoolCapacity(LaunchPoolCapacityRequest)
+      returns (LaunchPoolCapacityResponse) {
+    option (google.api.http) = {
+      post : "/pools:launch"
+      body : "*"
+    };
+  }
+  rpc ListPrivatePools(ListPrivatePoolsRequest) returns (ListPrivatePoolsResponse) {
+    option (google.api.http) = {
+      get : "/pools/private"
+    };
+  }
+  rpc CreateBYOCPool(CreateBYOCPoolRequest)
+      returns (CreateBYOCPoolResponse) {
+    option (google.api.http) = {
+      post : "/pools/byoc"
+      body : "*"
+    };
+  }
+  rpc GetBYOCPool(GetBYOCPoolRequest)
+      returns (GetBYOCPoolResponse) {
+    option (google.api.http) = {
+      get : "/pools/{pool_name}/byoc"
+    };
+  }
+  rpc ScaleBYOCPool(ScaleBYOCPoolRequest)
+      returns (ScaleBYOCPoolResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/byoc/scale"
+      body : "*"
+    };
+  }
+  // Sell compute: contribute machines to the managed endpoint fleet and earn
+  // a share of the tokens sold on them.
+  rpc GetProviderJoinCommand(GetProviderJoinCommandRequest)
+      returns (GetProviderJoinCommandResponse) {
+    option (google.api.http) = {
+      post : "/provider/join-command"
+      body : "*"
+    };
+  }
+  rpc ListProviderMachines(ListProviderMachinesRequest)
+      returns (ListProviderMachinesResponse) {
+    option (google.api.http) = {
+      get : "/provider/machines"
+    };
+  }
+  rpc GetEndpointUsage(GetEndpointUsageRequest)
+      returns (GetEndpointUsageResponse) {
+    option (google.api.http) = {
+      get : "/usage/endpoints"
+    };
+  }
+  rpc ListMachineContainers(ListMachineContainersRequest)
+      returns (ListMachineContainersResponse) {
+    option (google.api.http) = {
+      get : "/pools/{pool_name}/machines/{machine_id}/containers"
+    };
+  }
+  rpc CreatePool(CreatePoolRequest)
+      returns (CreatePoolResponse) {
+    option (google.api.http) = {
+      post : "/pools"
+      body : "*"
+    };
+  }
+  rpc DeletePool(DeletePoolRequest)
+      returns (DeletePoolResponse) {
+    option (google.api.http) = {
+      delete : "/pools/{name}"
+    };
+  }
+  rpc ExtendPoolCapacity(ExtendPoolCapacityRequest)
+      returns (ExtendPoolCapacityResponse) {
+    option (google.api.http) = {
+      post : "/pools/{name}/extend"
+      body : "*"
+    };
+  }
+  rpc CreatePoolJoinToken(CreatePoolJoinTokenRequest)
+      returns (CreatePoolJoinTokenResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/join-tokens"
+      body : "*"
+    };
+  }
+  rpc RevokePoolJoinToken(RevokePoolJoinTokenRequest)
+      returns (RevokePoolJoinTokenResponse) {
+    option (google.api.http) = {
+      post : "/pools/join-tokens/revoke"
+      body : "*"
+    };
+  }
+  rpc GetPoolJoinCommand(GetPoolJoinCommandRequest)
+      returns (GetPoolJoinCommandResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/join-command"
+      body : "*"
+    };
+  }
+  rpc ListPoolMachines(ListPoolMachinesRequest)
+      returns (ListPoolMachinesResponse) {
+    option (google.api.http) = {
+      get : "/pools/{pool_name}/machines"
+    };
+  }
+  rpc DownloadMachineSSHKey(DownloadMachineSSHKeyRequest)
+      returns (DownloadMachineSSHKeyResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/machines/{machine_id}/ssh/key:download"
+      body : "*"
+    };
+  }
+  rpc RotateMachineSSHKey(RotateMachineSSHKeyRequest)
+      returns (RotateMachineSSHKeyResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/machines/{machine_id}/ssh/key:rotate"
+      body : "*"
+    };
+  }
+  rpc ActivateMachineSSHKey(ActivateMachineSSHKeyRequest)
+      returns (ActivateMachineSSHKeyResponse) {
+    option (google.api.http) = {
+      post : "/pools/{pool_name}/machines/{machine_id}/ssh/key:activate"
+      body : "*"
+    };
+  }
+  rpc JoinAgent(JoinAgentRequest) returns (JoinAgentResponse) {
+    option (google.api.http) = {
+      post : "/agent/join"
+      body : "*"
+    };
+  }
+  rpc RequestAgentTransportCredential(RequestAgentTransportCredentialRequest)
+      returns (RequestAgentTransportCredentialResponse) {
+    option (google.api.http) = {
+      post : "/agent/transport-credential"
+      body : "*"
+    };
+  }
+  rpc GetAgentPoolVirtualization(GetAgentPoolVirtualizationRequest)
+      returns (GetAgentPoolVirtualizationResponse);
+  rpc CreateNodeEnrollment(CreateNodeEnrollmentRequest)
+      returns (CreateNodeEnrollmentResponse);
+  rpc DeleteNodeEnrollment(DeleteNodeEnrollmentRequest)
+      returns (DeleteNodeEnrollmentResponse);
+  rpc ListAgentRoutes(ListAgentRoutesRequest)
+      returns (ListAgentRoutesResponse) {
+    option (google.api.http) = {
+      post : "/agent/routes:list"
+      body : "*"
+    };
+  }
+  rpc UpdateAgentRouteStatus(UpdateAgentRouteStatusRequest)
+      returns (UpdateAgentRouteStatusResponse) {
+    option (google.api.http) = {
+      post : "/agent/routes/status"
+      body : "*"
+    };
+  }
+  rpc UpdateAgentSSHStatus(UpdateAgentSSHStatusRequest)
+      returns (UpdateAgentSSHStatusResponse) {
+    option (google.api.http) = {
+      post : "/agent/ssh/status"
+      body : "*"
+    };
+  }
+  rpc UpdateAgentAvailability(UpdateAgentAvailabilityRequest)
+      returns (UpdateAgentAvailabilityResponse) {
+    option (google.api.http) = {
+      post : "/agent/availability"
+      body : "*"
+    };
+  }
+  rpc StreamAgent(StreamAgentRequest) returns (stream StreamAgentResponse);
+  rpc StreamAgentTelemetry(stream AgentTelemetryRequest)
+      returns (AgentTelemetryResponse);
+
+  // Machines
+  rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse) {
+    option (google.api.http) = {
+      get : "/machines"
+    };
+  }
+  rpc CreateMachine(CreateMachineRequest) returns (CreateMachineResponse) {
+    option (google.api.http) = {
+      post : "/machines"
+      body : "*"
+    };
+  }
+  rpc DeleteMachine(DeleteMachineRequest) returns (DeleteMachineResponse) {
+    option (google.api.http) = {
+      delete : "/machines/{machine_id}"
+    };
+  }
+
+  // Tokens
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse) {
+    option (google.api.http) = {
+      get : "/tokens"
+    };
+  }
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse) {
+    option (google.api.http) = {
+      post : "/tokens"
+    };
+  }
+  rpc ToggleToken(ToggleTokenRequest) returns (ToggleTokenResponse) {
+    option (google.api.http) = {
+      post : "/tokens/{token_id}/toggle"
+    };
+  }
+  rpc DeleteToken(DeleteTokenRequest) returns (DeleteTokenResponse) {
+    option (google.api.http) = {
+      delete : "/tokens/{token_id}"
+    };
+  }
+
+  // Workers
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse) {
+    option (google.api.http) = {
+      get : "/workers"
+    };
+  }
+  rpc CordonWorker(CordonWorkerRequest) returns (CordonWorkerResponse) {
+    option (google.api.http) = {
+      post : "/workers/{worker_id}/cordon"
+    };
+  }
+  rpc UncordonWorker(UncordonWorkerRequest) returns (UncordonWorkerResponse) {
+    option (google.api.http) = {
+      post : "/workers/{worker_id}/uncordon"
+    };
+  }
+  rpc DrainWorker(DrainWorkerRequest) returns (DrainWorkerResponse) {
+    option (google.api.http) = {
+      post : "/workers/{worker_id}/drain"
+    };
+  }
+
+  // Workspace
+  rpc ExportWorkspaceConfig(ExportWorkspaceConfigRequest)
+      returns (ExportWorkspaceConfigResponse) {
+    option (google.api.http) = {
+      get : "/workspace/config"
+    };
+  }
+}
+
+message AuthorizeRequest {}
+
+message AuthorizeResponse {
+  bool ok = 1;
+  string workspace_id = 2;
+  string new_token = 3;
+  string error_msg = 4;
+}
+
+message SignPayloadRequest { bytes payload = 1; }
+
+message SignPayloadResponse {
+  bool ok = 1;
+  string signature = 2;
+  int64 timestamp = 3;
+  string error_msg = 4;
+}
+
+message ObjectMetadata {
+  string name = 1;
+  int64 size = 2;
+}
+
+message HeadObjectRequest {
+  string hash = 1;
+  bool supports_put_headers = 2;
+}
+
+message HeadObjectResponse {
+  bool ok = 1;
+  bool exists = 2;
+  string object_id = 3;
+  ObjectMetadata object_metadata = 4;
+  string error_msg = 5;
+  bool use_workspace_storage = 6;
+}
+
+message CreateObjectRequest {
+  ObjectMetadata object_metadata = 1;
+  string hash = 2;
+  int64 size = 3;
+  bool overwrite = 4;
+  bool supports_put_headers = 5;
+  // When > 0 the client can upload the object as concurrent parts of this
+  // many bytes; the gateway answers with upload_parts instead of a single
+  // presigned_url for objects larger than one part.
+  int64 multipart_part_size = 6;
+  // Byte length of the archive the parts cover (size is the manifest's
+  // uncompressed total, which is what the object record stores).
+  int64 multipart_total_size = 7;
+}
+
+message ObjectUploadPart {
+  uint32 number = 1;
+  int64 start = 2;
+  int64 end = 3;
+  string url = 4;
+}
+
+message CreateObjectResponse {
+  bool ok = 1;
+  string object_id = 2;
+  string presigned_url = 3;
+  string error_msg = 4;
+  map<string, string> put_headers = 5;
+  string upload_id = 6;
+  repeated ObjectUploadPart upload_parts = 7;
+}
+
+message ObjectUploadedPart {
+  uint32 number = 1;
+  string etag = 2;
+}
+
+message CompleteObjectUploadRequest {
+  string object_id = 1;
+  string upload_id = 2;
+  repeated ObjectUploadedPart parts = 3;
+}
+
+message CompleteObjectUploadResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PutObjectRequest {
+  bytes object_content = 1;
+  ObjectMetadata object_metadata = 2;
+  string hash = 3;
+  bool overwrite = 4;
+}
+
+message PutObjectResponse {
+  bool ok = 1;
+  string object_id = 2;
+  string error_msg = 3;
+}
+
+// Incremental sync: instead of re-uploading a whole workspace archive when a
+// few files changed, the client uploads an archive holding only the added and
+// modified files (the delta) and the gateway merges it with the archive of a
+// previous object of the same workspace into the new object.
+message CreateObjectDeltaRequest {
+  string hash = 1;           // identity of the merged object (content manifest hash)
+  int64 size = 2;            // expected size of the merged archive
+  string base_object_id = 3; // object the delta is relative to
+  int64 delta_size = 4;
+}
+
+message CreateObjectDeltaResponse {
+  bool ok = 1;
+  string object_id = 2;
+  string presigned_url = 3; // PUT the delta archive here
+  map<string, string> put_headers = 4;
+  string error_msg = 5;
+  bool base_missing = 6; // base object is gone: fall back to a full upload
+}
+
+message CommitObjectDeltaRequest {
+  string object_id = 1;
+  string base_object_id = 2;
+  repeated string removed_paths = 3; // base archive entries that no longer exist
+}
+
+message CommitObjectDeltaResponse {
+  bool ok = 1;
+  string object_id = 2;
+  int64 size = 3;
+  string error_msg = 4;
+}
+
+enum SyncContainerWorkspaceOperation {
+  WRITE = 0;
+  DELETE = 1;
+  MOVED = 2;
+}
+
+message SyncContainerWorkspaceRequest {
+  string container_id = 1;
+  string path = 2;
+  string new_path = 3;
+  bool is_dir = 4;
+  bytes data = 5;
+  SyncContainerWorkspaceOperation op = 6;
+}
+
+message SyncContainerWorkspaceResponse { bool ok = 1; }
+
+// Container messages
+
+message ListContainersRequest {}
+
+message ListContainersResponse {
+  repeated types.Container containers = 1;
+  bool ok = 2;
+  string error_msg = 3;
+}
+
+message StopContainerRequest { string container_id = 1; }
+
+message StopContainerResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message CheckpointContainerRequest { string container_id = 1; }
+
+message CheckpointContainerResponse {
+  bool ok = 1;
+  string checkpoint_id = 2;
+  string error_msg = 3;
+}
+
+message ContainerStreamMessage {
+  oneof payload {
+    AttachToContainerRequest attach_request = 1;
+    SyncContainerWorkspaceRequest sync_container_workspace = 2;
+  }
+}
+
+message AttachToContainerRequest { string container_id = 1; }
+
+message AttachToContainerResponse {
+  string output = 1;
+  bool done = 2;
+  int32 exit_code = 3;
+}
+
+// Task messages
+message StartTaskRequest {
+  string task_id = 1;
+  string container_id = 2;
+}
+
+message StartTaskResponse { bool ok = 1; }
+
+message EndTaskRequest {
+  string task_id = 1;
+  float task_duration = 2;
+  string task_status = 3;
+  string container_id = 4;
+  string container_hostname = 5;
+  float keep_warm_seconds = 6;
+  bytes result = 7;
+}
+
+message EndTaskResponse { bool ok = 1; }
+
+message StringList { repeated string values = 1; }
+
+message ListTasksRequest {
+  map<string, StringList> filters = 1;
+  uint32 limit = 2;
+}
+
+message Task {
+  string id = 2;
+  string status = 3;
+  string container_id = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp ended_at = 6;
+  string stub_id = 7;
+  string stub_name = 8;
+  string workspace_id = 9;
+  string workspace_name = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+}
+
+message ListTasksResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Task tasks = 3;
+  int32 total = 4;
+}
+
+message StopTasksRequest { repeated string task_ids = 1; }
+
+message StopTasksResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message Volume {
+  string id = 1;
+  string mount_path = 2;
+  optional types.MountPointConfig config = 3;
+}
+
+message SecretVar { string name = 1; }
+
+message Autoscaler {
+  string type = 1;
+  uint32 max_containers = 2;
+  uint32 tasks_per_container = 3;
+  uint32 min_containers = 4;
+}
+
+message DatabaseServingConfig {
+  string kind = 1;
+  uint32 port = 2;
+  string readiness_probe = 3;
+  string connection_env_name = 4;
+  repeated string credential_secret_names = 5;
+  string durability_mode = 6;
+  string username_secret_name = 7;
+  string password_secret_name = 8;
+  string database_secret_name = 9;
+  string connection_url_secret_name = 10;
+  // How long an object-store-flush disk may answer flushes before their
+  // commits; zero answers each only once it is committed.
+  uint32 commit_lag_ms = 11;
+}
+
+message ServingConfig {
+  string app_kind = 1;
+  string serving_protocol = 2;
+  reserved 3;
+  DatabaseServingConfig database = 4;
+}
+
+message DurableDisk {
+  string name = 1;
+  string size = 2;
+  string mount_path = 3;
+  string filesystem = 4;
+  string driver = 5;
+  bool read_only = 6;
+  // Snapshot used to initialize a disk with no snapshot history.
+  string source_snapshot_id = 7;
+}
+
+// A durable machine-root disk. The container's entire root filesystem delta
+// lives on a qcow-backed volume mounted at "/", so disk snapshots capture the
+// whole machine state. Shorthand for a DurableDisk with mount_path "/" and
+// the qcow driver.
+message PersistentRoot {
+  string size = 1;
+  // Snapshot used to initialize the root with no snapshot history.
+  string source_snapshot_id = 2;
+  // Disk name backing the root. Disk snapshot history is keyed by this name
+  // within the workspace, so each machine wanting its own root lineage must
+  // use a distinct name (e.g. the machine id). Defaults to "root".
+  string name = 3;
+}
+
+message TaskPolicy {
+  int64 timeout = 1;
+  uint32 max_retries = 2;
+  uint32 ttl = 3;
+}
+
+message Schema { map<string, SchemaField> fields = 1; }
+
+message SchemaField {
+  string type = 1;
+  Schema fields = 2;
+}
+
+message GetOrCreateStubRequest {
+  string object_id = 1;
+  string image_id = 2;
+  string stub_type = 3;
+  string name = 4;
+  string python_version = 5;
+  int64 cpu = 6;
+  int64 memory = 7;
+  string gpu = 8;
+  string handler = 9;
+  uint32 retries = 10;
+  int64 timeout = 11;
+  float keep_warm_seconds = 12;
+  uint32 workers = 13;
+  uint32 max_pending_tasks = 15;
+  repeated Volume volumes = 16;
+  bool force_create = 17;
+  string on_start = 18;
+  string callback_url = 19;
+  bool authorized = 20;
+  repeated SecretVar secrets = 21;
+  Autoscaler autoscaler = 22;
+  TaskPolicy task_policy = 23;
+  uint32 concurrent_requests = 24;
+  string extra = 25;
+  bool checkpoint_enabled = 26;
+  uint32 gpu_count = 27;
+  string on_deploy = 28;
+  string on_deploy_stub_id = 29;
+  repeated string entrypoint = 30;
+  repeated uint32 ports = 31;
+  repeated string env = 32;
+  string app_name = 33;
+  reserved 34;
+  Schema inputs = 35;
+  Schema outputs = 36;
+  bool tcp = 37;
+  bool block_network = 38;
+  repeated string allow_list = 39;
+  bool docker_enabled = 40;
+  PoolConfig pool = 41;
+  bool is_service = 42;
+  ServingConfig serving = 43;
+  repeated DurableDisk disks = 44;
+  types.CheckpointTrigger checkpoint_trigger = 46;
+  // Hostname to set inside the container.
+  string hostname = 47;
+  PersistentRoot persistent_root = 48;
+  // JSON-encoded types.ManagedEndpointStubConfig for managed_endpoint/* and
+  // managed_service/* stubs (system workspace only).
+  string managed_endpoint = 49;
+  // Run the sandbox in its own virtual machine (microvm pools only).
+  bool use_vm = 50;
+}
+
+message GetOrCreateStubResponse {
+  bool ok = 1;
+  string stub_id = 2;
+  string err_msg = 3;
+  string warn_msg = 4;
+  // Capacity verdict for the requested GPU types, computed at stub creation:
+  // "available", "low", or "none". Empty when no check applies (CPU-only
+  // workloads, private-pool-only stubs, or pool-selector-bound stubs).
+  string capacity_status = 5;
+  // GPU types from the request that no serverless pool supports.
+  repeated string unsupported_gpus = 6;
+  // Name of an existing ready private pool in the workspace that satisfies
+  // the GPU request. Set instead of capacity_status "none" so clients can
+  // re-issue stub creation targeting this pool.
+  string matched_private_pool = 7;
+}
+
+message DeployStubRequest {
+  string stub_id = 1;
+  string name = 2;
+  string rollout = 3;
+}
+
+message DeployStubResponse {
+  bool ok = 1;
+  string deployment_id = 2;
+  uint32 version = 3;
+  string invoke_url = 4;
+  string err_msg = 5;
+  string warn_msg = 6;
+  string rollout_action = 7;
+}
+
+message Deployment {
+  string id = 1;
+  string name = 2;
+  bool active = 3;
+  string stub_id = 4;
+  string stub_type = 5;
+  string stub_name = 6;
+  uint32 version = 7;
+  string workspace_id = 8;
+  string workspace_name = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  string app_id = 12;
+  string database_kind = 13;
+  string connection_string_secret = 14;
+  string connection_env_name = 15;
+}
+
+message ListDeploymentsRequest {
+  map<string, StringList> filters = 1;
+  uint32 limit = 2;
+}
+
+message ListDeploymentsResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Deployment deployments = 3;
+}
+
+message StopDeploymentRequest { string id = 1; }
+
+message StopDeploymentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message StartDeploymentRequest { string id = 1; }
+
+message StartDeploymentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message ScaleDeploymentRequest {
+  string id = 1;
+  uint32 containers = 2;
+}
+
+message ScaleDeploymentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message DeleteDeploymentRequest { string id = 1; }
+
+message DeleteDeploymentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message Pool {
+  string name = 2;
+  bool active = 3;
+  string gpu = 4;
+  string minFreeGpu = 5;
+  string minFreeCpu = 6;
+  string minFreeMemory = 7;
+  string defaultWorkerCpu = 8;
+  string defaultWorkerMemory = 9;
+  string defaultWorkerGpuCount = 10;
+  types.WorkerPoolState state = 11;
+}
+
+message ListPoolsRequest {
+  map<string, StringList> filters = 1;
+  uint32 limit = 2;
+}
+
+message ListPoolsResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Pool pools = 3;
+}
+
+message PoolConfig {
+  string name = 1;
+  repeated string gpu = 2;
+  uint32 nodes = 3;
+  string ttl = 4;
+  double max_spend = 5;
+  repeated string providers = 6;
+  repeated string regions = 7;
+  double min_reliability = 8;
+  string selector = 9;
+  string mode = 10;
+  string transport = 11;
+  string fallback = 12;
+  int32 priority = 13;
+  string offer_id = 14;
+  // Runtime for workers in this pool.
+  string container_runtime = 15;
+}
+
+message PoolOffer {
+  string id = 1;
+  string provider = 2;
+  string instance_type = 3;
+  string region = 4;
+  string gpu = 5;
+  uint32 gpu_count = 6;
+  int64 cpu_millicores = 7;
+  int64 memory_mb = 8;
+  int64 hourly_cost_micros = 9;
+  double reliability = 10;
+  uint32 available = 11;
+  int64 storage_mb = 12;
+  string cloud = 13;
+  uint32 node_count = 14;
+  string display_name = 15;
+  string category = 16;
+  string region_display_name = 17;
+  double latitude = 18;
+  double longitude = 19;
+}
+
+message ProviderInstance {
+  string id = 1;
+  string pool_name = 2;
+  string provider = 3;
+  string offer_id = 4;
+  string status = 5;
+  uint32 gpu_count = 6;
+  int64 hourly_cost_micros = 7;
+  string source = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  google.protobuf.Timestamp billing_renewal_at = 11;
+  string status_message = 12;
+  string terminating_reason = 13;
+  string machine_id = 14;
+  string cloud = 15;
+  string region = 16;
+  uint32 node_count = 17;
+  string instance_type = 18;
+  int64 cpu_millicores = 19;
+  int64 memory_mb = 20;
+  int64 storage_mb = 21;
+}
+
+message PrivatePool {
+  string name = 1;
+  string selector = 2;
+  PoolConfig config = 3;
+  repeated ProviderInstance reservations = 4;
+  int64 committed_spend_micros = 6;
+  string status = 7;
+  string source = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  uint32 machine_count = 11;
+  uint32 ready_machine_count = 12;
+  uint32 reserved_nodes = 13;
+  BYOCPoolState byoc = 14;
+}
+
+message ListPoolOffersRequest { PoolConfig pool = 1; }
+
+message ListPoolOffersResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated PoolOffer offers = 3;
+}
+
+message LaunchPoolCapacityRequest {
+  PoolConfig pool = 1;
+  uint32 nodes = 2;
+}
+
+message LaunchPoolCapacityResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  string error_code = 4;
+  int64 required_cents = 5;
+  int64 available_cents = 6;
+}
+
+message ListPrivatePoolsRequest {
+  map<string, StringList> filters = 1;
+  uint32 limit = 2;
+}
+
+message ListPrivatePoolsResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated PrivatePool pools = 3;
+}
+
+message CreateBYOCPoolRequest {
+  string provider = 1;
+  string pool_name = 2;
+  string region = 3;
+  string instance_type = 4;
+  uint32 desired_nodes = 5;
+  uint32 max_nodes = 6;
+  string account_id = 7;
+  string gpu = 8;
+  uint32 gpu_count = 9;
+}
+
+message CreateBYOCPoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  string setup_url = 4;
+  string resource_name = 5;
+  string resource_url = 6;
+  BYOCPoolState byoc = 7;
+}
+
+message BYOCPoolState {
+  string provider = 1;
+  string account_id = 2;
+  string region = 3;
+  string resource_name = 4;
+  string resource_url = 5;
+  string destroy_url = 6;
+  string phase = 7;
+  uint32 desired_nodes = 8;
+  uint32 max_nodes = 9;
+  uint32 target_sandboxes = 10;
+  uint32 sandboxes_per_node = 11;
+  string instance_type = 12;
+  uint32 machine_count = 13;
+  uint32 ready_machine_count = 14;
+  string message = 15;
+  int64 hourly_cost_micros = 16;
+  int64 total_hourly_cost_micros = 17;
+  bool direct_scale_enabled = 18;
+  string gpu = 19;
+  uint32 gpu_count = 20;
+}
+
+message GetBYOCPoolRequest {
+  string pool_name = 1;
+}
+
+message GetBYOCPoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  bool ready = 4;
+  uint32 ready_machine_count = 5;
+  uint32 machine_count = 6;
+  BYOCPoolState byoc = 7;
+}
+
+message ScaleBYOCPoolRequest {
+  string pool_name = 1;
+  uint32 desired_nodes = 2;
+  uint32 max_nodes = 3;
+}
+
+message ScaleBYOCPoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+  BYOCPoolState byoc = 4;
+}
+
+message GetProviderJoinCommandRequest {
+  // GPU type of the machines that will join (one provider pool per GPU type).
+  string gpu = 1;
+  string ttl = 2;
+}
+
+message GetProviderJoinCommandResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string command = 3;
+  string token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  string pool_name = 6;
+}
+
+message ListProviderMachinesRequest {}
+
+message ListProviderMachinesResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Machine machines = 3;
+}
+
+// Managed endpoint usage of the calling workspace: what it spent calling
+// models ("spend") or earned serving them on its contributed machines ("earned").
+message GetEndpointUsageRequest {
+  string kind = 1; // spend (default) | earned
+  // Inclusive UTC day bounds (YYYY-MM-DD); end_date defaults to today.
+  string start_date = 2;
+  string end_date = 3;
+}
+
+message EndpointUsage {
+  int64 requests = 1;
+  int64 prompt_tokens = 2;
+  int64 completion_tokens = 3;
+  int64 images = 4;
+  int64 micro_usd = 5;
+  // Cached tokens are included in prompt_tokens. Prompt cost excludes cache.
+  int64 cached_tokens = 6;
+  int64 prompt_micro_usd = 7;
+  int64 completion_micro_usd = 8;
+  int64 cached_micro_usd = 9;
+  int64 request_micro_usd = 10;
+  int64 image_micro_usd = 11;
+}
+
+message GetEndpointUsageResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  EndpointUsage total = 3;
+  map<string, EndpointUsage> per_model = 4;
+  map<string, EndpointUsage> per_day = 5;
+}
+
+message ListMachineContainersRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+}
+
+message MachineContainer {
+  string container_id = 1;
+  string stub_id = 2;
+  string status = 3;
+  string workspace_id = 4;
+  string gpu = 5;
+  uint32 gpu_count = 6;
+  int64 cpu = 7;
+  int64 memory = 8;
+  int64 scheduled_at = 9;
+  int64 started_at = 10;
+}
+
+message ListMachineContainersResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated MachineContainer containers = 3;
+}
+
+message CreatePoolRequest { PoolConfig pool = 1; }
+
+message CreatePoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+}
+
+message DeletePoolRequest { string name = 1; }
+
+message DeletePoolResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message ExtendPoolCapacityRequest {
+  string name = 1;
+  string ttl = 2;
+  double max_spend = 3;
+}
+
+message ExtendPoolCapacityResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  PrivatePool pool = 3;
+}
+
+message CreatePoolJoinTokenRequest {
+  string pool_name = 1;
+  string ttl = 2;
+}
+
+message CreatePoolJoinTokenResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string token = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message RevokePoolJoinTokenRequest { string token = 1; }
+
+message RevokePoolJoinTokenResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message GetPoolJoinCommandRequest {
+  string pool_name = 1;
+  string ttl = 2;
+}
+
+message GetPoolJoinCommandResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string command = 3;
+  string token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message ListPoolMachinesRequest {
+  string pool_name = 1;
+  uint32 limit = 2;
+}
+
+message ListPoolMachinesResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Machine machines = 3;
+}
+
+message AgentBootstrapConfig {
+  string gateway_http_url = 1;
+  string gateway_grpc_host = 2;
+  int32 gateway_grpc_port = 3;
+  bool gateway_grpc_tls = 4;
+  string workspace_id = 5;
+  string pool_name = 6;
+  string transport = 7;
+  string executor = 8;
+  string fallback = 9;
+  reserved 10;
+  reserved "disabled_services";
+  string image_registry_store = 11;
+  uint32 image_clip_version = 12;
+  bool image_local_cache_enabled = 13;
+  AgentTelemetryConfig telemetry = 14;
+  // Non-secret publishing settings; registry credentials remain gateway-brokered.
+  string image_build_registry = 15;
+  string image_build_repository_name = 16;
+  bool image_build_registry_insecure = 17;
+}
+
+message AgentTelemetryConfig {
+  bool enabled = 1;
+  string stream_prefix = 2;
+  AgentTelemetrySinkConfig logs = 3;
+  AgentTelemetrySinkConfig events = 4;
+}
+
+message AgentTelemetrySinkConfig {
+  string destination = 1;
+  string credential = 2;
+  string stream_prefix = 3;
+}
+
+message JoinAgentRequest {
+  string join_token = 1;
+  string machine_fingerprint = 2;
+  string hostname = 3;
+  string os = 4;
+  string arch = 5;
+  uint32 cpu_count = 6;
+  uint64 memory_mb = 7;
+  repeated string gpu = 8;
+  uint32 gpu_count = 9;
+  repeated AgentPreflightCheck preflight = 10;
+  bool schedulable = 11;
+  string executor = 12;
+  int64 cpu_millicores = 13;
+  repeated string gpu_ids = 14;
+  uint32 network_slot_pool_size = 15;
+  uint32 container_start_concurrency = 16;
+  // Optional per-machine worker image override. The gateway remembers the
+  // generated value as a baseline so untouched installs continue to follow
+  // future image tag changes while manually edited values remain pinned.
+  string worker_image = 17;
+  repeated string capabilities = 18;
+}
+
+message JoinAgentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string workspace_id = 3;
+  string pool_name = 4;
+  string machine_id = 5;
+  string agent_token = 6;
+  AgentBootstrapConfig bootstrap = 7;
+}
+
+message AgentPreflightCheck {
+  string name = 1;
+  bool ok = 2;
+  string message = 3;
+  string severity = 4;
+}
+
+message AgentRoute {
+  string route_id = 1;
+  string workspace_id = 2;
+  string pool_name = 3;
+  string machine_id = 4;
+  string worker_id = 5;
+  string container_id = 6;
+  string kind = 7;
+  int32 port = 8;
+  string protocol = 9;
+  string transport = 10;
+  string local_target = 11;
+  string proxy_target = 12;
+  string state = 13;
+  string error = 14;
+  int64 updated_at = 15;
+}
+
+message RequestAgentTransportCredentialRequest {
+  string agent_token = 1;
+  string transport = 2;
+}
+
+message RequestAgentTransportCredentialResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string auth_key = 3;
+  string control_url = 4;
+  string hostname = 5;
+  bool ephemeral = 6;
+  // Run Tailscale SSH on the node; the tailnet policy decides who may log in.
+  bool tailnet_ssh = 7;
+}
+
+message CreateNodeEnrollmentRequest { string agent_token = 1; }
+
+message CreateNodeEnrollmentResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string enrollment_token = 3;
+}
+
+message DeleteNodeEnrollmentRequest { string agent_token = 1; }
+
+message DeleteNodeEnrollmentResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ListAgentRoutesRequest { string agent_token = 1; }
+
+message ListAgentRoutesResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated AgentRoute routes = 3;
+}
+
+message UpdateAgentRouteStatusRequest {
+  string agent_token = 1;
+  string route_id = 2;
+  string state = 3;
+  string proxy_target = 4;
+  string error = 5;
+  map<string, string> attrs = 6;
+}
+
+message UpdateAgentRouteStatusResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message AgentWorkerSlot {
+  string worker_id = 1;
+  string worker_token = 2;
+  string pool_name = 3;
+  string machine_id = 4;
+  int64 cpu = 5;
+  int64 memory = 6;
+  string gpu = 7;
+  uint32 gpu_count = 8;
+  string gpu_assignment = 9;
+  string network_prefix = 10;
+  string worker_image = 11;
+  uint32 network_slot_pool_size = 12;
+  uint32 container_start_concurrency = 13;
+  // Pool mode ("private" / "provider" / "external") and the container
+  // runtime the worker must run with.
+  string mode = 14;
+  string container_runtime = 15;
+  bool requires_pool_selector = 18;
+  int32 priority = 19;
+  bool preemptable = 20;
+  // Distinguishes an explicitly configured zero priority from legacy
+  // gateways that did not send scheduling priority metadata.
+  bool priority_set = 21;
+  string gvisor_platform = 22;
+  string gvisor_root = 23;
+  repeated string gvisor_extra_args = 24;
+  // Deterministic identity of the restart-relevant slot specification.
+  string generation = 25;
+  bool cpu_affinity_enforced = 26;
+  AgentPoolRuntimeConfig pool_config = 27;
+}
+
+message StreamAgentRequest { string agent_token = 1; }
+
+message StreamAgentResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated AgentRoute routes = 3;
+  repeated AgentWorkerSlot slots = 4;
+  AgentSSHConfig ssh = 5;
+}
+
+message AgentLogRecord {
+  string source = 1;
+  string worker_id = 2;
+  string level = 3;
+  string stream = 4;
+  string line = 5;
+  int64 timestamp_unix_nano = 6;
+}
+
+message AgentMetricSnapshot {
+  int64 timestamp_unix_nano = 1;
+  float cpu_utilization_pct = 2;
+  uint64 memory_used_mb = 3;
+  uint64 memory_total_mb = 4;
+  float memory_utilization_pct = 5;
+  uint64 disk_used_mb = 6;
+  uint64 disk_total_mb = 7;
+  float disk_usage_pct = 8;
+  string disk_path = 9;
+  uint32 worker_count = 10;
+  uint32 container_count = 11;
+  uint32 free_gpu_count = 12;
+  repeated MachinePathMetrics path_metrics = 13;
+}
+
+message AgentEventRecord {
+  string action = 1;
+  string status = 2;
+  string message = 3;
+  map<string, string> attrs = 4;
+  int64 timestamp_unix_nano = 5;
+  string event_type = 6;
+}
+
+message AgentNetworkInfo {
+  string public_ip = 1;
+  string tailnet_ip = 2;
+  string tailnet_hostname = 3;
+  bool tailnet_ssh = 4;
+}
+
+message AgentTelemetryRequest {
+  string agent_token = 1;
+  repeated AgentLogRecord logs = 2;
+  AgentMetricSnapshot metrics = 3;
+  repeated AgentEventRecord events = 4;
+  AgentNetworkInfo network = 5;
+}
+
+message AgentTelemetryResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message Machine {
+  string id = 1;
+  int64 cpu = 2;
+  int64 memory = 3;
+  string gpu = 4;
+  uint32 gpu_count = 5;
+  string status = 6;
+  string pool_name = 7;
+  reserved 8, 9, 10, 11, 16;
+  reserved "provider_name", "registration_token", "tailscale_url", "tailscale_auth", "user_data";
+  string last_keepalive = 12;
+  string created = 13;
+  string agent_version = 14;
+  MachineMetrics machine_metrics = 15;
+  MachineSSHAccess ssh = 17;
+  string public_ip = 18;
+  string tailnet_hostname = 19;
+  string tailnet_ip = 20;
+  bool tailnet_ssh = 21;
+}
+
+message MachineMetrics {
+  int32 total_cpu_available = 1;
+  int32 total_memory_available = 2;
+  float cpu_utilization_pct = 3;
+  float memory_utilization_pct = 4;
+  int32 worker_count = 5;
+  int32 container_count = 6;
+  int32 free_gpu_count = 7;
+  float cache_usage_pct = 8;
+  int32 cache_capacity = 9;
+  int32 cache_memory_usage = 10;
+  float cache_cpu_usage = 11;
+  int64 memory_used_mb = 12;
+  int64 memory_total_mb = 13;
+  int64 disk_used_mb = 14;
+  int64 disk_total_mb = 15;
+  float disk_usage_pct = 16;
+  repeated MachinePathMetrics path_metrics = 17;
+}
+
+message MachinePathMetrics {
+  string label = 1;
+  string path = 2;
+  uint64 used_mb = 3;
+  uint64 total_mb = 4;
+  uint64 available_mb = 5;
+  float usage_pct = 6;
+}
+
+message ListMachinesRequest {
+  string pool_name = 1;
+  uint32 limit = 2;
+}
+
+message ListMachinesResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Machine machines = 3;
+  // gpus reports live worker availability per GPU type (a worker with that
+  // GPU is currently registered).
+  map<string, bool> gpus = 4;
+  // supported_gpus reports pool-config-based serverless support per GPU
+  // type: true when a pool could serve the GPU even if scaled to zero.
+  map<string, bool> supported_gpus = 5;
+  // Resource ceilings enforced when creating a serverless stub. Private
+  // on-demand pools own their machine and do not use these limits.
+  uint32 max_cpu_millicores = 6;
+  uint32 max_memory_mb = 7;
+}
+
+message CreateMachineRequest { string pool_name = 1; }
+
+message CreateMachineResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  Machine machine = 3;
+  reserved 4, 5, 6;
+  reserved "agent_upstream_url", "agent_upstream_branch", "agent_upstream_token";
+  // Agent-backed managed pools return the systemd installer here. The join
+  // token embedded in the command is short-lived and machine-bound.
+  string install_command = 7;
+}
+
+message DeleteMachineRequest {
+  string machine_id = 1;
+  string pool_name = 2;
+}
+
+message DeleteMachineResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message Token {
+  string token_id = 1;
+  string key = 2;
+  bool active = 3;
+  bool reusable = 4;
+  optional uint32 workspace_id = 5;
+  string token_type = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message ListTokensRequest {}
+
+message ListTokensResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated Token tokens = 3;
+}
+
+message CreateTokenRequest {
+  string token_type = 1;
+}
+
+message CreateTokenResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  Token token = 3;
+}
+
+message ToggleTokenRequest { string token_id = 1; }
+
+message ToggleTokenResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  Token token = 3;
+}
+
+message DeleteTokenRequest { string token_id = 1; }
+
+message DeleteTokenResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message GetURLRequest {
+  string stub_id = 1;
+  string deployment_id = 2;
+  string url_type = 3;
+  bool is_shell = 4;
+}
+
+message GetURLResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string url = 3;
+}
+
+message ListWorkersRequest {}
+
+message ListWorkersResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  repeated types.Worker workers = 3;
+}
+
+message CordonWorkerRequest { string worker_id = 1; }
+
+message CordonWorkerResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message UncordonWorkerRequest { string worker_id = 1; }
+
+message UncordonWorkerResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message DrainWorkerRequest {
+  string worker_id = 1;
+  // Recreate an agent-managed worker after its outstanding work has drained.
+  // The replacement remains cordoned until explicitly uncordoned.
+  bool restart = 2;
+}
+
+message DrainWorkerResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message ExportWorkspaceConfigRequest {}
+
+message ExportWorkspaceConfigResponse {
+  string gateway_http_host = 1;
+  int32 gateway_http_port = 2;
+  bool gateway_http_tls = 3;
+  string gateway_grpc_host = 4;
+  int32 gateway_grpc_port = 5;
+  bool gateway_grpc_tls = 6;
+  string workspace_id = 7;
+  // Advertises gateway support for the persistent VM HTTP management API.
+  // When true, clients can skip the VM API capability preflight. False/unset
+  // leaves support unknown (older gateways), so clients must probe the API.
+  // Independent of any VM's existence, lifecycle state or readiness.
+  bool persistent_vms = 8;
+}
+
+message UpdateAgentAvailabilityRequest {
+  string agent_token = 1;
+  bool schedulable = 2;
+  string reason = 3;
+  // Unix nanoseconds, matching the *_unix_nano convention used elsewhere in
+  // this file (e.g. AgentLogRecord.timestamp_unix_nano).
+  int64 observed_at_unix_nano = 4;
+}
+
+message UpdateAgentAvailabilityResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+// Managed SSH messages live at the end of this file so adding the feature
+// does not renumber every existing generated message implementation.
+message DownloadMachineSSHKeyRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+}
+
+message DownloadMachineSSHKeyResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  string private_key = 3;
+  string filename = 4;
+  uint64 generation = 5;
+  string fingerprint = 6;
+  bool activation_required = 7;
+}
+
+message RotateMachineSSHKeyRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+}
+
+message RotateMachineSSHKeyResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MachineSSHAccess ssh = 3;
+}
+
+message ActivateMachineSSHKeyRequest {
+  string pool_name = 1;
+  string machine_id = 2;
+  uint64 generation = 3;
+}
+
+message ActivateMachineSSHKeyResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  MachineSSHAccess ssh = 3;
+}
+
+message AgentSSHConfig {
+  bool enabled = 1;
+  string username = 2;
+  string public_key = 3;
+  string key_fingerprint = 4;
+  uint64 generation = 5;
+}
+
+message UpdateAgentSSHStatusRequest {
+  string agent_token = 1;
+  uint64 generation = 2;
+  string status = 3;
+  string public_ip = 4;
+  string host_key_fingerprint = 5;
+  string error = 6;
+  uint32 listen_port = 7;
+}
+
+message UpdateAgentSSHStatusResponse {
+  bool ok = 1;
+  string err_msg = 2;
+}
+
+message MachineSSHAccess {
+  bool supported = 1;
+  string status = 2;
+  string public_ip = 3;
+  string host = 4;
+  uint32 port = 5;
+  string username = 6;
+  uint64 active_generation = 7;
+  uint64 applied_generation = 8;
+  string key_fingerprint = 9;
+  string host_key_fingerprint = 10;
+  bool private_key_available = 11;
+  bool pending_rotation = 12;
+  uint64 pending_generation = 13;
+  string pending_fingerprint = 14;
+  bool pending_key_available = 15;
+  bool pending_key_downloaded = 16;
+  string error = 17;
+  google.protobuf.Timestamp updated_at = 18;
+}
+
+// Host-backed runtime settings for an agent worker. Presence of this message
+// means the managed pool configuration is authoritative; older gateways omit
+// it and agents retain their installer-level state/cache defaults.
+message AgentPoolCacheDiskConfig {
+  bool enabled = 1;
+  string host_path = 2;
+  string mount_path = 3;
+  double max_usage_pct = 4;
+  int64 min_free_bytes = 5;
+}
+
+message AgentPoolCacheConfig {
+  bool enabled = 1;
+  AgentPoolCacheDiskConfig disk = 2;
+}
+
+message AgentPoolRuntimeConfig {
+  bool network_preallocation = 1;
+  bool criu_enabled = 2;
+  string tmp_size_limit = 3;
+  string storage_mode = 4;
+  string storage_path = 5;
+  string images_path = 6;
+  string durable_disks_path = 7;
+  AgentPoolCacheConfig cache = 8;
+  string config_group = 9;
+  bool gpu_virtualized = 10;
+}
+
+message GetAgentPoolVirtualizationRequest { string agent_token = 1; }
+
+message GetAgentPoolVirtualizationResponse {
+  bool ok = 1;
+  string err_msg = 2;
+  bool gpu_virtualized = 3;
+}

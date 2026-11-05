@@ -1,0 +1,1239 @@
+package types
+
+import (
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/lib/pq"
+
+	pb "github.com/beam-cloud/beta9/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+type Time struct {
+	time.Time
+}
+
+func (t Time) Serialize() string {
+	return t.Time.Format(time.RFC3339Nano)
+}
+
+func (t *Time) Scan(value interface{}) error {
+	_t, ok := value.(time.Time)
+	if !ok {
+		return fmt.Errorf("type assertion to time.Time failed")
+	}
+
+	t.Time = _t
+	return nil
+}
+
+// Value implements the driver.Valuer interface for SQL operations
+func (t Time) Value() (driver.Value, error) {
+	return t.Time, nil
+}
+
+// @go2proto
+type NullTime struct {
+	Time  time.Time
+	Valid bool
+}
+
+func (t *NullTime) Scan(value interface{}) error {
+	var nullTime sql.NullTime
+	if err := nullTime.Scan(value); err != nil {
+		return err
+	}
+
+	t.Time = nullTime.Time
+	t.Valid = nullTime.Valid
+	return nil
+}
+
+func (t NullTime) Value() (driver.Value, error) {
+	if !t.Valid {
+		return nil, nil
+	}
+
+	return t.Time, nil
+}
+
+func (t NullTime) Serialize() interface{} {
+	if !t.Valid {
+		return nil
+	}
+
+	return t.Time.Format(time.RFC3339Nano)
+}
+
+func (t NullTime) Now() NullTime {
+	return NullTime{
+		Time:  time.Now(),
+		Valid: true,
+	}
+}
+
+// @go2proto
+type Workspace struct {
+	Id                 uint              `db:"id" json:"id,omitempty" serializer:"id,source:external_id"`
+	ExternalId         string            `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
+	Name               string            `db:"name" json:"name" serializer:"name"`
+	CreatedAt          Time              `db:"created_at" json:"created_at,omitempty" serializer:"created_at"`
+	UpdatedAt          Time              `db:"updated_at" json:"updated_at,omitempty" serializer:"updated_at"`
+	SigningKey         *string           `db:"signing_key" json:"signing_key" serializer:"signing_key"`
+	VolumeCacheEnabled bool              `db:"volume_cache_enabled" json:"volume_cache_enabled" serializer:"volume_cache_enabled"`
+	MultiGpuEnabled    bool              `db:"multi_gpu_enabled" json:"multi_gpu_enabled" serializer:"multi_gpu_enabled"`
+	ConcurrencyLimitId *uint             `db:"concurrency_limit_id" json:"concurrency_limit_id,omitempty"`
+	ConcurrencyLimit   *ConcurrencyLimit `db:"concurrency_limit" json:"concurrency_limit" serializer:"concurrency_limit,omitempty"`
+	StorageId          *uint             `db:"storage_id" json:"storage_id,omitempty" serializer:"storage_id,from:storage.external_id,omitempty"`
+	Storage            *WorkspaceStorage `db:"storage" json:"storage" serializer:"storage,omitempty"`
+}
+
+func (w *Workspace) StorageAvailable() bool {
+	return w.Storage != nil && w.Storage.Id != nil && *w.Storage.Id > 0
+}
+
+func (w Workspace) WithoutSigningKey() Workspace {
+	w.SigningKey = nil
+	return w
+}
+
+func (w Workspace) WithoutPrivateCredentials() Workspace {
+	w.SigningKey = nil
+	if w.Storage != nil {
+		storage := *w.Storage
+		storage.AccessKey = nil
+		storage.SecretKey = nil
+		w.Storage = &storage
+	}
+	return w
+}
+
+func (w *Workspace) ToProto() *pb.Workspace {
+	concurrencyLimit := &pb.ConcurrencyLimit{}
+	if w.ConcurrencyLimit != nil {
+		concurrencyLimit = w.ConcurrencyLimit.ToProto()
+	}
+
+	storage := &pb.WorkspaceStorage{}
+	if w.StorageAvailable() {
+		storage = w.Storage.ToProto()
+	}
+
+	return &pb.Workspace{
+		Id:                 uint32(w.Id),
+		ExternalId:         w.ExternalId,
+		Name:               w.Name,
+		SigningKey:         getStringOrDefault(w.SigningKey),
+		VolumeCacheEnabled: w.VolumeCacheEnabled,
+		MultiGpuEnabled:    w.MultiGpuEnabled,
+		ConcurrencyLimit:   concurrencyLimit,
+		Storage:            storage,
+	}
+}
+
+func NewWorkspaceFromProto(in *pb.Workspace) *Workspace {
+	concurrencyLimit := &ConcurrencyLimit{}
+	if in.ConcurrencyLimit != nil {
+		concurrencyLimit = NewConcurrencyLimitFromProto(in.ConcurrencyLimit)
+	}
+
+	storage := &WorkspaceStorage{}
+	if in.Storage != nil {
+		storage = NewWorkspaceStorageFromProto(in.Storage)
+	}
+
+	return &Workspace{
+		Id:                 uint(in.Id),
+		ExternalId:         in.ExternalId,
+		Name:               in.Name,
+		SigningKey:         getPointerOrNil(in.SigningKey),
+		VolumeCacheEnabled: in.VolumeCacheEnabled,
+		MultiGpuEnabled:    in.MultiGpuEnabled,
+		ConcurrencyLimit:   concurrencyLimit,
+		Storage:            storage,
+	}
+}
+
+// @go2proto
+type WorkspaceStorage struct {
+	Id          *uint      `db:"id" json:"id"`
+	ExternalId  *string    `db:"external_id" json:"external_id"`
+	BucketName  *string    `db:"bucket_name" json:"bucket_name"`
+	AccessKey   *string    `db:"access_key" json:"access_key" encrypt:"true"`
+	SecretKey   *string    `db:"secret_key" json:"secret_key" encrypt:"true"`
+	EndpointUrl *string    `db:"endpoint_url" json:"endpoint_url"`
+	Region      *string    `db:"region" json:"region"`
+	CreatedAt   *time.Time `db:"created_at" json:"created_at,omitempty"`
+	UpdatedAt   *time.Time `db:"updated_at" json:"updated_at,omitempty"`
+}
+
+func NewWorkspaceStorageFromProto(in *pb.WorkspaceStorage) *WorkspaceStorage {
+	id := uint(in.Id)
+	createdAt := in.CreatedAt.AsTime()
+	updatedAt := in.UpdatedAt.AsTime()
+
+	return &WorkspaceStorage{
+		Id:          &id,
+		ExternalId:  &in.ExternalId,
+		BucketName:  &in.BucketName,
+		AccessKey:   &in.AccessKey,
+		SecretKey:   &in.SecretKey,
+		EndpointUrl: &in.EndpointUrl,
+		Region:      &in.Region,
+		CreatedAt:   &createdAt,
+		UpdatedAt:   &updatedAt,
+	}
+}
+
+func (w *WorkspaceStorage) ToProto() *pb.WorkspaceStorage {
+	createdAt := timestamppb.New(time.Time{})
+	if w.CreatedAt != nil {
+		createdAt = timestamppb.New(*w.CreatedAt)
+	}
+
+	updatedAt := timestamppb.New(time.Time{})
+	if w.UpdatedAt != nil {
+		updatedAt = timestamppb.New(*w.UpdatedAt)
+	}
+
+	return &pb.WorkspaceStorage{
+		Id:          uint32(getUintOrDefault(w.Id)),
+		ExternalId:  getStringOrDefault(w.ExternalId),
+		BucketName:  getStringOrDefault(w.BucketName),
+		AccessKey:   getStringOrDefault(w.AccessKey),
+		SecretKey:   getStringOrDefault(w.SecretKey),
+		Region:      getStringOrDefault(w.Region),
+		EndpointUrl: getStringOrDefault(w.EndpointUrl),
+		CreatedAt:   createdAt,
+		UpdatedAt:   updatedAt,
+	}
+}
+
+func getUintOrDefault(value *uint) uint {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+const (
+	TokenTypeClusterAdmin     string = "admin"
+	TokenTypeWorkspacePrimary string = "workspace_primary"
+	TokenTypeWorkspace        string = "workspace"
+	// Legacy: endpoints are now deployed by the repo's CI with a cluster admin
+	// token. Kept for existing rows; image builds from it are platform work.
+	TokenTypePlatformDeployer string = "platform_deployer"
+	TokenTypeWorker           string = "worker"
+	// TokenTypeWorkerPrivate is a worker token minted for private-pool (agent)
+	// compute running on customer machines. It carries the pool owner's
+	// workspace and marks the worker as untrusted customer compute, so the
+	// gateway scopes its cache namespace and credential access by workspace.
+	TokenTypeWorkerPrivate       string = "worker_private"
+	TokenTypeWorkspaceRestricted string = "workspace_restricted"
+)
+
+// IsWorkerTokenType reports whether the token type belongs to a worker
+// process: cluster workers (in-cluster and external pools) or private-pool
+// agent workers.
+func IsWorkerTokenType(tokenType string) bool {
+	return tokenType == TokenTypeWorker || tokenType == TokenTypeWorkerPrivate
+}
+
+// IsTokenType reports whether the gateway issues tokens of this type. Tokens
+// of retired types stay in the database but don't authenticate.
+func IsTokenType(tokenType string) bool {
+	switch tokenType {
+	case TokenTypeClusterAdmin, TokenTypeWorkspacePrimary, TokenTypeWorkspace, TokenTypePlatformDeployer,
+		TokenTypeWorker, TokenTypeWorkerPrivate, TokenTypeWorkspaceRestricted:
+		return true
+	}
+	return false
+}
+
+type Token struct {
+	Id                     uint       `db:"id" json:"id" serializer:"id,source:external_id"`
+	ExternalId             string     `db:"external_id" json:"external_id" serializer:"external_id"`
+	Key                    string     `db:"key" json:"key" serializer:"key"`
+	Active                 bool       `db:"active" json:"active" serializer:"active"`
+	Reusable               bool       `db:"reusable" json:"reusable" serializer:"reusable"`
+	WorkspaceId            *uint      `db:"workspace_id" json:"workspace_id,omitempty"`                            // Foreign key to Workspace
+	Workspace              *Workspace `db:"workspace" json:"workspace,omitempty" serializer:"workspace,omitempty"` // Pointer to associated Workspace
+	TokenType              string     `db:"token_type" json:"token_type" serializer:"token_type"`
+	CreatedAt              Time       `db:"created_at" json:"created_at" serializer:"created_at"`
+	UpdatedAt              Time       `db:"updated_at" json:"updated_at" serializer:"updated_at"`
+	DisabledByClusterAdmin bool       `db:"disabled_by_cluster_admin" json:"disabled_by_cluster_admin" serializer:"disabled_by_cluster_admin"`
+	// WorkerID is the only worker a worker token may act as; empty for other token types.
+	WorkerID string `db:"worker_id" json:"worker_id,omitempty"`
+}
+
+type Volume struct {
+	Id          uint   `db:"id" json:"id"`
+	ExternalId  string `db:"external_id" json:"external_id"`
+	Name        string `db:"name" json:"name"`
+	Size        uint64 `json:"size"`                           // Populated by volume abstraction
+	WorkspaceId uint   `db:"workspace_id" json:"workspace_id"` // Foreign key to Workspace
+	CreatedAt   Time   `db:"created_at" json:"created_at"`
+	UpdatedAt   Time   `db:"updated_at" json:"updated_at"`
+}
+
+type VolumeWithRelated struct {
+	Volume
+	Workspace Workspace `db:"workspace" json:"workspace"`
+}
+
+type Deployment struct {
+	Id          uint     `db:"id" json:"id" serializer:"id,source:external_id"`
+	ExternalId  string   `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
+	Name        string   `db:"name" json:"name" serializer:"name"`
+	Active      bool     `db:"active" json:"active" serializer:"active"`
+	Subdomain   string   `db:"subdomain" json:"subdomain" serializer:"subdomain"`
+	WorkspaceId uint     `db:"workspace_id" json:"workspace_id"` // Foreign key to Workspace
+	StubId      uint     `db:"stub_id" json:"stub_id"`           // Foreign key to Stub
+	StubType    string   `db:"stub_type" json:"stub_type" serializer:"stub_type"`
+	Version     uint     `db:"version" json:"version" serializer:"version"`
+	CreatedAt   Time     `db:"created_at" json:"created_at" serializer:"created_at"`
+	UpdatedAt   Time     `db:"updated_at" json:"updated_at" serializer:"updated_at"`
+	DeletedAt   NullTime `db:"deleted_at" json:"deleted_at" serializer:"deleted_at"`
+	AppId       uint     `db:"app_id" json:"app_id,omitempty"` // Foreign key to App
+}
+
+type DeploymentWithRelated struct {
+	Deployment
+	Workspace   Workspace `db:"workspace" json:"workspace" serializer:"workspace"`
+	Stub        Stub      `db:"stub" json:"stub" serializer:"stub"`
+	App         App       `db:"app" json:"app" serializer:"app"`
+	StubId      string    `serializer:"stub_id,source:stub.id"`
+	AppId       string    `serializer:"app_id,source:app.id"`
+	WorkspaceId string    `serializer:"workspace_id,source:workspace.id"`
+	URL         string    `db:"-" json:"url,omitempty" serializer:"url,omitempty"`
+	InvokeURL   string    `db:"-" json:"invoke_url,omitempty" serializer:"invoke_url,omitempty"`
+}
+
+// @go2proto
+type Object struct {
+	Id          uint   `db:"id" json:"id" serializer:"id,source:external_id"`
+	ExternalId  string `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
+	Hash        string `db:"hash" json:"hash" serializer:"hash"`
+	Size        int64  `db:"size" json:"size" serializer:"size"`
+	WorkspaceId uint   `db:"workspace_id" json:"workspace_id"` // Foreign key to Workspace
+	CreatedAt   Time   `db:"created_at" json:"created_at"`
+}
+
+func (o *Object) ToProto() *pb.Object {
+	return &pb.Object{
+		Id:          uint32(o.Id),
+		ExternalId:  o.ExternalId,
+		Hash:        o.Hash,
+		Size:        o.Size,
+		WorkspaceId: uint32(o.WorkspaceId),
+	}
+}
+
+func NewObjectFromProto(in *pb.Object) *Object {
+	return &Object{
+		Id:          uint(in.Id),
+		ExternalId:  in.ExternalId,
+		Hash:        in.Hash,
+		Size:        in.Size,
+		WorkspaceId: uint(in.WorkspaceId),
+	}
+}
+
+type TaskStatus string
+
+func (ts TaskStatus) IsCompleted() bool {
+	switch ts {
+	case TaskStatusComplete, TaskStatusCancelled, TaskStatusError, TaskStatusTimeout, TaskStatusExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func (ts TaskStatus) IsInflight() bool {
+	switch ts {
+	case TaskStatusPending, TaskStatusRunning, TaskStatusRetry:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	TaskStatusPending   TaskStatus = "PENDING"
+	TaskStatusRunning   TaskStatus = "RUNNING"
+	TaskStatusComplete  TaskStatus = "COMPLETE"
+	TaskStatusError     TaskStatus = "ERROR"
+	TaskStatusCancelled TaskStatus = "CANCELLED"
+	TaskStatusExpired   TaskStatus = "EXPIRED"
+	TaskStatusTimeout   TaskStatus = "TIMEOUT"
+	TaskStatusRetry     TaskStatus = "RETRY"
+)
+
+type TaskParams struct {
+	TaskId      string
+	ContainerId string
+	StubId      uint
+	WorkspaceId uint
+}
+
+type Task struct {
+	Id            uint       `db:"id" json:"id,omitempty" serializer:"id,source:external_id"`
+	ExternalId    string     `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
+	Status        TaskStatus `db:"status" json:"status,omitempty" serializer:"status"`
+	FailureReason string     `db:"failure_reason" json:"failure_reason,omitempty" serializer:"failure_reason"`
+	ContainerId   string     `db:"container_id" json:"container_id,omitempty" serializer:"container_id"`
+	StartedAt     NullTime   `db:"started_at" json:"started_at,omitempty" serializer:"started_at"`
+	EndedAt       NullTime   `db:"ended_at" json:"ended_at,omitempty" serializer:"ended_at"`
+	WorkspaceId   uint       `db:"workspace_id" json:"workspace_id,omitempty"` // Foreign key to Workspace
+	StubId        uint       `db:"stub_id" json:"stub_id,omitempty"`           // Foreign key to Stub
+	AppId         *uint      `db:"app_id" json:"app_id,omitempty"`             // Foreign key to App
+	CreatedAt     Time       `db:"created_at" json:"created_at,omitempty" serializer:"created_at"`
+	UpdatedAt     Time       `db:"updated_at" json:"updated_at,omitempty" serializer:"updated_at"`
+}
+
+type TaskWithRelated struct {
+	Task
+	Deployment struct {
+		ExternalId *string `db:"external_id" json:"external_id" serializer:"id"`
+		Name       *string `db:"name" json:"name" serializer:"name"`
+		Version    *uint   `db:"version" json:"version" serializer:"version"`
+	} `db:"deployment" json:"deployment" serializer:"deployment"`
+	Outputs   []TaskOutput    `json:"outputs" serializer:"outputs"`
+	Stats     TaskStats       `json:"stats" serializer:"stats"`
+	Result    json.RawMessage `json:"result" serializer:"result"`
+	Workspace Workspace       `db:"workspace" json:"workspace" serializer:"workspace"`
+	Stub      Stub            `db:"stub" json:"stub" serializer:"stub"`
+	App       App             `db:"app" json:"app" serializer:"app"`
+}
+
+type TaskCountPerDeployment struct {
+	DeploymentName string `db:"deployment_name" json:"deployment_name"`
+	TaskCount      uint   `db:"task_count" json:"task_count"`
+}
+
+// AppActivityBucket is one hour of an app's 24h activity strip: tasks created
+// (task-based stubs) plus sandboxes created (sandbox stubs), and how many of
+// those tasks ended in error.
+type AppActivityBucket struct {
+	Time   time.Time `json:"time"`
+	Total  int       `json:"total"`
+	Failed int       `json:"failed"`
+}
+
+type AppStateCounts struct {
+	All     int `json:"all" serializer:"all"`
+	Running int `json:"running" serializer:"running"`
+	Idle    int `json:"idle" serializer:"idle"`
+	Stopped int `json:"stopped" serializer:"stopped"`
+}
+
+type TaskCountByTime struct {
+	Time         time.Time       `db:"time" json:"time"`
+	Count        uint            `count:"count" json:"count"`
+	StatusCounts json.RawMessage `db:"status_counts" json:"status_counts"`
+}
+
+type TaskOutput struct {
+	Name      string `json:"name" serializer:"name"`
+	URL       string `json:"url" serializer:"url"`
+	ExpiresIn uint32 `json:"expires_in" serializer:"expires_in"`
+}
+
+type TaskStats struct {
+	ActiveContainers uint32 `json:"active_containers" serializer:"active_containers"`
+	QueueDepth       uint32 `json:"queue_depth" serializer:"queue_depth"`
+}
+
+// @go2proto
+type Checkpoint struct {
+	Id                uint     `db:"id" json:"id" serializer:"id,source:external_id" go2proto:"ignore"`
+	CheckpointId      string   `db:"checkpoint_id" json:"checkpoint_id" serializer:"checkpoint_id"`
+	ExternalId        string   `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
+	SourceContainerId string   `db:"source_container_id" json:"source_container_id" serializer:"source_container_id"`
+	ContainerIp       string   `db:"container_ip" json:"container_ip" serializer:"container_ip"`
+	Status            string   `db:"status" json:"status" serializer:"status"`
+	RemoteKey         string   `db:"remote_key" json:"remote_key" serializer:"remote_key"`
+	WorkspaceId       uint     `db:"workspace_id" json:"workspace_id" go2proto:"ignore"` // Foreign key to Workspace
+	StubId            uint     `db:"stub_id" json:"stub_id" go2proto:"ignore"`           // Foreign key to Stub
+	StubType          string   `db:"stub_type" json:"stub_type" serializer:"stub_type"`
+	AppId             uint     `db:"app_id" json:"app_id,omitempty" go2proto:"ignore"` // Foreign key to App
+	ExposedPorts      []uint32 `db:"exposed_ports" json:"exposed_ports" serializer:"exposed_ports"`
+	CreatedAt         Time     `db:"created_at" json:"created_at" serializer:"created_at"`
+	LastRestoredAt    Time     `db:"last_restored_at" json:"last_restored_at" serializer:"last_restored_at"`
+	DeletedAt         NullTime `db:"deleted_at" json:"deleted_at" serializer:"deleted_at"`
+	CacheHash         string   `db:"cache_hash" json:"cache_hash" serializer:"cache_hash"`
+	CacheSizeBytes    int64    `db:"cache_size_bytes" json:"cache_size_bytes" serializer:"cache_size_bytes"`
+	OriginKey         string   `db:"origin_key" json:"origin_key" serializer:"origin_key"`
+	Locality          string   `db:"locality" json:"locality" serializer:"locality"`
+	Accelerator       string   `db:"accelerator" json:"accelerator" serializer:"accelerator"`
+	Runtime           string   `db:"runtime" json:"runtime" serializer:"runtime"`
+	// Internal placement metadata, carried separately by worker RPCs.
+	CompatibilityKey string `db:"compatibility_key" json:"compatibility_key,omitempty" go2proto:"ignore"`
+}
+
+const CheckpointRuntimeFilesystem = "filesystem"
+
+const (
+	CheckpointCompatibilityLegacyPrefix     string = "v1:"
+	CheckpointCompatibilityGPUDevicesPrefix string = "v2:"
+)
+
+func (c *Checkpoint) IsFilesystemOnly() bool {
+	return c != nil && strings.EqualFold(strings.TrimSpace(c.Runtime), CheckpointRuntimeFilesystem)
+}
+
+// RequiresGPUDeviceSpec identifies checkpoints with saved NVIDIA device entries.
+// Workers that clear those entries cannot restore them.
+func (c *Checkpoint) RequiresGPUDeviceSpec() bool {
+	return c != nil && strings.HasPrefix(c.CompatibilityKey, CheckpointCompatibilityGPUDevicesPrefix)
+}
+
+// CompatibleWithWorker lets workers retaining NVIDIA devices restore matching
+// older checkpoints; older workers cannot restore checkpoints retaining devices.
+func (c *Checkpoint) CompatibleWithWorker(key string) bool {
+	if c == nil || c.CompatibilityKey == "" || key == "" {
+		return false
+	}
+	if c.CompatibilityKey == key {
+		return true
+	}
+	checkpointProfile, legacy := strings.CutPrefix(c.CompatibilityKey, CheckpointCompatibilityLegacyPrefix)
+	if !legacy || checkpointProfile == "" {
+		return false
+	}
+	workerProfile, retainsDevices := strings.CutPrefix(key, CheckpointCompatibilityGPUDevicesPrefix)
+	return retainsDevices && checkpointProfile == workerProfile
+}
+
+func (c *Checkpoint) ToProto() *pb.Checkpoint {
+	exposedPorts := make([]uint32, len(c.ExposedPorts))
+	for i, port := range c.ExposedPorts {
+		exposedPorts[i] = port
+	}
+
+	return &pb.Checkpoint{
+		CheckpointId:      c.CheckpointId,
+		ExternalId:        c.ExternalId,
+		SourceContainerId: c.SourceContainerId,
+		ContainerIp:       c.ContainerIp,
+		Status:            c.Status,
+		RemoteKey:         c.RemoteKey,
+		StubType:          c.StubType,
+		ExposedPorts:      exposedPorts,
+		CreatedAt:         timestamppb.New(c.CreatedAt.Time),
+		LastRestoredAt:    timestamppb.New(c.LastRestoredAt.Time),
+		CacheHash:         c.CacheHash,
+		CacheSizeBytes:    c.CacheSizeBytes,
+		OriginKey:         c.OriginKey,
+		Locality:          c.Locality,
+		Accelerator:       c.Accelerator,
+		Runtime:           c.Runtime,
+	}
+}
+
+func NewCheckpointFromProto(in *pb.Checkpoint) *Checkpoint {
+	exposedPorts := make([]uint32, len(in.ExposedPorts))
+	for i, port := range in.ExposedPorts {
+		exposedPorts[i] = uint32(port)
+	}
+
+	return &Checkpoint{
+		CheckpointId:      in.CheckpointId,
+		ExternalId:        in.ExternalId,
+		SourceContainerId: in.SourceContainerId,
+		ContainerIp:       in.ContainerIp,
+		Status:            in.Status,
+		RemoteKey:         in.RemoteKey,
+		StubType:          in.StubType,
+		ExposedPorts:      exposedPorts,
+		CreatedAt:         Time{Time: in.CreatedAt.AsTime()},
+		LastRestoredAt:    Time{Time: in.LastRestoredAt.AsTime()},
+		CacheHash:         in.CacheHash,
+		CacheSizeBytes:    in.CacheSizeBytes,
+		OriginKey:         in.OriginKey,
+		Locality:          in.Locality,
+		Accelerator:       in.Accelerator,
+		Runtime:           in.Runtime,
+	}
+}
+
+type StubConfigV1 struct {
+	Runtime            Runtime            `json:"runtime"`
+	Handler            string             `json:"handler"`
+	OnStart            string             `json:"on_start"`
+	OnDeploy           string             `json:"on_deploy"`
+	OnDeployStubId     string             `json:"on_deploy_stub_id"`
+	PythonVersion      string             `json:"python_version"`
+	KeepWarmSeconds    int                `json:"keep_warm_seconds"`
+	MaxPendingTasks    uint               `json:"max_pending_tasks"`
+	CallbackUrl        string             `json:"callback_url"`
+	TaskPolicy         TaskPolicy         `json:"task_policy"`
+	Workers            uint               `json:"workers"`
+	ConcurrentRequests uint               `json:"concurrent_requests"`
+	Authorized         bool               `json:"authorized"`
+	Volumes            []*pb.Volume       `json:"volumes"`
+	Secrets            []Secret           `json:"secrets,omitempty"`
+	Env                []string           `json:"env,omitempty"`
+	Autoscaler         *Autoscaler        `json:"autoscaler"`
+	Extra              json.RawMessage    `json:"extra"`
+	CheckpointEnabled  bool               `json:"checkpoint_enabled"`
+	CheckpointTrigger  *CheckpointTrigger `json:"checkpoint_trigger,omitempty"`
+	WorkDir            string             `json:"work_dir"`
+	EntryPoint         []string           `json:"entry_point"`
+	Ports              []uint32           `json:"ports"`
+	Inputs             *Schema            `json:"inputs"`
+	Outputs            *Schema            `json:"outputs"`
+	TCP                bool               `json:"tcp"`
+	BlockNetwork       bool               `json:"block_network"`
+	AllowList          []string           `json:"allow_list"`
+	DockerEnabled      bool               `json:"docker_enabled"`
+	// UseVM runs sandboxes in a microvm pool instead of a container runtime.
+	UseVM bool `json:"use_vm,omitempty"`
+	// Hostname to set inside the container.
+	Hostname string `json:"hostname,omitempty"`
+	// MachineID pins the stub's containers to one agent machine (pod/shell
+	// `--machine`); not exposed to the SDK decorators.
+	MachineID string            `json:"machine_id,omitempty"`
+	IsService bool              `json:"is_service"`
+	Serving   *ServingConfig    `json:"serving,omitempty"`
+	Pool      *PoolConfig       `json:"pool,omitempty"`
+	Disks     []*pb.DurableDisk `json:"disks,omitempty"`
+	// ManagedEndpoint carries the platform endpoint/service spec for
+	// managed_endpoint/* and managed_service/* stubs.
+	ManagedEndpoint *ManagedEndpointStubConfig `json:"managed_endpoint,omitempty"`
+
+	PreparationCacheKey string `json:"preparation_cache_key,omitempty"`
+}
+
+func (c *StubConfigV1) UnmarshalJSON(data []byte) error {
+	type config StubConfigV1
+	value := struct {
+		*config
+		KeepWarmSeconds json.RawMessage `json:"keep_warm_seconds"`
+	}{config: (*config)(c)}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	// Older clients encoded the indefinite (-1) TTL as an unsigned integer.
+	if string(value.KeepWarmSeconds) == "18446744073709551615" {
+		c.KeepWarmSeconds = -1
+		return nil
+	}
+	if len(value.KeepWarmSeconds) > 0 {
+		return json.Unmarshal(value.KeepWarmSeconds, &c.KeepWarmSeconds)
+	}
+	return nil
+}
+
+const (
+	ForceResourceLimitsMetadata  = "x-beta9-force-resource-limits"
+	forceResourceLimitsConfigKey = "_beta9_force_resource_limits"
+)
+
+// StubConfigWithForcedResourceLimits carries the request-scoped override over
+// the existing stub config wire path. Keeping the config as raw JSON preserves
+// fields introduced by newer clients that this gateway does not know yet.
+func StubConfigWithForcedResourceLimits(config string) (string, error) {
+	fields := map[string]json.RawMessage{}
+	if strings.TrimSpace(config) != "" && strings.TrimSpace(config) != "null" {
+		if err := json.Unmarshal([]byte(config), &fields); err != nil {
+			return "", err
+		}
+	}
+	fields[forceResourceLimitsConfigKey] = json.RawMessage("true")
+	updated, err := json.Marshal(fields)
+	if err != nil {
+		return "", err
+	}
+	return string(updated), nil
+}
+
+func StubConfigForcesResourceLimits(config string) bool {
+	marker := struct {
+		Enabled bool `json:"_beta9_force_resource_limits"`
+	}{}
+	return json.Unmarshal([]byte(config), &marker) == nil && marker.Enabled
+}
+
+type ServingConfig struct {
+	AppKind         string                 `json:"app_kind,omitempty" serializer:"app_kind,omitempty"`
+	ServingProtocol string                 `json:"serving_protocol,omitempty" serializer:"serving_protocol,omitempty"`
+	Database        *DatabaseServingConfig `json:"database,omitempty" serializer:"database,omitempty"`
+}
+
+type DatabaseServingConfig struct {
+	Kind                    string   `json:"kind,omitempty" serializer:"kind,omitempty"`
+	Port                    uint32   `json:"port,omitempty" serializer:"port,omitempty"`
+	ReadinessProbe          string   `json:"readiness_probe,omitempty" serializer:"readiness_probe,omitempty"`
+	ConnectionEnvName       string   `json:"connection_env_name,omitempty" serializer:"connection_env_name,omitempty"`
+	ConnectionURL           string   `json:"connection_url,omitempty" serializer:"connection_url,omitempty"`
+	CredentialSecretNames   []string `json:"credential_secret_names,omitempty" serializer:"credential_secret_names,omitempty"`
+	DurabilityMode          string   `json:"durability_mode,omitempty" serializer:"durability_mode,omitempty"`
+	CommitLagMs             uint32   `json:"commit_lag_ms,omitempty" serializer:"commit_lag_ms,omitempty"`
+	UsernameSecretName      string   `json:"username_secret_name,omitempty" serializer:"username_secret_name,omitempty"`
+	PasswordSecretName      string   `json:"password_secret_name,omitempty" serializer:"password_secret_name,omitempty"`
+	DatabaseSecretName      string   `json:"database_secret_name,omitempty" serializer:"database_secret_name,omitempty"`
+	ConnectionURLSecretName string   `json:"connection_url_secret_name,omitempty" serializer:"connection_url_secret_name,omitempty"`
+}
+
+func (d *DatabaseServingConfig) ClearSecretNames() {
+	if d == nil {
+		return
+	}
+	d.CredentialSecretNames = nil
+	d.UsernameSecretName = ""
+	d.PasswordSecretName = ""
+	d.DatabaseSecretName = ""
+	d.ConnectionURLSecretName = ""
+}
+
+const (
+	DatabaseKindPostgres      = "postgres"
+	DatabaseKindPostgresAlias = "postgresql"
+	DatabaseKindRedis         = "redis"
+	DatabaseKindValkey        = "valkey"
+
+	// A journaled disk commits every flush to object storage.
+	DatabaseDurabilityObjectStoreFlush = "object-store-flush"
+
+	PostgresDataMountPath = "/var/lib/postgresql/data"
+)
+
+func NormalizeDatabaseKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	switch kind {
+	case DatabaseKindPostgresAlias:
+		return DatabaseKindPostgres
+	default:
+		return kind
+	}
+}
+
+func (c *DatabaseServingConfig) NormalizedKind() string {
+	if c == nil {
+		return ""
+	}
+	return NormalizeDatabaseKind(c.Kind)
+}
+
+func (c *DatabaseServingConfig) IsPostgres() bool {
+	return c.NormalizedKind() == DatabaseKindPostgres
+}
+
+func (c *DatabaseServingConfig) IsRedisCompatible() bool {
+	switch c.NormalizedKind() {
+	case DatabaseKindRedis, DatabaseKindValkey:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *DatabaseServingConfig) IsJournaled() bool {
+	return c != nil && c.DurabilityMode == DatabaseDurabilityObjectStoreFlush
+}
+
+// CommitLag is how long a journaled disk may answer flushes before their
+// commits; zero answers each only once it is committed.
+func (c *DatabaseServingConfig) CommitLag() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return time.Duration(c.CommitLagMs) * time.Millisecond
+}
+
+func (c *StubConfigV1) EffectiveServingConfig() *ServingConfig {
+	if c == nil || c.Serving == nil {
+		return nil
+	}
+	if c.Serving.AppKind == "" && c.Serving.ServingProtocol == "" && c.Serving.Database == nil {
+		return nil
+	}
+	return c.Serving
+}
+
+func (c *StubConfigV1) EffectiveAppKind() string {
+	if serving := c.EffectiveServingConfig(); serving != nil {
+		return serving.AppKind
+	}
+	return ""
+}
+
+func (c *StubConfigV1) EffectiveServingProtocol() string {
+	if serving := c.EffectiveServingConfig(); serving != nil {
+		return serving.ServingProtocol
+	}
+	return ""
+}
+
+func (c *StubConfigV1) EffectiveDatabaseConfig() *DatabaseServingConfig {
+	if serving := c.EffectiveServingConfig(); serving != nil {
+		return serving.Database
+	}
+	return nil
+}
+
+type PoolConfig struct {
+	Name           string   `json:"name,omitempty"`
+	GPUs           []string `json:"gpu,omitempty"`
+	Nodes          uint32   `json:"nodes,omitempty"`
+	OfferID        string   `json:"offer_id,omitempty"`
+	TTL            string   `json:"ttl,omitempty"`
+	MaxSpend       float64  `json:"max_spend,omitempty"`
+	Providers      []string `json:"providers,omitempty"`
+	Regions        []string `json:"regions,omitempty"`
+	MinReliability float64  `json:"min_reliability,omitempty"`
+	Selector       string   `json:"selector,omitempty"`
+	Fallback       string   `json:"fallback,omitempty"`
+}
+
+func (p *PoolConfig) RequiresReservation() bool {
+	if p == nil {
+		return false
+	}
+	return p.Nodes > 0 ||
+		p.OfferID != "" ||
+		p.TTL != "" ||
+		p.MaxSpend > 0 ||
+		len(p.Providers) > 0 ||
+		len(p.Regions) > 0 ||
+		p.MinReliability > 0
+}
+
+func (c *StubConfigV1) PoolSelector() string {
+	if c == nil || c.Pool == nil {
+		return ""
+	}
+	if c.Pool.Selector != "" {
+		return c.Pool.Selector
+	}
+	if c.Pool.Name != "" {
+		return c.Pool.Name
+	}
+	return ""
+}
+
+type StubConfigLimitedValues struct {
+	Inputs        *Schema    `json:"inputs"`
+	Outputs       *Schema    `json:"outputs"`
+	TaskPolicy    TaskPolicy `json:"task_policy"`
+	PythonVersion string     `json:"python_version"`
+	Runtime       Runtime    `json:"runtime"`
+}
+
+type Schema struct {
+	Fields map[string]SchemaField `json:"fields"`
+}
+
+func (s *Schema) ToString() string {
+	json, err := json.Marshal(s)
+	if err != nil {
+		return ""
+	}
+	return string(json)
+}
+
+func (s *Schema) ToProto() *pb.Schema {
+	fields := make(map[string]*pb.SchemaField, len(s.Fields))
+	for k, v := range s.Fields {
+		field := &pb.SchemaField{
+			Type: v.Type,
+		}
+		if v.Type == "object" && v.Fields != nil {
+			field.Fields = v.Fields.ToProto()
+		}
+		fields[k] = field
+	}
+	return &pb.Schema{
+		Fields: fields,
+	}
+}
+
+func NewSchemaFromProto(in *pb.Schema) *Schema {
+	fields := make(map[string]SchemaField, len(in.Fields))
+	for k, v := range in.Fields {
+		var nested *Schema
+		if v.Type == "object" && v.Fields != nil {
+			nested = NewSchemaFromProto(v.Fields)
+		}
+		fields[k] = SchemaField{
+			Type:   v.Type,
+			Fields: nested,
+		}
+	}
+
+	return &Schema{
+		Fields: fields,
+	}
+}
+
+type SchemaField struct {
+	Type   string  `json:"type"`
+	Fields *Schema `json:"fields,omitempty"` // Only for type == "object"
+}
+
+func (c *StubConfigV1) RequiresGPU() bool {
+	for _, gpu := range c.Runtime.Gpus {
+		if gpu != "" && gpu != NO_GPU {
+			return true
+		}
+	}
+	return c.Runtime.Gpu != "" && c.Runtime.Gpu != NO_GPU
+}
+
+type AutoscalerType string
+
+const (
+	QueueDepthAutoscaler AutoscalerType = "queue_depth"
+)
+
+type Autoscaler struct {
+	Type              AutoscalerType `json:"type"`
+	MaxContainers     uint           `json:"max_containers"`
+	TasksPerContainer uint           `json:"tasks_per_container"`
+	MinContainers     uint           `json:"min_containers"`
+}
+
+func (c *StubConfigV1) SetReplicaCount(containers uint) {
+	if c.Autoscaler == nil {
+		c.Autoscaler = &Autoscaler{
+			Type:              QueueDepthAutoscaler,
+			TasksPerContainer: 1,
+		}
+	}
+	if c.Autoscaler.Type == "" {
+		c.Autoscaler.Type = QueueDepthAutoscaler
+	}
+	if c.Autoscaler.TasksPerContainer == 0 {
+		c.Autoscaler.TasksPerContainer = 1
+	}
+	if containers == 0 {
+		c.Autoscaler.MinContainers = 0
+		if c.Autoscaler.MaxContainers == 0 {
+			c.Autoscaler.MaxContainers = 1
+		}
+		return
+	}
+	c.Autoscaler.MinContainers = containers
+	c.Autoscaler.MaxContainers = containers
+}
+
+// @go2proto
+type App struct {
+	Id          uint     `db:"id" json:"id" serializer:"id,source:external_id"`
+	ExternalId  string   `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
+	Name        string   `db:"name" json:"name" serializer:"name"`
+	Description string   `db:"description" json:"description" serializer:"description"`
+	WorkspaceId uint     `db:"workspace_id" json:"workspace_id"` // Foreign key to Workspace
+	CreatedAt   Time     `db:"created_at" json:"created_at" serializer:"created_at"`
+	UpdatedAt   Time     `db:"updated_at" json:"updated_at" serializer:"updated_at"`
+	DeletedAt   NullTime `db:"deleted_at" json:"deleted_at" serializer:"deleted_at"`
+}
+
+func (a *App) ToProto() *pb.App {
+	return &pb.App{
+		Id:          uint32(a.Id),
+		ExternalId:  a.ExternalId,
+		Name:        a.Name,
+		Description: a.Description,
+		CreatedAt:   timestamppb.New(a.CreatedAt.Time),
+		UpdatedAt:   timestamppb.New(a.UpdatedAt.Time),
+	}
+}
+
+const (
+	StubTypeFunction               string = "function"
+	StubTypeFunctionDeployment     string = "function/deployment"
+	StubTypeFunctionServe          string = "function/serve"
+	StubTypeContainer              string = "container"
+	StubTypeShell                  string = "shell"
+	StubTypeTaskQueue              string = "taskqueue"
+	StubTypeTaskQueueDeployment    string = "taskqueue/deployment"
+	StubTypeTaskQueueServe         string = "taskqueue/serve"
+	StubTypeEndpoint               string = "endpoint"
+	StubTypeEndpointDeployment     string = "endpoint/deployment"
+	StubTypeEndpointServe          string = "endpoint/serve"
+	StubTypeASGI                   string = "asgi"
+	StubTypeASGIDeployment         string = "asgi/deployment"
+	StubTypeASGIServe              string = "asgi/serve"
+	StubTypeScheduledJob           string = "schedule"
+	StubTypeScheduledJobDeployment string = "schedule/deployment"
+	StubTypeBot                    string = "bot"
+	StubTypeBotDeployment          string = "bot/deployment"
+	StubTypeBotServe               string = "bot/serve"
+	StubTypePod                    string = "pod"
+	StubTypePodDeployment          string = "pod/deployment"
+	StubTypePodRun                 string = "pod/run"
+	StubTypeSandbox                string = "sandbox"
+	StubTypeVM                     string = "vm"
+)
+
+// @go2proto
+type StubType string
+
+func (t StubType) IsServe() bool {
+	return strings.HasSuffix(string(t), "/serve")
+}
+
+func (t StubType) IsDeployment() bool {
+	return strings.HasSuffix(string(t), "/deployment")
+}
+
+func (t StubType) Kind() string {
+	return strings.Split(string(t), "/")[0]
+}
+
+// IsSandbox identifies workloads that share sandbox execution and storage.
+// Persistent VMs retain their own kind for lifecycle and billing.
+func (t StubType) IsSandbox() bool {
+	return t.Kind() == StubTypeSandbox || t.Kind() == StubTypeVM
+}
+
+// RouteKind keeps VM runtime operations on the shared sandbox transport.
+func (t StubType) RouteKind() string {
+	if t.Kind() == StubTypeVM {
+		return StubTypeSandbox
+	}
+	return t.Kind()
+}
+
+// StubScopedContainerPrefixes identifies container IDs carrying a stub UUID.
+func StubScopedContainerPrefixes() []string {
+	return []string{StubTypeSandbox, StubTypeVM, StubTypePod, StubTypeEndpoint, StubTypeTaskQueue, "managed"}
+}
+
+// @go2proto
+type Stub struct {
+	Id            uint     `db:"id" json:"id,omitempty" serializer:"id,source:external_id"`
+	ExternalId    string   `db:"external_id" json:"external_id,omitempty" serializer:"external_id"`
+	Name          string   `db:"name" json:"name" serializer:"name"`
+	Type          StubType `db:"type" json:"type" serializer:"type"`
+	Config        string   `db:"config" json:"config" serializer:"config"`
+	ConfigVersion uint     `db:"config_version" json:"config_version" serializer:"config_version"`
+	ObjectId      uint     `db:"object_id" json:"object_id"`       // Foreign key to Object
+	WorkspaceId   uint     `db:"workspace_id" json:"workspace_id"` // Foreign key to Workspace
+	CreatedAt     Time     `db:"created_at" json:"created_at" serializer:"created_at"`
+	UpdatedAt     Time     `db:"updated_at" json:"updated_at" serializer:"updated_at"`
+	Public        bool     `db:"public" json:"public" serializer:"public"`
+	AppId         uint     `db:"app_id" json:"app_id,omitempty"` // Foreign key to App
+}
+
+func (s *Stub) UnmarshalConfig() (*StubConfigV1, error) {
+	var config *StubConfigV1
+	err := json.Unmarshal([]byte(s.Config), &config)
+	if err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+func (s *Stub) SanitizeConfig() error {
+	var config StubConfigV1
+	err := json.Unmarshal([]byte(s.Config), &config)
+	if err != nil {
+		return err
+	}
+
+	// Remove secret values from config
+	for i := range config.Secrets {
+		config.Secrets[i].Value = ""
+	}
+	if config.Serving != nil {
+		config.Serving.Database.ClearSecretNames()
+	}
+
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	s.Config = string(data)
+	return nil
+}
+
+func (s *Stub) ToProto() *pb.Stub {
+	return &pb.Stub{
+		Id:            uint32(s.Id),
+		ExternalId:    s.ExternalId,
+		Name:          s.Name,
+		Type:          string(s.Type),
+		Config:        s.Config,
+		ConfigVersion: uint32(s.ConfigVersion),
+		WorkspaceId:   uint32(s.WorkspaceId),
+		CreatedAt:     timestamppb.New(s.CreatedAt.Time),
+		UpdatedAt:     timestamppb.New(s.UpdatedAt.Time),
+	}
+}
+
+func NewStubFromProto(in *pb.Stub) *Stub {
+	return &Stub{
+		Id:            uint(in.Id),
+		ExternalId:    in.ExternalId,
+		Name:          in.Name,
+		Type:          StubType(in.Type),
+		Config:        in.Config,
+		ConfigVersion: uint(in.ConfigVersion),
+		WorkspaceId:   uint(in.WorkspaceId),
+		CreatedAt:     Time{Time: in.CreatedAt.AsTime()},
+		UpdatedAt:     Time{Time: in.UpdatedAt.AsTime()},
+	}
+}
+
+// @go2proto
+type StubWithRelated struct {
+	Stub
+	Workspace Workspace `db:"workspace" json:"workspace" serializer:"workspace"`
+	Object    Object    `db:"object" json:"object" serializer:"object"`
+	App       *App      `db:"app" json:"app" serializer:"app"`
+}
+
+func (s *StubWithRelated) ToProto() *pb.StubWithRelated {
+	return &pb.StubWithRelated{
+		Stub:      s.Stub.ToProto(),
+		Workspace: s.Workspace.ToProto(),
+		Object:    s.Object.ToProto(),
+	}
+}
+
+func NewStubWithRelatedFromProto(in *pb.StubWithRelated) *StubWithRelated {
+	return &StubWithRelated{
+		Stub:      *NewStubFromProto(in.Stub),
+		Workspace: *NewWorkspaceFromProto(in.Workspace),
+		Object:    *NewObjectFromProto(in.Object),
+	}
+}
+
+type Image struct {
+	Commands             []string `json:"commands"`
+	PythonVersion        string   `json:"python_version"`
+	PythonPackages       []string `json:"python_packages"`
+	BaseImage            *string  `json:"base_image"`
+	BaseImageCredentials *string  `json:"base_image_creds"`
+}
+
+type Runtime struct {
+	Cpu      int64     `json:"cpu"`
+	Gpu      GpuType   `json:"gpu"`
+	GpuCount uint32    `json:"gpu_count"`
+	Memory   int64     `json:"memory"`
+	ImageId  string    `json:"image_id"`
+	Gpus     []GpuType `json:"gpus"`
+}
+
+// FilterFieldMapping represents a mapping between a client-provided field and
+// its corresponding database field, along with the values for filtering on the database field.
+type FilterFieldMapping struct {
+	ClientField   string
+	ClientValues  []string
+	DatabaseField string
+}
+
+// @go2proto
+type ConcurrencyLimit struct {
+	Id                uint      `db:"id" json:"-" redis:"-"`
+	ExternalId        string    `db:"external_id" json:"external_id,omitempty" redis:"external_id"`
+	WorkspaceId       uint      `db:"workspace_id" json:"workspace_id,omitempty" redis:"workspace_id"`
+	GPULimit          uint32    `db:"gpu_limit" json:"gpu_limit" redis:"gpu_limit"`
+	CPUMillicoreLimit uint32    `db:"cpu_millicore_limit" json:"cpu_millicore_limit" redis:"cpu_millicore_limit"`
+	CreatedAt         time.Time `db:"created_at" json:"created_at,omitempty" redis:"-"`
+	UpdatedAt         time.Time `db:"updated_at" json:"updated_at,omitempty" redis:"-"`
+}
+
+func (c *ConcurrencyLimit) ToProto() *pb.ConcurrencyLimit {
+	return &pb.ConcurrencyLimit{
+		Id:                uint32(c.Id),
+		ExternalId:        c.ExternalId,
+		WorkspaceId:       uint32(c.WorkspaceId),
+		GpuLimit:          c.GPULimit,
+		CpuMillicoreLimit: c.CPUMillicoreLimit,
+	}
+}
+
+func NewConcurrencyLimitFromProto(in *pb.ConcurrencyLimit) *ConcurrencyLimit {
+	return &ConcurrencyLimit{
+		Id:                uint(in.Id),
+		ExternalId:        in.ExternalId,
+		WorkspaceId:       uint(in.WorkspaceId),
+		GPULimit:          in.GpuLimit,
+		CPUMillicoreLimit: in.CpuMillicoreLimit,
+	}
+}
+
+type Secret struct {
+	Hosts         pq.StringArray `db:"hosts" json:"hosts"`
+	Placeholder   string         `db:"placeholder" json:"placeholder,omitempty"`
+	Id            uint           `db:"id" json:"-"`
+	ExternalId    string         `db:"external_id" json:"external_id,omitempty"`
+	CreatedAt     time.Time      `db:"created_at" json:"created_at,omitempty"`
+	UpdatedAt     time.Time      `db:"updated_at" json:"updated_at,omitempty"`
+	Name          string         `db:"name" json:"name"`
+	Value         string         `db:"value" json:"value,omitempty"`
+	WorkspaceId   uint           `db:"workspace_id" json:"workspace_id,omitempty"`
+	LastUpdatedBy *uint          `db:"last_updated_by" json:"last_updated_by,omitempty"`
+	// EnvName is the variable a bound secret is injected under. Stub config only, not a column.
+	EnvName string `db:"-" json:"env_name,omitempty"`
+}
+
+// EnvVarName is the variable the secret is exposed as inside the container.
+func (s Secret) EnvVarName() string {
+	if s.EnvName != "" {
+		return s.EnvName
+	}
+	return s.Name
+}
+
+const StackSpecMaxBytes = 256 << 10
+
+var ErrStackSpecTooLarge = fmt.Errorf("stack spec exceeds 256 KiB")
+
+// Stack holds dashboard layout and agent deployment state in Spec.
+type Stack struct {
+	Id          uint            `db:"id" json:"-"`
+	ExternalId  string          `db:"external_id" json:"id"`
+	WorkspaceId uint            `db:"workspace_id" json:"-"`
+	Name        string          `db:"name" json:"name"`
+	Spec        json.RawMessage `db:"spec" json:"spec"`
+	CreatedAt   time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt   time.Time       `db:"updated_at" json:"updated_at"`
+}
+
+type ScheduledJob struct {
+	Id         uint64 `db:"id"`
+	ExternalId string `db:"external_id"`
+
+	JobId    uint64              `db:"job_id"`
+	JobName  string              `db:"job_name"`
+	Schedule string              `db:"job_schedule"`
+	Payload  ScheduledJobPayload `db:"job_payload"`
+
+	StubId       uint         `db:"stub_id"`
+	DeploymentId uint         `db:"deployment_id"`
+	CreatedAt    time.Time    `db:"created_at"`
+	UpdatedAt    time.Time    `db:"updated_at"`
+	DeletedAt    sql.NullTime `db:"deleted_at"`
+}
+
+type ScheduledJobPayload struct {
+	StubId        string      `json:"stub_id"`
+	WorkspaceName string      `json:"workspace_name"`
+	TaskPayload   TaskPayload `json:"task_payload"`
+}
+
+func (p *ScheduledJobPayload) Scan(value interface{}) error {
+	bytes, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("type assertion to []byte failed")
+	}
+
+	return json.Unmarshal(bytes, p)
+}
+
+func (p ScheduledJobPayload) Value() (driver.Value, error) {
+	return json.Marshal(p)
+}

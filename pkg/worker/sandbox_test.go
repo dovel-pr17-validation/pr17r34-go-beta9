@@ -1,0 +1,547 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+	goproc "github.com/beam-cloud/goproc/pkg"
+	goprocpb "github.com/beam-cloud/goproc/proto"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func TestDockerStartupCanceledClassification(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{
+			name: "wrapped grpc canceled setup status error",
+			ctx:  context.Background(),
+			err: fmt.Errorf(
+				"cgroup setup status failed: %w",
+				status.Error(codes.Canceled, "context canceled while waiting for connections to become ready"),
+			),
+			want: true,
+		},
+		{
+			name: "wrapped grpc deadline setup status error",
+			ctx:  context.Background(),
+			err: fmt.Errorf(
+				"cgroup setup status failed: %w",
+				status.Error(codes.DeadlineExceeded, "deadline exceeded while waiting for connections to become ready"),
+			),
+			want: true,
+		},
+		{
+			name: "shutdown context with ordinary process error",
+			ctx:  ctx,
+			err:  errors.New("process manager unavailable"),
+			want: true,
+		},
+		{
+			name: "direct context cancellation",
+			ctx:  context.Background(),
+			err:  context.Canceled,
+			want: true,
+		},
+		{
+			name: "shutdown transport message",
+			ctx:  context.Background(),
+			err:  errors.New("rpc error: code = Unavailable desc = transport is closing"),
+			want: true,
+		},
+		{
+			name: "real cgroup failure",
+			ctx:  context.Background(),
+			err:  errors.New("cgroup setup failed with exit code 1: stderr=\"permission denied\""),
+			want: false,
+		},
+		{
+			name: "nil error",
+			ctx:  context.Background(),
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, dockerStartupCanceled(tt.ctx, tt.err))
+		})
+	}
+}
+
+func TestWorkerDockerStartupCanceledUsesContainerStopState(t *testing.T) {
+	worker := &Worker{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	err := errors.New(`cgroup setup status failed: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 192.168.0.193:7111: connect: connection refused"`)
+
+	worker.containerInstances.Set("stopping", &ContainerInstance{StopReason: types.StopContainerReasonUser})
+	require.True(t, worker.dockerStartupCanceled(context.Background(), "stopping", err))
+
+	worker.containerInstances.Set("active", &ContainerInstance{})
+	require.False(t, worker.dockerStartupCanceled(context.Background(), "active", err))
+}
+
+func TestWorkerDockerStartupCanceledTreatsMissingContainerAsTeardown(t *testing.T) {
+	worker := &Worker{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	err := errors.New("rpc error: code = Unavailable desc = connection refused")
+
+	require.True(t, worker.dockerStartupCanceled(context.Background(), "already-cleaned-up", err))
+}
+
+type readyGoProcServer struct {
+	goprocpb.UnimplementedGoProcServer
+}
+
+func TestVMReservationOwnsSandboxReadiness(t *testing.T) {
+	worker := &Worker{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	request := &types.ContainerRequest{ContainerId: "vm-reservation", Stub: types.StubWithRelated{Stub: types.Stub{Type: types.StubType(types.StubTypeVM)}}}
+	require.True(t, worker.reserveContainerInstance(request))
+	instance, ok := worker.containerInstances.Get(request.ContainerId)
+	require.True(t, ok)
+	require.NotNil(t, instance.processManagerReadyChannel())
+	require.False(t, instance.processManagerReady())
+	worker.releaseUnclaimedContainer(request)
+	select {
+	case <-instance.processManagerReadyChannel():
+	default:
+		t.Fatal("VM readiness did not wake after a rejected claim")
+	}
+	_, ok = worker.containerInstances.Get(request.ContainerId)
+	require.False(t, ok)
+}
+
+func (readyGoProcServer) Ready(context.Context, *goprocpb.ReadyRequest) (*goprocpb.ReadyResponse, error) {
+	return &goprocpb.ReadyResponse{Ok: true}, nil
+}
+
+// The process manager comes up only after the runtime has exec'd it, which on a
+// cold node can trail image materialization by tens of seconds. The wait must
+// ride that out rather than give up on a clock.
+func TestWaitForProcessManagerOutlivesSlowStartup(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close()) // port is now refusing connections
+
+	server := grpc.NewServer()
+	goprocpb.RegisterGoProcServer(server, readyGoProcServer{})
+	defer server.Stop()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			return
+		}
+		_ = server.Serve(listener)
+	}()
+
+	instance := &ContainerInstance{
+		ContainerAddressMap: map[int32]string{types.WorkerSandboxProcessManagerPort: address},
+	}
+	// The wait only returns on success or ctx; bound it so a server that never
+	// comes up fails the test instead of hanging it.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, ready, stats := (&Worker{}).waitForProcessManager(ctx, "slow", instance)
+	require.True(t, ready)
+	require.NotNil(t, client)
+	require.Greater(t, stats.Failures, 0)
+	require.Equal(t, "unavailable", stats.LastClass)
+	_ = client.Cleanup()
+}
+
+func TestWaitForProcessManagerStopsWithContainer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	instance := &ContainerInstance{ContainerIp: "127.0.0.1"}
+	client, ready, stats := (&Worker{}).waitForProcessManager(ctx, "gone", instance)
+	require.False(t, ready)
+	require.Nil(t, client)
+	require.Equal(t, context.Canceled.Error(), stats.LastError)
+	require.Greater(t, stats.Attempts, 1)
+}
+
+type delayedReadyGoProcServer struct {
+	goprocpb.UnimplementedGoProcServer
+	cancelled atomic.Int64
+}
+
+func (s *delayedReadyGoProcServer) Ready(ctx context.Context, _ *goprocpb.ReadyRequest) (*goprocpb.ReadyResponse, error) {
+	select {
+	case <-ctx.Done():
+		s.cancelled.Add(1)
+		return nil, ctx.Err()
+	case <-time.After(25 * time.Millisecond):
+		return &goprocpb.ReadyResponse{Ok: true}, nil
+	}
+}
+
+func TestWaitForProcessManagerAcceptsReadyReplyWithinProbeBudget(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	service := &delayedReadyGoProcServer{}
+	goprocpb.RegisterGoProcServer(server, service)
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	instance := &ContainerInstance{
+		ContainerAddressMap: map[int32]string{types.WorkerSandboxProcessManagerPort: listener.Addr().String()},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	client, ready, stats := (&Worker{}).waitForProcessManager(ctx, "slow-rpc", instance)
+	require.True(t, ready, "a ready reply within the probe budget must not wait behind a second of cancelled probes")
+	require.Equal(t, 1, stats.Attempts)
+	require.Zero(t, service.cancelled.Load())
+	t.Cleanup(func() { _ = client.Cleanup() })
+	// The short readiness deadline must not become the client's lifetime.
+	time.Sleep(goprocReadyProbeTimeout)
+	require.NoError(t, client.Ready())
+}
+
+// A sandbox stopped while its process manager was still starting is finalized
+// and removed before the wait returns. Writing the stale instance back would
+// leave a phantom container the worker counts forever, so it never idles out
+// or finishes draining (seen as cordoned workers with zero containers that
+// sat for hours).
+func TestAttachProcessManagerSkipsFinalizedSandbox(t *testing.T) {
+	request := &types.ContainerRequest{ContainerId: "sandbox-gone"}
+	worker := &Worker{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	stale := &ContainerInstance{Id: request.ContainerId, Request: request}
+	stale.initializeProcessManagerReadiness()
+	worker.containerInstances.Set(request.ContainerId, stale)
+	worker.containerInstances.Delete(request.ContainerId)
+
+	_, attached := worker.attachProcessManager(context.Background(), request, nil, false)
+	require.False(t, attached)
+	require.Equal(t, 0, worker.containerInstances.Len(), "a finalized sandbox must not be re-created")
+}
+
+func TestAttachProcessManagerPublishesReadinessOnLiveSandbox(t *testing.T) {
+	request := &types.ContainerRequest{ContainerId: "sandbox-live"}
+	worker := &Worker{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	live := &ContainerInstance{Id: request.ContainerId, Request: request}
+	live.initializeProcessManagerReadiness()
+	worker.containerInstances.Set(request.ContainerId, live)
+
+	instance, attached := worker.attachProcessManager(context.Background(), request, nil, true)
+	require.True(t, attached)
+	require.Same(t, live, instance)
+	require.True(t, instance.processManagerReady())
+	select {
+	case <-instance.processManagerReadyChannel():
+	default:
+		t.Fatal("exec waiters must be released once the process manager is attached")
+	}
+	require.Equal(t, 1, worker.containerInstances.Len())
+}
+
+func TestSandboxProcessManagerEndpointFallsBackToContainerIP(t *testing.T) {
+	endpoints := sandboxProcessManagerEndpoints(&ContainerInstance{
+		ContainerIp: "192.168.0.81",
+	})
+
+	require.Len(t, endpoints, 1)
+	require.Equal(t, "192.168.0.81", endpoints[0].host)
+	require.Equal(t, int(types.WorkerSandboxProcessManagerPort), endpoints[0].port)
+}
+
+func TestSandboxProcessManagerEndpointsIncludePublishedAddress(t *testing.T) {
+	endpoints := sandboxProcessManagerEndpoints(&ContainerInstance{
+		ContainerIp: "192.168.0.81",
+		ContainerAddressMap: map[int32]string{
+			types.WorkerSandboxProcessManagerPort: "10.42.0.163:35659",
+		},
+	})
+
+	require.Len(t, endpoints, 2)
+	require.Equal(t, "192.168.0.81", endpoints[0].host)
+	require.Equal(t, int(types.WorkerSandboxProcessManagerPort), endpoints[0].port)
+	require.Equal(t, "10.42.0.163", endpoints[1].host)
+	require.Equal(t, 35659, endpoints[1].port)
+}
+
+func TestSandboxProcessManagerEndpointsUsePublishedAddressWhenContainerIPMissing(t *testing.T) {
+	endpoints := sandboxProcessManagerEndpoints(&ContainerInstance{
+		ContainerAddressMap: map[int32]string{
+			types.WorkerSandboxProcessManagerPort: "10.42.0.163:35659",
+		},
+	})
+
+	require.Len(t, endpoints, 1)
+	require.Equal(t, "10.42.0.163", endpoints[0].host)
+	require.Equal(t, 35659, endpoints[0].port)
+}
+
+func TestSandboxProcessManagerEndpointsIgnoreInvalidPublishedAddress(t *testing.T) {
+	endpoints := sandboxProcessManagerEndpoints(&ContainerInstance{
+		ContainerIp: "192.168.0.81",
+		ContainerAddressMap: map[int32]string{
+			types.WorkerSandboxProcessManagerPort: "route://not-a-host-port",
+		},
+	})
+
+	require.Len(t, endpoints, 1)
+	require.Equal(t, "192.168.0.81", endpoints[0].host)
+	require.Equal(t, int(types.WorkerSandboxProcessManagerPort), endpoints[0].port)
+}
+
+// On dual-stack nodes the worker publishes the process manager port on the
+// node's IPv6 address. goproc joins host and port with "%s:%d", so the host
+// must arrive bracketed or grpc rejects the target with "too many colons" and
+// the fallback endpoint is useless exactly when it is needed.
+func TestSandboxProcessManagerEndpointsBracketIPv6ForDialing(t *testing.T) {
+	endpoints := sandboxProcessManagerEndpoints(&ContainerInstance{
+		ContainerIp: "192.168.0.81",
+		ContainerAddressMap: map[int32]string{
+			types.WorkerSandboxProcessManagerPort: "[2600:1f18:37a4:c02::1a9b]:44209",
+		},
+	})
+
+	require.Len(t, endpoints, 2)
+	require.Equal(t, "192.168.0.81", endpoints[0].dialHost())
+	require.Equal(t, "2600:1f18:37a4:c02::1a9b", endpoints[1].host)
+	require.Equal(t, "[2600:1f18:37a4:c02::1a9b]", endpoints[1].dialHost())
+	require.Equal(t, 44209, endpoints[1].port)
+
+	require.Equal(t, "[fd00::5]", processManagerEndpoint{host: "fd00::5", port: 7111}.dialHost())
+	require.Equal(t, "[fd00::5]", processManagerEndpoint{host: "[fd00::5]", port: 7111}.dialHost())
+	require.Equal(t, "10.42.0.163", processManagerEndpoint{host: "10.42.0.163", port: 7111}.dialHost())
+	require.Equal(t, "sandbox.local", processManagerEndpoint{host: "sandbox.local", port: 7111}.dialHost())
+}
+
+// End-to-end version of the above: a real goproc server on an IPv6 address,
+// reachable only through the host-mapped fallback endpoint. Before dialHost()
+// this failed with "invalid target address ::1:<port> ... too many colons".
+func TestNewProcessManagerClientReachesIPv6FallbackEndpoint(t *testing.T) {
+	lis, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	srv := grpc.NewServer()
+	goprocpb.RegisterGoProcServer(srv, &goproc.GoProcServer{})
+	go srv.Serve(lis)
+	defer srv.Stop()
+
+	instance := &ContainerInstance{
+		ContainerAddressMap: map[int32]string{
+			types.WorkerSandboxProcessManagerPort: lis.Addr().String(),
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := newProcessManagerClient(ctx, instance)
+	require.NoError(t, err)
+	defer client.Cleanup()
+	require.NoError(t, client.ReadyContext(ctx))
+}
+
+// A restored sandbox has both endpoints. Right after restore the container-IP
+// endpoint can refuse for a moment (retryable), while the published address is
+// a host-mapped port the worker itself cannot reach (PREROUTING-only DNAT) and
+// fails in a non-retryable way. The retryable error has to win, otherwise the
+// exec fails immediately instead of riding out the blip.
+func TestNewProcessManagerClientKeepsRetryableErrorWhenFallbackFailsHard(t *testing.T) {
+	refused, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	primaryHost, primaryPort, _ := net.SplitHostPort(refused.Addr().String())
+	require.NoError(t, refused.Close()) // primary: nothing listening -> connection refused
+
+	// fallback: accepts and immediately hangs up -> "error reading server preface: EOF"
+	hangup, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer hangup.Close()
+	go func() {
+		for {
+			conn, err := hangup.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	port, err := strconv.Atoi(primaryPort)
+	require.NoError(t, err)
+	instance := &ContainerInstance{ContainerIp: primaryHost}
+	instance.setContainerAddressMap(map[int32]string{types.WorkerSandboxProcessManagerPort: hangup.Addr().String()})
+	endpoints := sandboxProcessManagerEndpoints(instance)
+	require.Len(t, endpoints, 2)
+	endpoints[0].port = port // the real primary is fixed at 7111, which a test cannot bind
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := newProcessManagerClientFromEndpoints(ctx, endpoints)
+	require.Nil(t, client)
+	require.Error(t, err)
+	require.True(t, isProcessManagerDialFailure(err), "expected the primary's retryable error, got: %v", err)
+}
+
+func TestDockerSandboxStartupCleanupRemovesStalePidFiles(t *testing.T) {
+	require.Equal(t, "rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid", dockerSandboxStartupCleanupScript())
+}
+
+func TestDockerSandboxShutdownScriptPreservesInnerContainers(t *testing.T) {
+	script := dockerSandboxShutdownScript()
+
+	require.Contains(t, script, "docker ps -q")
+	require.Contains(t, script, "docker stop -t 2")
+	require.Contains(t, script, "docker kill")
+	require.NotContains(t, script, "docker rm")
+	require.Contains(t, script, "pkill -TERM dockerd")
+	require.Contains(t, script, "pkill -KILL containerd")
+	require.True(t, strings.HasSuffix(strings.TrimSpace(script), "exit 0"))
+}
+
+func TestSandboxMemoryLimitScriptWritesMountedHierarchy(t *testing.T) {
+	const limit = 16 * 1024 * 1024 * 1024
+	const quota, period, cpus = 400000, 100000, 4
+
+	// Run the script where neither taskset nor python3 resolves, so the
+	// affinity step cannot reach the test host's PID 1; the rest is builtins.
+	run := func(script string) ([]byte, error) {
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Env = []string{"PATH=/nonexistent"}
+		return cmd.CombinedOutput()
+	}
+	writeFiles := func(t *testing.T, root string, files ...string) {
+		for _, file := range files {
+			path := filepath.Join(root, file)
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+			require.NoError(t, os.WriteFile(path, []byte("max\n"), 0o644))
+		}
+	}
+	readFile := func(t *testing.T, root, file string) string {
+		contents, err := os.ReadFile(filepath.Join(root, file))
+		require.NoError(t, err)
+		return strings.TrimSpace(string(contents))
+	}
+
+	t.Run("cgroup v2", func(t *testing.T) {
+		root := t.TempDir()
+		writeFiles(t, root, "memory.max", "cpu.max")
+
+		out, err := run(sandboxMemoryLimitScript(root, limit, quota, period, cpus))
+		require.NoError(t, err, string(out))
+		require.Equal(t, strconv.FormatInt(limit, 10), readFile(t, root, "memory.max"))
+		require.Equal(t, "400000 100000", readFile(t, root, "cpu.max"))
+	})
+
+	// The layout gVisor mounts: the process's cgroup is the mount root, so the
+	// controller files at the root are what cargo, the JVM and Node read.
+	t.Run("cgroup v1", func(t *testing.T) {
+		root := t.TempDir()
+		writeFiles(t, root, "memory/memory.limit_in_bytes", "cpu/cpu.cfs_quota_us", "cpu/cpu.cfs_period_us")
+
+		out, err := run(sandboxMemoryLimitScript(root, limit, quota, period, cpus))
+		require.NoError(t, err, string(out))
+		require.Equal(t, strconv.FormatInt(limit, 10), readFile(t, root, "memory/memory.limit_in_bytes"))
+		require.Equal(t, "400000", readFile(t, root, "cpu/cpu.cfs_quota_us"))
+		require.Equal(t, "100000", readFile(t, root, "cpu/cpu.cfs_period_us"))
+	})
+
+	t.Run("no cpu request leaves cpu files alone", func(t *testing.T) {
+		root := t.TempDir()
+		writeFiles(t, root, "memory/memory.limit_in_bytes", "cpu/cpu.cfs_quota_us", "cpu/cpu.cfs_period_us")
+
+		out, err := run(sandboxMemoryLimitScript(root, limit, 0, period, 0))
+		require.NoError(t, err, string(out))
+		require.Equal(t, strconv.FormatInt(limit, 10), readFile(t, root, "memory/memory.limit_in_bytes"))
+		require.Equal(t, "max", readFile(t, root, "cpu/cpu.cfs_quota_us"))
+	})
+
+	t.Run("no cgroup mounted", func(t *testing.T) {
+		out, err := run(sandboxMemoryLimitScript(t.TempDir(), limit, quota, period, cpus))
+		require.Error(t, err)
+		require.Contains(t, string(out), "no cgroup memory limit file")
+	})
+
+	t.Run("memory mounted without cpu controller", func(t *testing.T) {
+		root := t.TempDir()
+		writeFiles(t, root, "memory/memory.limit_in_bytes")
+
+		out, err := run(sandboxMemoryLimitScript(root, limit, quota, period, cpus))
+		require.Error(t, err)
+		require.Contains(t, string(out), "no cgroup cpu limit file")
+		require.Equal(t, strconv.FormatInt(limit, 10), readFile(t, root, "memory/memory.limit_in_bytes"), "memory is written before the cpu check fails")
+	})
+
+	t.Run("affinity narrows PID 1 to the requested cpus", func(t *testing.T) {
+		require.Contains(t, sandboxMemoryLimitScript("/sys/fs/cgroup", limit, quota, period, 4), "taskset -a -c -p 0-3 1 ")
+		require.Contains(t, sandboxMemoryLimitScript("/sys/fs/cgroup", limit, 100000, period, 1), "taskset -a -c -p 0 1 ")
+		require.Contains(t, sandboxMemoryLimitScript("/sys/fs/cgroup", limit, quota, period, 4), `os.listdir("/proc/1/task")]' 4 `)
+	})
+
+	t.Run("no affinity tool is not an error", func(t *testing.T) {
+		root := t.TempDir()
+		writeFiles(t, root, "memory/memory.limit_in_bytes", "cpu/cpu.cfs_quota_us", "cpu/cpu.cfs_period_us")
+
+		out, err := run(sandboxMemoryLimitScript(root, limit, quota, period, cpus))
+		require.NoError(t, err, string(out))
+		require.Contains(t, string(out), "no taskset or python3")
+	})
+}
+
+func TestRequestedCPUCount(t *testing.T) {
+	for millicores, want := range map[int64]int64{0: 0, -1: 0, 1: 1, 500: 1, 1000: 1, 1001: 2, 1500: 2, 4000: 4, 255000: 255} {
+		require.Equal(t, want, requestedCPUCount(millicores), "millicores=%d", millicores)
+	}
+}
+
+func TestExposeSandboxMemoryLimitOnlyTargetsGvisorRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		runtime string
+		memory  int64
+	}{
+		{name: "runc sees its real cgroup", runtime: types.ContainerRuntimeRunc.String(), memory: 1024},
+		{name: "no memory request", runtime: types.ContainerRuntimeGvisor.String(), memory: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instance := &ContainerInstance{Runtime: &mockRuntime{name: tt.runtime}}
+			request := &types.ContainerRequest{Memory: tt.memory}
+
+			// A nil process manager would fail the exec if the request were not skipped.
+			require.NoError(t, (&Worker{}).exposeSandboxMemoryLimit(context.Background(), request, instance, nil))
+		})
+	}
+}
+
+func TestStopDockerSandboxPreservesTerminalCheckpointState(t *testing.T) {
+	instance := &ContainerInstance{
+		Request: &types.ContainerRequest{DockerEnabled: true},
+	}
+	instance.initializeProcessManagerReadiness()
+	instance.signalProcessManagerReadiness(true)
+	instance.terminalCheckpointCreated.Store(true)
+
+	// A nil process manager would panic if stopDockerSandbox attempted cleanup.
+	(&Worker{}).stopDockerSandbox("container-1", instance, false)
+}

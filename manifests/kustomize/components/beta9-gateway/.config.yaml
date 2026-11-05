@@ -1,0 +1,27 @@
+worker:
+  pools:
+    default:
+      containerStartConcurrency: 128
+      jobSpec:
+        env:
+        - name: CONFIG_PATH
+          value: /etc/beta9/.config.yaml
+        volumes:
+        - name: config
+          secret:
+            secretName: beta9-config
+        volumeMounts:
+        - mountPath: /etc/beta9
+          name: config
+managedCompute:
+  billing:
+    mode: noop
+    endpoint: ""
+    authToken: ""
+    required: false
+    timeout: 5s
+    reconcileInterval: 1m
+    minimumCreditCents: 2500
+cache:
+  server:
+    pageSizeBytes: 4194304

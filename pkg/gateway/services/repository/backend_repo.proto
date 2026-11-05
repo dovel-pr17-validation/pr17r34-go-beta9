@@ -1,0 +1,175 @@
+syntax = "proto3";
+
+option go_package = "github.com/beam-cloud/beta9/proto";
+import "google/protobuf/timestamp.proto";
+import "types.proto";
+
+service BackendRepositoryService {
+  rpc GetCheckpointById(GetCheckpointByIdRequest)
+      returns (GetCheckpointByIdResponse);
+  rpc GetLatestCheckpointByStubId(GetLatestCheckpointByStubIdRequest)
+      returns (GetLatestCheckpointByStubIdResponse);
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+  rpc CreateCheckpoint(CreateCheckpointRequest)
+      returns (CreateCheckpointResponse);
+  rpc UpdateCheckpoint(UpdateCheckpointRequest)
+      returns (UpdateCheckpointResponse);
+  rpc CreateDiskSnapshot(CreateDiskSnapshotRequest)
+      returns (CreateDiskSnapshotResponse);
+  rpc FailDiskSnapshot(FailDiskSnapshotRequest)
+      returns (FailDiskSnapshotResponse);
+  rpc GetLatestDiskSnapshot(GetLatestDiskSnapshotRequest)
+      returns (GetLatestDiskSnapshotResponse);
+  rpc GetDiskSnapshot(GetDiskSnapshotRequest) returns (GetDiskSnapshotResponse);
+  rpc GetDiskSnapshotDownloadURL(GetDiskSnapshotDownloadURLRequest)
+      returns (GetDiskSnapshotDownloadURLResponse);
+}
+
+message GetCheckpointByIdRequest { string checkpoint_id = 1; }
+
+message GetCheckpointByIdResponse {
+  bool ok = 1;
+  types.Checkpoint checkpoint = 2;
+  string error_msg = 3;
+}
+
+message GetLatestCheckpointByStubIdRequest {
+  string stub_id = 1;
+  string compatibility_key = 2;
+}
+
+message GetLatestCheckpointByStubIdResponse {
+  bool ok = 1;
+  types.Checkpoint checkpoint = 2;
+  string error_msg = 3;
+  // Stored checkpoint key, or the applied filter when no checkpoint is available.
+  string compatibility_key = 4;
+}
+
+message ListCheckpointsRequest { string workspace_id = 1; }
+
+message ListCheckpointsResponse {
+  bool ok = 1;
+  repeated types.Checkpoint checkpoints = 2;
+  string error_msg = 3;
+}
+
+message CreateCheckpointRequest {
+  string checkpoint_id = 1;
+  string source_container_id = 2;
+  string container_ip = 3;
+  string status = 4;
+  string remote_key = 5;
+  string stub_id = 6;
+  repeated uint32 exposed_ports = 7;
+  string cache_hash = 8;
+  int64 cache_size_bytes = 9;
+  string origin_key = 10;
+  string locality = 11;
+  string accelerator = 12;
+  string runtime = 13;
+  string compatibility_key = 14;
+}
+
+message CreateCheckpointResponse {
+  bool ok = 1;
+  types.Checkpoint checkpoint = 2;
+  string error_msg = 3;
+}
+
+message UpdateCheckpointRequest {
+  string checkpoint_id = 1;
+  string status = 2;
+  google.protobuf.Timestamp last_restored_at = 3;
+}
+
+message UpdateCheckpointResponse {
+  bool ok = 1;
+  types.Checkpoint checkpoint = 2;
+  string error_msg = 3;
+}
+
+message DiskSnapshot {
+  string external_id = 1;
+  string disk_name = 2;
+  string format = 3;
+  string status = 4;
+  string reason = 5;
+  string parent_snapshot_id = 6;
+  int64 generation = 7;
+  int64 size_bytes = 8;
+  string filesystem = 9;
+  string driver = 10;
+  string manifest_key = 11;
+  string manifest_digest = 12;
+  int64 manifest_size_bytes = 13;
+  int64 chunk_count = 14;
+  int64 logical_size_bytes = 15;
+  int64 stored_size_bytes = 16;
+  string bucket_name = 17;
+  string object_prefix = 18;
+  string source_pool = 19;
+  string source_worker_id = 20;
+  string source_storage_node_id = 21;
+  google.protobuf.Timestamp created_at = 22;
+  google.protobuf.Timestamp updated_at = 23;
+  google.protobuf.Timestamp completed_at = 24;
+  bool public = 25;
+}
+
+message CreateDiskSnapshotRequest {
+  string workspace_id = 1;
+  string stub_id = 2;
+  DiskSnapshot snapshot = 3;
+}
+
+message CreateDiskSnapshotResponse {
+  bool ok = 1;
+  DiskSnapshot snapshot = 2;
+  string error_msg = 3;
+}
+
+message FailDiskSnapshotRequest {
+  string workspace_id = 1;
+  string snapshot_id = 2;
+  string reason = 3;
+}
+
+message FailDiskSnapshotResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message GetLatestDiskSnapshotRequest {
+  string workspace_id = 1;
+  string disk_name = 2;
+}
+
+message GetLatestDiskSnapshotResponse {
+  bool ok = 1;
+  DiskSnapshot snapshot = 2;
+  string error_msg = 3;
+}
+
+message GetDiskSnapshotRequest {
+  string workspace_id = 1;
+  string snapshot_id = 2;
+}
+
+message GetDiskSnapshotResponse {
+  bool ok = 1;
+  DiskSnapshot snapshot = 2;
+  string error_msg = 3;
+}
+
+message GetDiskSnapshotDownloadURLRequest {
+  string workspace_id = 1;
+  string snapshot_id = 2;
+  string object_key = 3;
+}
+
+message GetDiskSnapshotDownloadURLResponse {
+  bool ok = 1;
+  string url = 2;
+  string error_msg = 3;
+}

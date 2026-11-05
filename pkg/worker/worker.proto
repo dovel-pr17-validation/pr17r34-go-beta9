@@ -1,0 +1,344 @@
+syntax = "proto3";
+
+option go_package = "github.com/beam-cloud/beta9/proto";
+
+import "gateway.proto";
+import "types.proto";
+
+package container;
+
+service ContainerService {
+  rpc ContainerKill(ContainerKillRequest) returns (ContainerKillResponse) {}
+  rpc ContainerStatus(ContainerStatusRequest) returns (ContainerStatusResponse) {}
+  rpc ContainerExec(ContainerExecRequest) returns (ContainerExecResponse) {}
+  rpc ContainerStreamLogs(ContainerStreamLogsRequest) returns (stream ContainerLogEntry) {}
+  rpc ContainerArchive(ContainerArchiveRequest) returns (stream ContainerArchiveResponse) {}
+  rpc ContainerCheckpoint(ContainerCheckpointRequest) returns (ContainerCheckpointResponse) {}
+  rpc ContainerSnapshotDisks(ContainerSnapshotDisksRequest)
+      returns (ContainerSnapshotDisksResponse) {}
+  rpc ContainerSyncWorkspace(gateway.SyncContainerWorkspaceRequest)
+      returns (gateway.SyncContainerWorkspaceResponse) {}
+  rpc ContainerSandboxExec(ContainerSandboxExecRequest)
+      returns (ContainerSandboxExecResponse) {}
+  rpc ContainerSandboxStatus(ContainerSandboxStatusRequest)
+      returns (ContainerSandboxStatusResponse) {}
+  rpc ContainerSandboxStdout(ContainerSandboxStdoutRequest)
+      returns (ContainerSandboxStdoutResponse) {}
+  rpc ContainerSandboxStderr(ContainerSandboxStderrRequest)
+      returns (ContainerSandboxStderrResponse) {}
+  rpc ContainerSandboxKill(ContainerSandboxKillRequest)
+      returns (ContainerSandboxKillResponse) {}
+  rpc ContainerSandboxListFiles(ContainerSandboxListFilesRequest)
+      returns (ContainerSandboxListFilesResponse) {}
+  rpc ContainerSandboxUploadFile(ContainerSandboxUploadFileRequest)
+      returns (ContainerSandboxUploadFileResponse) {}
+  rpc ContainerSandboxDownloadFile(ContainerSandboxDownloadFileRequest)
+      returns (ContainerSandboxDownloadFileResponse) {}
+  rpc ContainerSandboxStatFile(ContainerSandboxStatFileRequest)
+      returns (ContainerSandboxStatFileResponse) {}
+  rpc ContainerSandboxDeleteFile(ContainerSandboxDeleteFileRequest)
+      returns (ContainerSandboxDeleteFileResponse) {}
+  rpc ContainerSandboxCreateDirectory(ContainerSandboxCreateDirectoryRequest)
+      returns (ContainerSandboxCreateDirectoryResponse) {}
+  rpc ContainerSandboxDeleteDirectory(ContainerSandboxDeleteDirectoryRequest)
+      returns (ContainerSandboxDeleteDirectoryResponse) {}
+  rpc ContainerSandboxExposePort(ContainerSandboxExposePortRequest)
+      returns (ContainerSandboxExposePortResponse) {}
+  rpc ContainerSandboxUpdateNetworkPermissions(ContainerSandboxUpdateNetworkPermissionsRequest)
+      returns (ContainerSandboxUpdateNetworkPermissionsResponse) {}
+  rpc ContainerSandboxReplaceInFiles(ContainerSandboxReplaceInFilesRequest)
+      returns (ContainerSandboxReplaceInFilesResponse) {}
+  rpc ContainerSandboxFindInFiles(ContainerSandboxFindInFilesRequest)
+      returns (ContainerSandboxFindInFilesResponse) {}
+  rpc ContainerSandboxListExposedPorts(ContainerSandboxListExposedPortsRequest)
+      returns (ContainerSandboxListExposedPortsResponse) {}
+  rpc ContainerSandboxListProcesses(ContainerSandboxListProcessesRequest)
+      returns (ContainerSandboxListProcessesResponse) {}
+  rpc ContainerTunnel(ContainerTunnelRequest) returns (ContainerTunnelResponse) {}
+}
+
+message ContainerKillRequest { string container_id = 1; }
+
+message ContainerKillResponse { bool ok = 1; }
+
+message ContainerExecRequest {
+  string container_id = 1;
+  string cmd = 2;
+  repeated string env = 3;
+}
+
+message ContainerExecResponse { bool ok = 1; }
+
+message ContainerStatusRequest { string container_id = 1; }
+
+message ContainerStatusResponse { bool running = 1; }
+
+message ContainerStreamLogsRequest { string container_id = 1; }
+
+message ContainerLogEntry { string msg = 1; }
+
+message ContainerArchiveRequest {
+  string container_id = 1;
+  string image_id = 2;
+}
+
+message ContainerArchiveResponse {
+  bool done = 1;
+  bool success = 2;
+  int32 progress = 3;
+  string error_msg = 4;
+}
+
+message ContainerCheckpointRequest {
+  string container_id = 1;
+  bool terminate_after_checkpoint = 2;
+}
+
+message ContainerCheckpointResponse {
+  bool ok = 1;
+  string checkpoint_id = 2;
+  string error_msg = 3;
+  string runtime = 4;
+  // Durable disk snapshots captured at the same boundary as the memory image.
+  repeated ContainerDiskSnapshot disk_snapshots = 5;
+}
+
+message ContainerSnapshotDisksRequest { string container_id = 1; }
+
+message ContainerDiskSnapshot {
+  string snapshot_id = 1;
+  string disk_name = 2;
+  int64 generation = 3;
+}
+
+message ContainerSnapshotDisksResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated ContainerDiskSnapshot snapshots = 3;
+}
+
+message ContainerSandboxExecRequest {
+  string container_id = 1;
+  string cmd = 2;
+  string cwd = 3;
+  map<string, string> env = 4;
+  bool interactive = 5;
+  bool wait = 6;
+ repeated types.SecretBinding secret_bindings = 7;
+}
+
+message ContainerSandboxExecResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  int32 pid = 3;
+  bool done = 4;
+  int32 exit_code = 5;
+  string stdout = 6;
+  string stderr = 7;
+}
+
+message ContainerSandboxStatusRequest {
+  string container_id = 1;
+  int32 pid = 2;
+  // Block on the worker's readiness event for a container-level probe.
+  bool wait_for_ready = 3;
+}
+
+message ContainerSandboxStatusResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string status = 3;
+  int32 exit_code = 4;
+}
+
+message ContainerSandboxStdoutRequest {
+  string container_id = 1;
+  int32 pid = 2;
+}
+
+message ContainerSandboxStdoutResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string stdout = 3;
+}
+
+message ContainerSandboxStderrRequest {
+  string container_id = 1;
+  int32 pid = 2;
+}
+
+message ContainerSandboxStderrResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string stderr = 3;
+}
+
+message ContainerSandboxKillRequest {
+  string container_id = 1;
+  int32 pid = 2;
+}
+
+message ContainerSandboxKillResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ContainerSandboxListFilesRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message ContainerSandboxListFilesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated types.FileInfo files = 3;
+}
+
+message ContainerSandboxDeleteFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message ContainerSandboxDeleteFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ContainerSandboxCreateDirectoryRequest {
+  string container_id = 1;
+  string container_path = 2;
+  int32 mode = 3;
+}
+
+message ContainerSandboxCreateDirectoryResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ContainerSandboxDeleteDirectoryRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message ContainerSandboxDeleteDirectoryResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ContainerSandboxUploadFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+  bytes data = 3;
+  int32 mode = 4;
+  int64 offset = 5;
+}
+
+message ContainerSandboxUploadFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ContainerSandboxDownloadFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+  int64 offset = 3;
+  int32 length = 4;
+}
+
+message ContainerSandboxDownloadFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  bytes data = 3;
+}
+
+message ContainerSandboxExposePortRequest {
+  string container_id = 1;
+  int32 port = 2;
+}
+
+message ContainerSandboxExposePortResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ContainerSandboxStatFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message ContainerSandboxStatFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  types.FileInfo file_info = 3;
+}
+
+message ContainerSandboxReplaceInFilesRequest {
+  string container_id = 1;
+  string container_path = 2;
+  string pattern = 3;
+  string new_string = 4;
+}
+
+message ContainerSandboxReplaceInFilesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message ContainerSandboxFindInFilesRequest {
+  string container_id = 1;
+  string container_path = 2;
+  string pattern = 3;
+}
+
+message ContainerSandboxFindInFilesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated types.FileSearchResult results = 3;
+}
+
+message ContainerSandboxListExposedPortsRequest {
+  string container_id = 1;
+  int32 port = 2;
+}
+
+message ContainerSandboxListExposedPortsResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated int32 exposed_ports = 3;
+}
+
+message ContainerSandboxListProcessesRequest { string container_id = 1; }
+
+message ContainerSandboxListProcessesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated types.ProcessInfo processes = 3;
+}
+
+message ContainerSandboxUpdateNetworkPermissionsRequest {
+  string container_id = 1;
+  bool block_network = 2;
+  repeated string allow_list = 3;
+}
+
+message ContainerSandboxUpdateNetworkPermissionsResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+// The worker owns the TCP socket; reads and writes use request replay metadata.
+message ContainerTunnelRequest {
+  string container_id = 1;
+  string session_id = 2;
+  uint32 port = 3;
+  bool create = 4;
+  bytes input = 5;
+  bool input_eof = 6;
+  bool read = 7;
+  bool close = 8;
+}
+
+message ContainerTunnelResponse {
+  bytes output = 1;
+  bool output_eof = 2;
+}

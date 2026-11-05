@@ -1,0 +1,689 @@
+package repository_services
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"testing"
+
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/beam-cloud/redislock"
+	"github.com/stretchr/testify/require"
+)
+
+type workerRuntimeCredentialsBackendRepo struct {
+	repository.BackendRepository
+	workspace                  *types.Workspace
+	stub                       *types.StubWithRelated
+	tokens                     []types.Token
+	secrets                    []types.Secret
+	workspaceByExternalIDCalls int
+	workspaceWithSigningCalls  int
+	workspaceCalls             int
+}
+
+func (r *workerRuntimeCredentialsBackendRepo) GetWorkspaceByExternalId(ctx context.Context, externalID string) (types.Workspace, error) {
+	r.workspaceByExternalIDCalls++
+	workspace := *r.workspace
+	workspace.ExternalId = externalID
+	return workspace, nil
+}
+
+func (r *workerRuntimeCredentialsBackendRepo) GetWorkspaceByExternalIdWithSigningKey(ctx context.Context, externalID string) (types.Workspace, error) {
+	r.workspaceWithSigningCalls++
+	workspace := *r.workspace
+	workspace.ExternalId = externalID
+	return workspace, nil
+}
+
+func (r *workerRuntimeCredentialsBackendRepo) GetWorkspace(ctx context.Context, workspaceID uint) (*types.Workspace, error) {
+	r.workspaceCalls++
+	workspace := *r.workspace
+	workspace.Id = workspaceID
+	return &workspace, nil
+}
+
+func (r *workerRuntimeCredentialsBackendRepo) GetSecretsByNameDecrypted(ctx context.Context, workspace *types.Workspace, names []string) ([]types.Secret, error) {
+	return r.secrets, nil
+}
+
+func (r *workerRuntimeCredentialsBackendRepo) RetrieveActiveToken(ctx context.Context, workspaceID uint, tokenType string) (*types.Token, error) {
+	var newest *types.Token
+	for i := range r.tokens {
+		token := &r.tokens[i]
+		if token.WorkspaceId == nil || *token.WorkspaceId != workspaceID || !token.Active || token.DisabledByClusterAdmin || token.TokenType != tokenType {
+			continue
+		}
+		if newest == nil || token.CreatedAt.After(newest.CreatedAt.Time) || (token.CreatedAt.Equal(newest.CreatedAt.Time) && token.Id > newest.Id) {
+			newest = token
+		}
+	}
+	if newest == nil {
+		return nil, sql.ErrNoRows
+	}
+	token := *newest
+	return &token, nil
+}
+
+func (r *workerRuntimeCredentialsBackendRepo) CreateToken(ctx context.Context, workspaceID uint, tokenType string, reusable bool) (types.Token, error) {
+	token := types.Token{Id: uint(len(r.tokens) + 1), Key: "created-runtime-token", Active: true, TokenType: tokenType, Reusable: reusable, WorkspaceId: &workspaceID}
+	r.tokens = append(r.tokens, token)
+	return token, nil
+}
+
+func runtimeToken(workspaceID uint, key string) types.Token {
+	return types.Token{Key: key, Active: true, TokenType: types.TokenTypeWorkspaceRestricted, WorkspaceId: &workspaceID}
+}
+
+func (r *workerRuntimeCredentialsBackendRepo) GetStubByExternalId(ctx context.Context, externalID string, queryFilters ...types.QueryFilter) (*types.StubWithRelated, error) {
+	if r.stub == nil {
+		return &types.StubWithRelated{Stub: types.Stub{ExternalId: externalID, Type: types.StubType(types.StubTypePodDeployment), Config: "{}"}}, nil
+	}
+	return r.stub, nil
+}
+
+type workerRuntimeCredentialsContainerRepo struct {
+	repository.ContainerRepository
+	state    *types.ContainerState
+	errs     []error
+	attempts int
+}
+
+func (r *workerRuntimeCredentialsContainerRepo) GetContainerState(containerID string) (*types.ContainerState, error) {
+	r.attempts++
+	if len(r.errs) > 0 {
+		err := r.errs[0]
+		r.errs = r.errs[1:]
+		return nil, err
+	}
+	return r.state, nil
+}
+
+func TestGetContainerRuntimeCredentialsVendsPrivateRuntimeBundle(t *testing.T) {
+	signingKey, signingKeyBytes := testSigningKey(t)
+	accessKey, err := common.Encrypt(signingKeyBytes, "mount-access")
+	require.NoError(t, err)
+	secretKey, err := common.Encrypt(signingKeyBytes, "mount-secret")
+	require.NoError(t, err)
+
+	storageID := uint(1)
+	storageBucket := "workspace-bucket"
+	storageAccess := "storage-access"
+	storageSecret := "storage-secret"
+	storageEndpoint := "https://storage.example.com"
+	storageRegion := "us-east-1"
+
+	stubConfig := types.StubConfigV1{
+		Volumes: []*pb.Volume{{
+			Id:        "volume-id",
+			MountPath: "data",
+			Config: &pb.MountPointConfig{
+				BucketName:     "mount-bucket",
+				AccessKey:      accessKey,
+				SecretKey:      secretKey,
+				EndpointUrl:    "https://mount.example.com",
+				Region:         "us-west-2",
+				ForcePathStyle: true,
+			},
+		}},
+	}
+	configJSON, err := json.Marshal(stubConfig)
+	require.NoError(t, err)
+
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{
+				Id:         7,
+				ExternalId: "workspace-id",
+				Name:       "workspace",
+				SigningKey: &signingKey,
+				Storage: &types.WorkspaceStorage{
+					Id:          &storageID,
+					BucketName:  &storageBucket,
+					AccessKey:   &storageAccess,
+					SecretKey:   &storageSecret,
+					EndpointUrl: &storageEndpoint,
+					Region:      &storageRegion,
+				},
+			},
+			stub: &types.StubWithRelated{
+				Stub: types.Stub{ExternalId: "stub-id", Config: string(configJSON)},
+			},
+			tokens:  []types.Token{runtimeToken(7, "restricted-runtime-token")},
+			secrets: []types.Secret{{Name: "SECRET", Value: "secret-value"}},
+		},
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{
+				ContainerId: "container-id",
+				WorkspaceId: "workspace-id",
+				StubId:      "stub-id",
+				WorkerId:    "worker-1",
+			},
+		},
+	}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{
+			WorkspaceId:      "workspace-id",
+			StubId:           "stub-id",
+			ContainerId:      "container-id",
+			SecretNames:      []string{"SECRET"},
+			RuntimeToken:     true,
+			WorkspaceStorage: true,
+			MountCredentials: []*pb.RuntimeMountCredentialRequest{{
+				MountPath:  "/volumes/data",
+				BucketName: "mount-bucket",
+			}},
+		},
+	)
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.ElementsMatch(t, []string{"SECRET=secret-value", "BETA9_TOKEN=restricted-runtime-token"}, resp.Env)
+	require.NotNil(t, resp.WorkspaceStorage)
+	require.Equal(t, "storage-access", resp.WorkspaceStorage.AccessKey)
+	require.Equal(t, "storage-secret", resp.WorkspaceStorage.SecretKey)
+	require.Len(t, resp.MountCredentials, 1)
+	require.Equal(t, "mount-access", resp.MountCredentials[0].Config.AccessKey)
+	require.Equal(t, "mount-secret", resp.MountCredentials[0].Config.SecretKey)
+}
+
+func TestGetContainerRuntimeCredentialsVendsStubScopedSecretAlias(t *testing.T) {
+	signingKey, signingKeyBytes := testSigningKey(t)
+	databaseURL, err := common.Encrypt(signingKeyBytes, "postgres://app:pass@db/app")
+	require.NoError(t, err)
+	stubConfig := types.StubConfigV1{
+		Secrets: []types.Secret{{
+			Name:  "DATABASE_URL",
+			Value: databaseURL,
+		}},
+	}
+	configJSON, err := json.Marshal(stubConfig)
+	require.NoError(t, err)
+
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{
+				Id:         7,
+				ExternalId: "workspace-id",
+				SigningKey: &signingKey,
+			},
+			stub: &types.StubWithRelated{
+				Stub: types.Stub{ExternalId: "stub-id", Config: string(configJSON)},
+			},
+		},
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{
+			WorkspaceId: "workspace-id",
+			StubId:      "stub-id",
+			ContainerId: "container-id",
+			SecretNames: []string{"DATABASE_URL"},
+		},
+	)
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Equal(t, []string{"DATABASE_URL=postgres://app:pass@db/app"}, resp.Env)
+}
+
+func TestGetContainerRuntimeCredentialsUsesWorkerTokenWorkspaceID(t *testing.T) {
+	signingKey, _ := testSigningKey(t)
+	workspaceID := uint(7)
+	backendRepo := &workerRuntimeCredentialsBackendRepo{
+		workspace: &types.Workspace{
+			Id:         workspaceID,
+			ExternalId: "workspace-id",
+			SigningKey: &signingKey,
+		},
+	}
+	service := &WorkerRepositoryService{
+		backendRepo: backendRepo,
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{Id: workspaceID, ExternalId: "workspace-id"},
+		Token:     &types.Token{TokenType: types.TokenTypeWorker, WorkspaceId: &workspaceID, WorkerID: "worker-1"},
+	})
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		ctx,
+		&pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: "workspace-id", StubId: "stub-id", ContainerId: "container-id"},
+	)
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Zero(t, backendRepo.workspaceByExternalIDCalls)
+}
+
+func TestGetContainerRuntimeCredentialsAllowsTrustedWorkerAcrossWorkspaces(t *testing.T) {
+	storageID := uint(1)
+	storageBucket := "target-bucket"
+	backendRepo := &workerRuntimeCredentialsBackendRepo{
+		workspace: &types.Workspace{
+			Id:         9,
+			ExternalId: "target-workspace",
+			Storage: &types.WorkspaceStorage{
+				Id:         &storageID,
+				BucketName: &storageBucket,
+			},
+		},
+	}
+	service := &WorkerRepositoryService{
+		backendRepo: backendRepo,
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "target-workspace", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+	adminWorkspaceID := uint(7)
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{Id: adminWorkspaceID, ExternalId: "admin-workspace"},
+		Token:     &types.Token{TokenType: types.TokenTypeWorker, WorkspaceId: &adminWorkspaceID, WorkerID: "worker-1"},
+	})
+
+	resp, err := service.GetContainerRuntimeCredentials(ctx, &pb.GetContainerRuntimeCredentialsRequest{
+		WorkspaceId:      "target-workspace",
+		StubId:           "stub-id",
+		ContainerId:      "container-id",
+		WorkspaceStorage: true,
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.NotNil(t, resp.WorkspaceStorage)
+	require.Equal(t, storageBucket, resp.WorkspaceStorage.BucketName)
+	require.Equal(t, 1, backendRepo.workspaceByExternalIDCalls)
+	require.Equal(t, 1, backendRepo.workspaceCalls, "reuse the authorized workspace instead of loading it again")
+}
+
+func TestGetContainerRuntimeCredentialsRejectsPrivateWorkerAcrossWorkspaces(t *testing.T) {
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{Id: 9, ExternalId: "target-workspace"},
+		},
+	}
+	privateWorkspaceID := uint(7)
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{Id: privateWorkspaceID, ExternalId: "private-workspace"},
+		Token:     &types.Token{TokenType: types.TokenTypeWorkerPrivate, WorkspaceId: &privateWorkspaceID, WorkerID: "worker-1"},
+	})
+
+	resp, err := service.GetContainerRuntimeCredentials(ctx, &pb.GetContainerRuntimeCredentialsRequest{
+		WorkspaceId:      "target-workspace",
+		WorkspaceStorage: true,
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "cannot request credentials")
+}
+
+func TestGetContainerRuntimeCredentialsRetriesContainerStateLockContention(t *testing.T) {
+	workspaceID := uint(7)
+	containerRepo := &workerRuntimeCredentialsContainerRepo{
+		state: &types.ContainerState{
+			ContainerId: "container-id",
+			WorkspaceId: "workspace-id",
+			StubId:      "stub-id",
+			WorkerId:    "worker-1",
+		},
+		errs: []error{redislock.ErrNotObtained, redislock.ErrNotObtained},
+	}
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{Id: workspaceID, ExternalId: "workspace-id"},
+			tokens:    []types.Token{runtimeToken(workspaceID, "restricted-runtime-token")},
+		},
+		containerRepo: containerRepo,
+	}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{
+			WorkspaceId:  "workspace-id",
+			StubId:       "stub-id",
+			ContainerId:  "container-id",
+			RuntimeToken: true,
+		},
+	)
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Equal(t, []string{"BETA9_TOKEN=restricted-runtime-token"}, resp.Env)
+	require.Equal(t, 3, containerRepo.attempts)
+}
+
+func TestGetContainerRuntimeCredentialsMintsOneRuntimeTokenPerWorkspace(t *testing.T) {
+	backendRepo := &workerRuntimeCredentialsBackendRepo{
+		workspace: &types.Workspace{Id: 7, ExternalId: "workspace-id"},
+		tokens:    []types.Token{runtimeToken(9, "other-workspace-token")},
+	}
+	service := &WorkerRepositoryService{
+		backendRepo: backendRepo,
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+	request := &pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: "workspace-id", StubId: "stub-id", ContainerId: "container-id", RuntimeToken: true}
+
+	for range 2 {
+		resp, err := service.GetContainerRuntimeCredentials(cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"), request)
+		require.NoError(t, err)
+		require.True(t, resp.Ok, resp.ErrorMsg)
+		require.Equal(t, []string{"BETA9_TOKEN=created-runtime-token"}, resp.Env)
+	}
+	require.Len(t, backendRepo.tokens, 2)
+	require.Equal(t, uint(7), *backendRepo.tokens[1].WorkspaceId)
+}
+
+func TestGetContainerRuntimeCredentialsDoesNotRequireSigningKeyForStorageAndRuntimeToken(t *testing.T) {
+	storageID := uint(1)
+	storageBucket := "workspace-bucket"
+	storageAccess := "storage-access"
+	storageSecret := "storage-secret"
+	storageEndpoint := "https://storage.example.com"
+	storageRegion := "us-east-1"
+	backendRepo := &workerRuntimeCredentialsBackendRepo{
+		workspace: &types.Workspace{
+			Id:         7,
+			ExternalId: "workspace-id",
+			Name:       "workspace",
+			Storage: &types.WorkspaceStorage{
+				Id:          &storageID,
+				BucketName:  &storageBucket,
+				AccessKey:   &storageAccess,
+				SecretKey:   &storageSecret,
+				EndpointUrl: &storageEndpoint,
+				Region:      &storageRegion,
+			},
+		},
+		tokens: []types.Token{runtimeToken(7, "restricted-runtime-token")},
+	}
+	service := &WorkerRepositoryService{
+		backendRepo: backendRepo,
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{
+			WorkspaceId:      "workspace-id",
+			StubId:           "stub-id",
+			ContainerId:      "container-id",
+			RuntimeToken:     true,
+			WorkspaceStorage: true,
+		},
+	)
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Equal(t, []string{"BETA9_TOKEN=restricted-runtime-token"}, resp.Env)
+	require.NotNil(t, resp.WorkspaceStorage)
+	require.Equal(t, "storage-access", resp.WorkspaceStorage.AccessKey)
+	require.Equal(t, "storage-secret", resp.WorkspaceStorage.SecretKey)
+	require.Zero(t, backendRepo.workspaceWithSigningCalls)
+}
+
+func TestGetContainerRuntimeCredentialsRequiresAssignedContainerForWorkspaceStorage(t *testing.T) {
+	storageID := uint(1)
+	storageBucket := "workspace-bucket"
+	storageAccess := "storage-access"
+	storageSecret := "storage-secret"
+	backendRepo := &workerRuntimeCredentialsBackendRepo{
+		workspace: &types.Workspace{
+			Id:         7,
+			ExternalId: "workspace-id",
+			Name:       "workspace",
+			Storage: &types.WorkspaceStorage{
+				Id:         &storageID,
+				BucketName: &storageBucket,
+				AccessKey:  &storageAccess,
+				SecretKey:  &storageSecret,
+			},
+		},
+	}
+	for _, state := range []*types.ContainerState{
+		nil,
+		{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-2"},
+	} {
+		service := &WorkerRepositoryService{backendRepo: backendRepo, containerRepo: &workerRuntimeCredentialsContainerRepo{state: state}}
+		resp, err := service.GetContainerRuntimeCredentials(
+			cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+			&pb.GetContainerRuntimeCredentialsRequest{
+				WorkspaceId:      "workspace-id",
+				StubId:           "stub-id",
+				ContainerId:      "container-id",
+				WorkspaceStorage: true,
+			},
+		)
+
+		require.NoError(t, err)
+		require.False(t, resp.Ok)
+		require.Contains(t, resp.ErrorMsg, "not assigned to this worker")
+		require.Nil(t, resp.WorkspaceStorage)
+	}
+}
+
+func TestGetContainerRuntimeCredentialsRequiresSigningKeyForSecrets(t *testing.T) {
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{Id: 7, ExternalId: "workspace-id"},
+		},
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{
+			WorkspaceId: "workspace-id",
+			StubId:      "stub-id",
+			ContainerId: "container-id",
+			SecretNames: []string{"SECRET"},
+		},
+	)
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "workspace signing key is unavailable")
+}
+
+func TestGetContainerRuntimeCredentialsRequiresSigningKeyForMountCredentials(t *testing.T) {
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{Id: 7, ExternalId: "workspace-id"},
+		},
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{
+			WorkspaceId: "workspace-id",
+			StubId:      "stub-id",
+			ContainerId: "container-id",
+			MountCredentials: []*pb.RuntimeMountCredentialRequest{{
+				MountPath:  "/volumes/data",
+				BucketName: "mount-bucket",
+			}},
+		},
+	)
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "workspace signing key is unavailable")
+}
+
+func TestGetContainerRuntimeCredentialsRejectsMismatchedContainerState(t *testing.T) {
+	signingKey, _ := testSigningKey(t)
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{Id: 7, ExternalId: "workspace-id", SigningKey: &signingKey},
+		},
+		containerRepo: &workerRuntimeCredentialsContainerRepo{
+			state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "other-workspace", StubId: "stub-id", WorkerId: "worker-1"},
+		},
+	}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: "workspace-id", StubId: "stub-id", ContainerId: "container-id"},
+	)
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "not assigned")
+}
+
+func TestVendRuntimeCredentialsLooksUpStateForAnotherContainer(t *testing.T) {
+	containerRepo := &workerRuntimeCredentialsContainerRepo{
+		state: &types.ContainerState{ContainerId: "other-container", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-2"},
+	}
+	service := &WorkerRepositoryService{
+		backendRepo: &workerRuntimeCredentialsBackendRepo{
+			workspace: &types.Workspace{Id: 7, ExternalId: "workspace-id"},
+			tokens:    []types.Token{runtimeToken(7, "runtime-token")},
+		},
+		containerRepo: containerRepo,
+	}
+	claimed := &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"}
+
+	// A nested request for the claimed container reuses the claim's state.
+	resp := service.vendRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: "workspace-id", StubId: "stub-id", ContainerId: "container-id", RuntimeToken: true},
+		claimed,
+	)
+	require.True(t, resp.Ok, resp.ErrorMsg)
+	require.Zero(t, containerRepo.attempts)
+
+	// A nested request naming another container is authorized against that
+	// container's own assignment, not the claim's.
+	resp = service.vendRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"),
+		&pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: "workspace-id", StubId: "stub-id", ContainerId: "other-container", RuntimeToken: true},
+		claimed,
+	)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "not assigned")
+	require.Equal(t, 1, containerRepo.attempts)
+}
+
+func TestGetContainerRuntimeCredentialsRequiresWorkerToken(t *testing.T) {
+	service := &WorkerRepositoryService{}
+
+	resp, err := service.GetContainerRuntimeCredentials(
+		cacheRepositoryAuthContext(types.TokenTypeWorkspace, "worker-workspace"),
+		&pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: "workspace-id", StubId: "stub-id", ContainerId: "container-id"},
+	)
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "worker token")
+}
+
+func testSigningKey(t *testing.T) (string, []byte) {
+	t.Helper()
+	key := make([]byte, 32)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+	return "sk_" + base64.StdEncoding.EncodeToString(key), key
+}
+
+// Managed endpoint replicas authenticate with their own replica secret and
+// may run on contributed hardware, so the worker token that claims them must
+// not be able to turn into an admin-workspace token or read undeclared secrets.
+func TestGetContainerRuntimeCredentialsBoundsManagedEndpointReplicas(t *testing.T) {
+	signingKey, signingKeyBytes := testSigningKey(t)
+	hfToken, err := common.Encrypt(signingKeyBytes, "hf-secret")
+	require.NoError(t, err)
+	configJSON, err := json.Marshal(types.StubConfigV1{Secrets: []types.Secret{{Name: "HF_TOKEN", Value: hfToken}}})
+	require.NoError(t, err)
+	workspace := &types.Workspace{Id: 7, ExternalId: "platform-admin", SigningKey: &signingKey}
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		ExternalId: "model-stub",
+		Type:       types.StubType(types.StubTypeManagedEndpointDeployment),
+		Config:     string(configJSON),
+	}}
+	newService := func() *WorkerRepositoryService {
+		return &WorkerRepositoryService{
+			backendRepo: &workerRuntimeCredentialsBackendRepo{
+				workspace: workspace,
+				stub:      stub,
+				tokens:    []types.Token{runtimeToken(workspace.Id, "admin-runtime-token")},
+				secrets:   []types.Secret{{Name: "STRIPE_KEY", Value: "unrelated"}},
+			},
+			containerRepo: &workerRuntimeCredentialsContainerRepo{
+				state: &types.ContainerState{ContainerId: "replica", WorkspaceId: workspace.ExternalId, StubId: "model-stub", WorkerId: "worker-1"},
+			},
+		}
+	}
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{Workspace: workspace, Token: &types.Token{TokenType: types.TokenTypeWorker, WorkerID: "worker-1"}})
+	base := pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: workspace.ExternalId, StubId: "model-stub", ContainerId: "replica"}
+
+	token := base
+	token.RuntimeToken = true
+	resp, err := newService().GetContainerRuntimeCredentials(ctx, &token)
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Empty(t, resp.Env)
+
+	undeclared := base
+	undeclared.SecretNames = []string{"HF_TOKEN", "STRIPE_KEY"}
+	resp, err = newService().GetContainerRuntimeCredentials(ctx, &undeclared)
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "STRIPE_KEY")
+
+	declared := base
+	declared.SecretNames = []string{"HF_TOKEN"}
+	resp, err = newService().GetContainerRuntimeCredentials(ctx, &declared)
+	require.NoError(t, err)
+	require.True(t, resp.Ok, resp.ErrorMsg)
+	require.Equal(t, []string{"HF_TOKEN=hf-secret"}, resp.Env)
+}
+
+func TestBrokeredSecretsVendOutsideEnvironment(t *testing.T) {
+	signingKey, _ := testSigningKey(t)
+	backend := &workerRuntimeCredentialsBackendRepo{
+		workspace: &types.Workspace{Id: 7, ExternalId: "workspace-id", SigningKey: &signingKey},
+		stub:      &types.StubWithRelated{Stub: types.Stub{ExternalId: "stub-id", Type: types.StubType(types.StubTypeSandbox), Config: `{}`}},
+		secrets:   []types.Secret{{Name: "KEY", Value: "real-value", Placeholder: "beam_secret_a", Hosts: []string{"api.example.com"}}},
+	}
+	service := &WorkerRepositoryService{backendRepo: backend, containerRepo: &workerRuntimeCredentialsContainerRepo{state: &types.ContainerState{ContainerId: "container-id", WorkspaceId: "workspace-id", StubId: "stub-id", WorkerId: "worker-1"}}}
+	request := &pb.GetContainerRuntimeCredentialsRequest{WorkspaceId: "workspace-id", StubId: "stub-id", ContainerId: "container-id", BindingNames: []string{"KEY"}}
+	response, err := service.GetContainerRuntimeCredentials(cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"), request)
+	require.NoError(t, err)
+	require.True(t, response.Ok, response.ErrorMsg)
+	require.Empty(t, response.Env)
+	require.Equal(t, "real-value", response.SecretBindings[0].Value)
+	backend.secrets[0].Value = "rotated"
+	response, err = service.GetContainerRuntimeCredentials(cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"), request)
+	require.NoError(t, err)
+	require.Equal(t, "rotated", response.SecretBindings[0].Value)
+	require.Equal(t, "beam_secret_a", response.SecretBindings[0].Placeholder)
+	request.BindingNames = nil
+	request.SecretNames = []string{"KEY"}
+	response, err = service.GetContainerRuntimeCredentials(cacheRepositoryAuthContext(types.TokenTypeWorkerPrivate, "workspace-id"), request)
+	require.NoError(t, err)
+	require.False(t, response.Ok, "old workers cannot hydrate brokered secrets into env")
+}

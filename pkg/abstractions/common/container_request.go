@@ -1,0 +1,39 @@
+package abstractions
+
+import (
+	"fmt"
+
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+)
+
+func ConfigureContainerRequestNetwork(request *types.ContainerRequest, stubConfig types.StubConfigV1) error {
+	if request == nil {
+		return fmt.Errorf("container request is nil")
+	}
+	policy := (&types.ContainerRequest{
+		BlockNetwork: stubConfig.BlockNetwork,
+		AllowList:    stubConfig.AllowList,
+	}).NetworkPolicy()
+	if stubConfig.BlockNetwork && policy == types.ContainerNetworkPolicyAllowList {
+		return fmt.Errorf("block_network and allow_list cannot both be set")
+	}
+	if policy == types.ContainerNetworkPolicyAllowList {
+		if err := common.ValidateAllowList(stubConfig.AllowList); err != nil {
+			return err
+		}
+	}
+
+	for _, binding := range request.SecretBindings {
+		for _, host := range binding.Hosts {
+			if len(stubConfig.AllowList) > 0 && !common.HostPatternCovered(host, stubConfig.AllowList) {
+				return fmt.Errorf("secret %q host %q is not allowed by egress", binding.SecretName, host)
+			}
+		}
+	}
+	request.BlockNetwork = stubConfig.BlockNetwork
+	request.AllowList = append([]string(nil), stubConfig.AllowList...)
+	request.DockerEnabled = stubConfig.DockerEnabled
+	request.UseVM = stubConfig.UseVM
+	return nil
+}

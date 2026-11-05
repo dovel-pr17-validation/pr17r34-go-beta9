@@ -1,0 +1,611 @@
+import os
+import tempfile
+import zipfile
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import MagicMock, patch
+
+from beta9.abstractions.image import Image, dockerignore_patterns
+from beta9.clients.gateway import (
+    CommitObjectDeltaResponse,
+    CompleteObjectUploadResponse,
+    CreateObjectDeltaResponse,
+    CreateObjectResponse,
+    HeadObjectResponse,
+    ObjectUploadPart,
+)
+from beta9.sync import (
+    FileSyncer,
+    FileSyncResult,
+    _Manifest,
+    _ManifestEntry,
+    _SyncCache,
+    ignore_file_name,
+)
+
+
+class _FakeGateway:
+    """Records what the syncer uploads; every archive PUT lands in self.puts."""
+
+    def __init__(self, known_hashes=(), base_missing=False, commit_ok=True, part_size=0):
+        self.known_hashes = set(known_hashes)
+        self.base_missing = base_missing
+        self.commit_ok = commit_ok
+        self.part_size = part_size
+        self.created = []
+        self.deltas = []
+        self.commits = []
+        self.completed = []
+        self.objects = 0
+
+    def head_object(self, req):
+        if req.hash in self.known_hashes:
+            return HeadObjectResponse(
+                ok=True, exists=True, object_id="obj-known", use_workspace_storage=True
+            )
+        return HeadObjectResponse(ok=True, exists=False, use_workspace_storage=True)
+
+    def create_object(self, req):
+        self.objects += 1
+        self.created.append(req)
+        if self.part_size and req.multipart_total_size > self.part_size:
+            parts = []
+            start = 0
+            while start < req.multipart_total_size:
+                end = min(start + self.part_size, req.multipart_total_size)
+                parts.append(
+                    ObjectUploadPart(
+                        number=len(parts) + 1,
+                        start=start,
+                        end=end,
+                        url=f"https://put/part/{len(parts) + 1}",
+                    )
+                )
+                start = end
+            return CreateObjectResponse(
+                ok=True, object_id=f"obj-{self.objects}", upload_id="mpu-1", upload_parts=parts
+            )
+        return CreateObjectResponse(
+            ok=True, object_id=f"obj-{self.objects}", presigned_url="https://put/full"
+        )
+
+    def complete_object_upload(self, req):
+        self.completed.append(req)
+        return CompleteObjectUploadResponse(ok=True)
+
+    def create_object_delta(self, req):
+        self.deltas.append(req)
+        if self.base_missing:
+            return CreateObjectDeltaResponse(ok=False, base_missing=True)
+        self.objects += 1
+        return CreateObjectDeltaResponse(
+            ok=True, object_id=f"obj-{self.objects}", presigned_url="https://put/delta"
+        )
+
+    def commit_object_delta(self, req):
+        self.commits.append(req)
+        return CommitObjectDeltaResponse(
+            ok=self.commit_ok, object_id=req.object_id, error_msg="" if self.commit_ok else "boom"
+        )
+
+
+class TestIncrementalSync(TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "proj"
+        self.root.mkdir()
+        (self.root / "app").mkdir()
+        for i in range(5):
+            (self.root / "app" / f"f{i}.bin").write_bytes(bytes([i]) * 10000)
+        (self.root / "main.py").write_text("print(1)\n")
+        self.cache_dir = Path(self.tmp.name) / "cache"
+        self.puts = []
+
+        self.part_bodies = {}
+        self.part_attempts = {}
+        self.part_failures = {}  # url -> how many attempts fail with 503 first
+        self.put_kwargs = []
+
+        def fake_put(url, data=None, headers=None, **kwargs):
+            self.put_kwargs.append(kwargs)
+            resp = MagicMock()
+            resp.status_code = 200
+            if isinstance(data, bytes):  # a multipart part
+                self.part_attempts[url] = self.part_attempts.get(url, 0) + 1
+                if self.part_failures.get(url, 0) >= self.part_attempts[url]:
+                    resp.status_code = 503
+                    return resp
+                self.part_bodies[url] = data
+                resp.headers = {"ETag": f'"etag-{len(self.part_bodies)}"'}
+                return resp
+            names = sorted(zipfile.ZipFile(data.name).namelist())
+            self.puts.append((url, names))
+            return resp
+
+        self.patches = [
+            patch("beta9.sync._SyncCache.cache_dir", classmethod(lambda cls: self.cache_dir)),
+            patch("beta9.sync.requests.put", side_effect=fake_put),
+            patch(
+                "beta9.sync.terminal.progress_open", side_effect=lambda p, mode, **k: open(p, mode)
+            ),
+            patch("beta9.sync.is_local", return_value=False),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _sync(self, gw):
+        syncer = FileSyncer(gateway_stub=gw, root_dir=str(self.root))
+        return syncer.sync()
+
+    def test_dockerfile_upload_reincludes_files_under_excluded_directories(self):
+        dockerfile = self.root / "Dockerfile"
+        dockerfile.write_text("FROM scratch\nCOPY . /\n")
+        (self.root / ".dockerignore").write_text("*\n!app/f0.bin\n")
+        (self.root / ".beamignore").write_text("*\n")
+        image = Image.from_dockerfile(str(dockerfile))
+        image.gateway_stub = _FakeGateway()
+
+        image.sync_files(str(self.root))
+
+        self.assertEqual(self.puts[0][1], ["app/f0.bin"])
+        self.assertTrue(image.build_ctx_object)
+
+    def test_dockerfile_upload_without_dockerignore_preserves_all_local_files(self):
+        dockerfile = self.root / "Dockerfile"
+        dockerfile.write_text("FROM scratch\nCOPY . /\n")
+        (self.root / ".beamignore").write_text("*\n")
+        image = Image.from_dockerfile(str(dockerfile))
+        image.gateway_stub = _FakeGateway()
+
+        image.sync_files(str(self.root))
+
+        self.assertIn("main.py", self.puts[0][1])
+        self.assertIn(".beamignore", self.puts[0][1])
+
+    def test_empty_ignore_patterns_preserve_project_exclusions_in_uploaded_archive(self):
+        for name in (".git/HEAD", ".venv/lib/file", "node_modules/package/index.js"):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("excluded")
+        (self.root / ignore_file_name()).write_text(
+            f"{ignore_file_name()}\n.git\n.venv\nnode_modules\napp\n"
+        )
+
+        with patch("beta9.sync.is_local", return_value=True):
+            FileSyncer(_FakeGateway(), root_dir=str(self.root)).sync(ignore_patterns=[])
+
+        self.assertEqual(self.puts[0][1], ["main.py"])
+
+    def test_manifest_hash_depends_on_content_path_and_mode(self):
+        a = _Manifest({"x": _ManifestEntry(1, 1, "h1", 0o644)})
+        self.assertEqual(
+            a.hash(),
+            _Manifest({"x": _ManifestEntry(1, 999, "h1", 0o644)}).hash(),
+            "mtime is not identity",
+        )
+        self.assertNotEqual(a.hash(), _Manifest({"x": _ManifestEntry(1, 1, "h2", 0o644)}).hash())
+        self.assertNotEqual(a.hash(), _Manifest({"y": _ManifestEntry(1, 1, "h1", 0o644)}).hash())
+        self.assertNotEqual(a.hash(), _Manifest({"x": _ManifestEntry(1, 1, "h1", 0o755)}).hash())
+
+    def test_sync_nothing_does_not_replace_the_directory_cache_entry(self):
+        # A build or a sandbox without sync_local_dir syncs with ignore ["*"]
+        # from the same directory. Its empty manifest must not become the
+        # cache entry, or the next real sync diffs against nothing, sees every
+        # file as changed and uploads the whole directory again.
+        gw = _FakeGateway()
+        self._sync(gw)
+        self.assertEqual(len(gw.created), 1)
+        FileSyncer(gateway_stub=gw, root_dir=str(self.root)).sync(ignore_patterns=["*"])
+        cache = _SyncCache.load(self.root, [])
+        self.assertEqual(cache.object_id, "obj-1")
+        self.assertEqual(len(cache.manifest.entries), 6)
+
+        (self.root / "app" / "f0.bin").write_bytes(b"changed")
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(len(gw.deltas), 1, "the change goes up as a delta")
+        self.assertEqual(gw.deltas[0].base_object_id, "obj-1")
+        self.assertEqual(
+            len(gw.created), 2, "only the empty sync-nothing object, no second full upload"
+        )
+
+    def test_sync_nothing_resolves_its_object_once_per_gateway_identity(self):
+        # Every sandbox without sync_local_dir syncs the same empty manifest.
+        # Channels to one gateway and token share a cache_key, so after the first
+        # lookup the rest of a burst must not each pay a head_object round trip.
+        class _Channel:
+            cache_key = "gateway-a"
+
+        class _IdentifiedGateway(_FakeGateway):
+            channel = _Channel()
+
+            def __init__(self):
+                super().__init__(known_hashes=(_Manifest({}).hash(),))
+                self.heads = 0
+
+            def head_object(self, req):
+                self.heads += 1
+                return super().head_object(req)
+
+        gw = _IdentifiedGateway()
+        for _ in range(3):
+            result = FileSyncer(gateway_stub=gw, root_dir=str(self.root)).sync(
+                ignore_patterns=["*"]
+            )
+            self.assertEqual(result, FileSyncResult(success=True, object_id="obj-known"))
+        self.assertEqual(gw.heads, 1)
+
+        other = _IdentifiedGateway()
+        other.channel = type("C", (), {"cache_key": "gateway-b"})()
+        FileSyncer(gateway_stub=other, root_dir=str(self.root)).sync(ignore_patterns=["*"])
+        self.assertEqual(other.heads, 1, "a different gateway identity is looked up on its own")
+
+    def test_first_sync_uploads_everything_and_seeds_cache(self):
+        gw = _FakeGateway()
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(result.object_id, "obj-1")
+        self.assertEqual(len(gw.created), 1)
+        self.assertEqual(gw.deltas, [])
+        self.assertEqual(self.puts[0][0], "https://put/full")
+        self.assertEqual(
+            self.puts[0][1],
+            sorted(
+                ["app/f0.bin", "app/f1.bin", "app/f2.bin", "app/f3.bin", "app/f4.bin", "main.py"]
+            ),
+        )
+        cache = _SyncCache.load(self.root, [])
+        self.assertEqual(cache.object_id, "obj-1")
+        self.assertEqual(len(cache.manifest.entries), 6)
+        # The object record's size is the archive's byte length, like the
+        # stream and delta paths record it, not the uncompressed file total.
+        req = gw.created[0]
+        self.assertEqual(req.size, req.multipart_total_size)
+        self.assertEqual(req.object_metadata.size, req.multipart_total_size)
+        self.assertNotEqual(req.size, 5 * 10000 + len("print(1)\n"))
+
+    def test_large_full_upload_goes_as_concurrent_parts(self):
+        gw = _FakeGateway(part_size=20000)
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(self.puts, [], "no single-stream PUT for a multipart upload")
+        req = gw.created[0]
+        self.assertGreater(req.multipart_part_size, 0)
+        self.assertGreater(req.multipart_total_size, 20000)
+        self.assertEqual(len(gw.completed), 1)
+        completed = gw.completed[0]
+        self.assertEqual(completed.upload_id, "mpu-1")
+        self.assertEqual(
+            [p.number for p in completed.parts], list(range(1, len(self.part_bodies) + 1))
+        )
+        self.assertTrue(all(p.etag.startswith('"etag-') for p in completed.parts))
+        # The parts, in order, are the archive.
+        archive = b"".join(
+            self.part_bodies[f"https://put/part/{n}"] for n in range(1, len(self.part_bodies) + 1)
+        )
+        self.assertEqual(len(archive), req.multipart_total_size)
+        import io
+
+        names = sorted(zipfile.ZipFile(io.BytesIO(archive)).namelist())
+        self.assertEqual(
+            names,
+            sorted(
+                ["app/f0.bin", "app/f1.bin", "app/f2.bin", "app/f3.bin", "app/f4.bin", "main.py"]
+            ),
+        )
+
+    def test_unchanged_directory_is_a_head_hit(self):
+        gw = _FakeGateway()
+        first = self._sync(gw)
+        gw.known_hashes.add(gw.created[0].hash)
+        again = self._sync(gw)
+        self.assertEqual(again.object_id, "obj-known")
+        self.assertEqual(len(self.puts), 1, "nothing uploaded the second time")
+        self.assertEqual(first.object_id, "obj-1")
+
+    def test_one_changed_file_uploads_only_the_delta(self):
+        gw = _FakeGateway()
+        self._sync(gw)
+        (self.root / "app" / "f2.bin").write_bytes(b"changed" * 100)
+        (self.root / "app" / "f4.bin").unlink()
+        (self.root / "app" / "new.txt").write_text("new")
+
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(result.object_id, "obj-2")
+        self.assertEqual(len(gw.deltas), 1)
+        self.assertEqual(gw.deltas[0].base_object_id, "obj-1")
+        self.assertEqual(self.puts[-1][0], "https://put/delta")
+        self.assertEqual(self.puts[-1][1], ["app/f2.bin", "app/new.txt"])
+        self.assertEqual(gw.commits[0].removed_paths, ["app/f4.bin"])
+        self.assertEqual(gw.commits[0].base_object_id, "obj-1")
+        self.assertEqual(len(gw.created), 1, "no full upload")
+        self.assertEqual(_SyncCache.load(self.root, []).object_id, "obj-2")
+
+    def test_same_root_with_other_include_patterns_is_a_delta_base(self):
+        """A build context synced with add_local_dir (include patterns) and the
+        same directory mounted with sync_local_dir (no patterns) are different
+        objects, but the second sync should only upload the files the first
+        one did not cover."""
+        gw = _FakeGateway()
+        syncer = FileSyncer(gateway_stub=gw, root_dir=str(self.root))
+        first = syncer.sync(include_patterns=["app/**"])
+        self.assertTrue(first.success)
+        self.assertEqual(len(gw.created), 1)
+        self.assertEqual(self.puts[-1][1], [f"app/f{i}.bin" for i in range(5)])
+
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(result.object_id, "obj-2")
+        self.assertEqual(len(gw.created), 1, "no second full upload")
+        self.assertEqual(gw.deltas[0].base_object_id, "obj-1")
+        self.assertEqual(self.puts[-1][1], ["main.py"])
+        self.assertEqual(gw.commits[0].removed_paths, [])
+        self.assertEqual(_SyncCache.load(self.root, []).object_id, "obj-2")
+        self.assertEqual(_SyncCache.load(self.root, ["app/**"]).object_id, "obj-1")
+
+    def test_missing_base_falls_back_to_full_upload(self):
+        gw = _FakeGateway()
+        self._sync(gw)
+        gw.base_missing = True
+        (self.root / "main.py").write_text("print(2)\n")
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(len(gw.deltas), 1)
+        self.assertEqual(len(gw.created), 2)
+        self.assertEqual(self.puts[-1][0], "https://put/full")
+        self.assertEqual(len(self.puts[-1][1]), 6)
+
+    def test_failed_commit_falls_back_to_full_upload(self):
+        gw = _FakeGateway(commit_ok=False)
+        self._sync(gw)
+        (self.root / "main.py").write_text("print(3)\n")
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(len(gw.commits), 1)
+        self.assertEqual(len(gw.created), 2)
+        self.assertEqual(self.puts[-1][0], "https://put/full")
+
+    def test_large_delta_uses_full_upload(self):
+        gw = _FakeGateway()
+        self._sync(gw)
+        for i in range(4):
+            (self.root / "app" / f"f{i}.bin").write_bytes(bytes([9]) * 10000)
+        self._sync(gw)
+        self.assertEqual(gw.deltas, [])
+        self.assertEqual(len(gw.created), 2)
+
+    def test_unchanged_files_are_not_rehashed(self):
+        gw = _FakeGateway()
+        self._sync(gw)
+        with patch.object(
+            FileSyncer, "_calculate_sha256", wraps=FileSyncer._calculate_sha256
+        ) as calc:
+            (self.root / "main.py").write_text("print(4)\n")
+            self._sync(gw)
+            self.assertEqual(calc.call_count, 1)
+
+    def test_same_size_rewrite_with_preserved_mtime_is_rehashed(self):
+        # cp -p / rsync -t / touch -r can replace a file's bytes while keeping
+        # its size and mtime; only ctime, which user space cannot set, moves.
+        gw = _FakeGateway()
+        self._sync(gw)
+        target = self.root / "app" / "f1.bin"
+        st = target.stat()
+        target.write_bytes(bytes([7]) * 10000)  # same size, different content
+        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(target.stat().st_mtime_ns, st.st_mtime_ns)
+
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(len(gw.deltas), 1, "the rewrite is seen and uploaded")
+        self.assertEqual(self.puts[-1], ("https://put/delta", ["app/f1.bin"]))
+
+    def test_cache_entry_without_ctime_is_rehashed_once_then_reused(self):
+        # An entry written by an SDK that did not record ctime cannot be
+        # trusted; hash it once and record ctime so the next sync reuses it.
+        gw = _FakeGateway()
+        self._sync(gw)
+        cache = _SyncCache.load(self.root, [])
+        entries = {
+            rel: _ManifestEntry(e.size, e.mtime_ns, e.sha256, e.mode)
+            for rel, e in cache.manifest.entries.items()
+        }
+        cache.save(cache.object_id, _Manifest(entries))
+        with patch.object(
+            FileSyncer, "_calculate_sha256", wraps=FileSyncer._calculate_sha256
+        ) as calc:
+            gw.known_hashes.add(gw.created[0].hash)
+            self._sync(gw)
+            self.assertEqual(calc.call_count, 6)
+            self._sync(gw)
+            self.assertEqual(calc.call_count, 6, "ctime recorded; nothing rehashed")
+
+    def test_malformed_cache_entry_is_a_miss_not_an_error(self):
+        gw = _FakeGateway()
+        self._sync(gw)
+        path = _SyncCache.load(self.root, []).path
+        for bad in ('{"version": 1, "object_id": "obj-1", "manifest": null}', "[]", "null"):
+            path.write_text(bad)
+            cache = _SyncCache.load(self.root, [])
+            self.assertEqual(cache.object_id, "", bad)
+            self.assertIsNone(cache.manifest, bad)
+            result = self._sync(gw)
+            self.assertTrue(result.success, bad)
+
+    def test_transient_part_failure_is_retried(self):
+        gw = _FakeGateway(part_size=20000)
+        self.part_failures["https://put/part/2"] = 1
+        result = self._sync(gw)
+        self.assertTrue(result.success)
+        self.assertEqual(self.part_attempts["https://put/part/2"], 2)
+        self.assertEqual(len(gw.completed), 1)
+        self.assertTrue(all("timeout" in kw for kw in self.put_kwargs), "parts have a timeout")
+
+    def test_persistent_part_failure_fails_the_upload(self):
+        gw = _FakeGateway(part_size=20000)
+        self.part_failures["https://put/part/1"] = 99
+        with self.assertRaises(SystemExit):  # terminal.error("File sync failed")
+            self._sync(gw)
+        self.assertEqual(self.part_attempts["https://put/part/1"], 3)
+        self.assertEqual(gw.completed, [], "a failed upload is never completed")
+
+
+class TestDockerBuildContext(TestCase):
+    """A Dockerfile build sends what `docker build` would, whatever .beamignore says."""
+
+    FILES = [
+        "Dockerfile",
+        ".python-version",
+        "pyproject.toml",
+        "src/app.py",
+        "src/build/keep.txt",
+        "build/out.bin",
+        ".env",
+        "node_modules/x/index.js",
+        ".git/HEAD",
+    ]
+
+    def context(self, dockerignore=None, specific_ignore=None):
+        with tempfile.TemporaryDirectory() as root:
+            for name in self.FILES:
+                Path(root, name).parent.mkdir(parents=True, exist_ok=True)
+                Path(root, name).write_text("x")
+            if dockerignore is not None:
+                Path(root, ".dockerignore").write_text(dockerignore)
+            if specific_ignore is not None:
+                Path(root, "Dockerfile.dockerignore").write_text(specific_ignore)
+            patterns = dockerignore_patterns(str(Path(root, "Dockerfile")), root)
+            syncer = FileSyncer(
+                gateway_stub=MagicMock(),
+                root_dir=root,
+                prune_ignored_directories=not any(p.startswith("!") for p in patterns),
+            )
+            syncer.ignore_patterns = patterns
+            syncer.include_patterns = []
+            return sorted(os.path.relpath(path, root) for path in syncer._collect_files())
+
+    def test_dockerignore_patterns_are_anchored_at_the_context_root(self):
+        self.assertEqual(
+            self.context("build\n.env\n**/node_modules\n"),
+            [
+                ".dockerignore",
+                ".git/HEAD",
+                ".python-version",
+                "Dockerfile",
+                "pyproject.toml",
+                "src/app.py",
+                "src/build/keep.txt",
+            ],
+        )
+
+    def test_an_allowlist_dockerignore_reincludes_directories(self):
+        self.assertEqual(
+            self.context("*\n!src/\n!pyproject.toml\n"),
+            ["pyproject.toml", "src/app.py", "src/build/keep.txt"],
+        )
+
+    def test_without_a_dockerignore_sends_the_whole_context(self):
+        self.assertEqual(self.context(), sorted(self.FILES))
+
+    def test_negated_file_beneath_an_excluded_directory_is_included(self):
+        self.assertEqual(self.context("*\n!src/app.py\n"), ["src/app.py"])
+
+    def test_trailing_slashes_do_not_require_a_directory(self):
+        self.assertNotIn("pyproject.toml", self.context("pyproject.toml/\n"))
+
+    def test_dot_pattern_is_ignored(self):
+        self.assertEqual(self.context(".\n"), sorted(self.FILES + [".dockerignore"]))
+
+    def test_empty_negation_is_invalid(self):
+        with self.assertRaisesRegex(ValueError, "Empty .dockerignore pattern"):
+            self.context("!\n")
+
+    def test_dockerfile_specific_ignore_takes_precedence(self):
+        self.assertEqual(
+            self.context("src\n", "build\n"),
+            [
+                ".dockerignore",
+                ".env",
+                ".git/HEAD",
+                ".python-version",
+                "Dockerfile",
+                "Dockerfile.dockerignore",
+                "node_modules/x/index.js",
+                "pyproject.toml",
+                "src/app.py",
+                "src/build/keep.txt",
+            ],
+        )
+
+
+class TestFileSyncer(TestCase):
+    def test_disabling_project_ignore_does_not_load_or_create_it(self):
+        gateway = MagicMock()
+        gateway.head_object.return_value = HeadObjectResponse(ok=True, exists=True)
+        with tempfile.TemporaryDirectory() as root:
+            syncer = FileSyncer(gateway_stub=gateway, root_dir=root, use_project_ignore=False)
+            with patch.object(syncer, "_init_ignore_file") as initialize:
+                with patch.object(syncer, "_read_ignore_file") as read:
+                    syncer.sync(ignore_patterns=[])
+            initialize.assert_not_called()
+            read.assert_not_called()
+            self.assertEqual(syncer.ignore_patterns, [])
+
+    def test_default_sync_still_uses_beamignore(self):
+        gateway = MagicMock()
+        gateway.head_object.return_value = HeadObjectResponse(ok=True, exists=True)
+        with tempfile.TemporaryDirectory() as root:
+            syncer = FileSyncer(gateway_stub=gateway, root_dir=root)
+            with patch.object(syncer, "_init_ignore_file") as initialize:
+                with patch.object(syncer, "_read_ignore_file", return_value=["secret"]) as read:
+                    syncer.sync()
+            initialize.assert_called_once_with()
+            read.assert_called_once_with()
+            self.assertEqual(syncer.ignore_patterns, ["secret"])
+
+    def test_init_ignore_file(self):
+        syncer = FileSyncer(gateway_stub=MagicMock())
+
+        syncer._init_ignore_file()
+        self.assertTrue(syncer.ignore_file_path.exists())
+
+        # Clean up
+        os.remove(syncer.ignore_file_path)
+
+    def test_ignore_file_contents(self):
+        syncer = FileSyncer(gateway_stub=MagicMock())
+
+        syncer._init_ignore_file()
+        self.assertTrue(syncer.ignore_file_path.exists())
+
+        # Add some additional ignore patterns to file
+        with open(syncer.ignore_file_path, "a") as f:
+            f.write("*.pyc\n")
+            f.write("**/node_modules\n")
+            f.write("logs/*.log\n")
+            f.write("docs/*/temp\n")
+
+        syncer.ignore_patterns = syncer._read_ignore_file()
+
+        self.assertTrue(syncer._should_ignore(".venv"))
+        self.assertFalse(syncer._should_ignore("test.py"))
+        self.assertTrue(syncer._should_ignore(".venv/"))
+        self.assertTrue(syncer._should_ignore(".venv/lib/python3.8/site-packages/"))
+        self.assertTrue(syncer._should_ignore(".git/"))
+        self.assertTrue(syncer._should_ignore(".DS_Store"))
+        self.assertTrue(syncer._should_ignore("logs/test.log"))
+        self.assertTrue(syncer._should_ignore("docs/123/temp"))
+        self.assertTrue(syncer._should_ignore("docs/123/temp/test.txt"))
+        self.assertFalse(syncer._should_ignore("docs/123/test.txt"))
+        self.assertTrue(syncer._should_ignore("blah.pyc"))
+        self.assertTrue(syncer._should_ignore("oawdi/oawidj/oiw/node_modules"))
+        self.assertTrue(syncer._should_ignore("node_modules"))
+
+        # Clean up
+        os.remove(syncer.ignore_file_path)

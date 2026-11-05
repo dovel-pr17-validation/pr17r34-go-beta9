@@ -1,0 +1,412 @@
+package disk
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/google/uuid"
+)
+
+// qmpClient is a minimal QMP client for qemu-storage-daemon. It supports the
+// handshake plus the commands the disk engine needs: transactional snapshots,
+// commit jobs (compaction), graph queries (recovery), and quit.
+type qmpClient struct {
+	conn net.Conn
+	dec  *json.Decoder
+}
+
+const qmpDialTimeout = 10 * time.Second
+
+func dialQMP(ctx context.Context, socketPath string) (*qmpClient, error) {
+	dialer := net.Dialer{Timeout: qmpDialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial qmp socket %s: %w", socketPath, err)
+	}
+	client := &qmpClient{conn: conn, dec: json.NewDecoder(conn)}
+
+	// The server speaks first with a greeting banner.
+	var greeting struct {
+		QMP *json.RawMessage `json:"QMP"`
+	}
+	if err := client.decode(ctx, &greeting); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read qmp greeting: %w", err)
+	}
+	if greeting.QMP == nil {
+		conn.Close()
+		return nil, fmt.Errorf("unexpected qmp greeting")
+	}
+	if _, err := client.execute(ctx, types.QMPCommandCapabilities, nil); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("negotiate qmp capabilities: %w", err)
+	}
+	return client, nil
+}
+
+// Close is idempotent, so a caller can free the daemon's one monitor
+// connection before its deferred Close runs.
+func (c *qmpClient) Close() error {
+	if err := c.conn.Close(); !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
+}
+
+func qmpDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(qmpDialTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		return d
+	}
+	return deadline
+}
+
+func (c *qmpClient) decode(ctx context.Context, v any) error {
+	_ = c.conn.SetReadDeadline(qmpDeadline(ctx))
+	return c.dec.Decode(v)
+}
+
+type qmpError struct {
+	Class string `json:"class"`
+	Desc  string `json:"desc"`
+}
+
+func (c *qmpClient) execute(ctx context.Context, command string, arguments any) (json.RawMessage, error) {
+	id := uuid.NewString()
+	request := map[string]any{"execute": command, "id": id}
+	if arguments != nil {
+		request["arguments"] = arguments
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	_ = c.conn.SetWriteDeadline(qmpDeadline(ctx))
+	if _, err := c.conn.Write(payload); err != nil {
+		return nil, fmt.Errorf("write qmp command %s: %w", command, err)
+	}
+
+	// A timed-out command can reply after the monitor reconnects. Match IDs
+	// across connections so its result cannot stand in for a recovery query.
+	for {
+		var response struct {
+			ID     string           `json:"id"`
+			Return json.RawMessage  `json:"return"`
+			Error  *qmpError        `json:"error"`
+			Event  *json.RawMessage `json:"event"`
+		}
+		if err := c.decode(ctx, &response); err != nil {
+			return nil, fmt.Errorf("read qmp response for %s: %w", command, err)
+		}
+		if response.Event != nil || response.ID != id {
+			continue
+		}
+		if response.Error != nil {
+			return nil, fmt.Errorf("qmp %s: %s: %s", command, response.Error.Class, response.Error.Desc)
+		}
+		return response.Return, nil
+	}
+}
+
+// addOverlay opens a pre-created empty overlay under explicit node names,
+// with no backing attached yet. Naming the file child ourselves (instead of
+// letting blockdev-snapshot-sync open the file anonymously) keeps the head's
+// file node addressable for write statistics after every pivot.
+func (c *qmpClient) addOverlay(ctx context.Context, fmtNode, fileNode, path string) error {
+	_, err := c.execute(ctx, types.QMPCommandBlockdevAdd, map[string]any{
+		"driver":    "qcow2",
+		"node-name": fmtNode,
+		"file": map[string]any{
+			"driver": "file", "filename": path, "node-name": fileNode,
+		},
+		"backing": nil,
+	})
+	return err
+}
+
+// removeNode releases an unused node's monitor reference. Implicitly created
+// children are released with it.
+func (c *qmpClient) removeNode(ctx context.Context, nodeName string) error {
+	_, err := c.execute(ctx, types.QMPCommandBlockdevDel, map[string]any{"node-name": nodeName})
+	return err
+}
+
+// releaseUnusedNodes closes compacted layers retained by the QMP monitor.
+func (c *qmpClient) releaseUnusedNodes(ctx context.Context, head string) error {
+	// Overlay children disappear with their parent. Re-query afterwards to
+	// release the initial file node, which has a separate monitor reference.
+	for _, prefix := range []string{qsdFmtNodePrefix, qsdFileNodePrefix + qsdFmtNodePrefix} {
+		nodes, err := c.namedBlockNodes(ctx)
+		if err != nil {
+			return err
+		}
+		active, ok := nodes[head]
+		if !ok {
+			return fmt.Errorf("node %s not found in block graph", head)
+		}
+		live := active.Image.filenames()
+		var retired []string
+		for name, node := range nodes {
+			if strings.HasPrefix(name, prefix) && !live[node.Image.Filename] {
+				retired = append(retired, name)
+			}
+		}
+		// Parents must go before any retired backing nodes they reference.
+		sort.Slice(retired, func(i, j int) bool {
+			return nodes[retired[i]].BackingFileDepth > nodes[retired[j]].BackingFileDepth
+		})
+		for _, name := range retired {
+			if err := c.removeNode(ctx, name); err != nil {
+				return fmt.Errorf("release retired node %s: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// pivot re-parents the active qcow2 node under the already-added overlay. On
+// success the old active layer is sealed and all writes land in the overlay.
+func (c *qmpClient) pivot(ctx context.Context, nodeName, overlayNode string) error {
+	_, err := c.execute(ctx, types.QMPCommandTransaction, map[string]any{
+		"actions": []map[string]any{{
+			"type": types.QMPCommandBlockdevSnapshot,
+			"data": map[string]any{"node": nodeName, "overlay": overlayNode},
+		}},
+	})
+	return err
+}
+
+// commitChain runs an intermediate block-commit merging every layer between
+// base and top (inclusive, identified by filename) down into base, and polls
+// the job to its conclusion. The head keeps serving I/O; on completion the
+// daemon drops the merged layers and re-parents the layer above top onto base.
+func (c *qmpClient) commitChain(ctx context.Context, device, topPath, basePath string) error {
+	jobID := fmt.Sprintf("commit-%d", time.Now().UnixNano())
+	if _, err := c.execute(ctx, types.QMPCommandBlockCommit, map[string]any{
+		"job-id":       jobID,
+		"device":       device,
+		"top":          topPath,
+		"base":         basePath,
+		"auto-dismiss": false, // hold the concluded job so its error is readable
+	}); err != nil {
+		return err
+	}
+
+	return c.waitForCommitJob(ctx, jobID)
+}
+
+type qmpJob struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Status   string `json:"status"`
+	Error    string `json:"error"`
+	Progress int64  `json:"current-progress"`
+}
+
+func (c *qmpClient) jobs(ctx context.Context) ([]qmpJob, error) {
+	raw, err := c.execute(ctx, types.QMPCommandQueryJobs, nil)
+	if err != nil {
+		return nil, err
+	}
+	var jobs []qmpJob
+	err = json.Unmarshal(raw, &jobs)
+	return jobs, err
+}
+
+// cancelCommitJobs cancels and dismisses the daemon's commit jobs over a new
+// monitor connection: an expired deadline can leave a reply unread on the old.
+func cancelCommitJobs(socket string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), qmpDialTimeout)
+	defer cancel()
+	client, err := dialQMP(ctx, socket)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	jobs, err := client.jobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.Type == "commit" && job.Status != "concluded" {
+			if _, err := client.execute(ctx, types.QMPCommandJobCancel, map[string]any{"id": job.ID}); err != nil {
+				return err
+			}
+		}
+	}
+	// A cancelled job concludes with an error of its own.
+	_ = client.finishCommitJobs(ctx)
+	return nil
+}
+
+// A cancelled caller does not cancel QEMU's job. Join and dismiss any previous
+// commit before inspecting or mutating the graph; even a concluded job pins it.
+func (c *qmpClient) finishCommitJobs(ctx context.Context) error {
+	jobs, err := c.jobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.Type == "commit" {
+			if err := c.waitForCommitJob(ctx, job.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *qmpClient) waitForCommitJob(ctx context.Context, jobID string) error {
+	var progress int64
+	for {
+		jobs, err := c.jobs(ctx)
+		if err != nil {
+			return err
+		}
+		var job *qmpJob
+		for i := range jobs {
+			if jobs[i].ID == jobID {
+				job = &jobs[i]
+				break
+			}
+		}
+		if job == nil {
+			return fmt.Errorf("commit job %s disappeared before concluding", jobID)
+		}
+		if job.Status == "concluded" {
+			if _, err := c.execute(ctx, types.QMPCommandJobDismiss, map[string]any{"id": jobID}); err != nil {
+				return err
+			}
+			if job.Error != "" {
+				return fmt.Errorf("commit job: %s", job.Error)
+			}
+			return nil
+		}
+		if job.Progress > progress {
+			progress = job.Progress
+			reportProgress(ctx)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(maxPollInterval):
+		}
+	}
+}
+
+// qmpNode is one entry of query-named-block-nodes. BackingFileDepth counts
+// runtime backing links: an overlay added with backing=null reports zero
+// until a pivot wires it, which is what recovery uses to tell a committed
+// pivot from a dangling add.
+type qmpNode struct {
+	BackingFileDepth int      `json:"backing_file_depth"`
+	Driver           string   `json:"drv"`
+	ReadOnly         bool     `json:"ro"`
+	Image            qmpImage `json:"image"`
+}
+
+// qmpImage mirrors the recursive ImageInfo the daemon reports per node.
+type qmpImage struct {
+	Filename     string    `json:"filename"`
+	BackingImage *qmpImage `json:"backing-image"`
+}
+
+func (image qmpImage) filenames() map[string]bool {
+	filenames := make(map[string]bool)
+	for current := &image; current != nil; current = current.BackingImage {
+		filenames[current.Filename] = true
+	}
+	return filenames
+}
+
+// namedBlockNodes returns all named nodes in the daemon's graph, used during
+// recovery to determine whether a pivot committed.
+func (c *qmpClient) namedBlockNodes(ctx context.Context) (map[string]qmpNode, error) {
+	raw, err := c.execute(ctx, types.QMPCommandQueryNamedBlockNodes, nil)
+	if err != nil {
+		return nil, err
+	}
+	var nodes []struct {
+		NodeName string `json:"node-name"`
+		qmpNode
+	}
+	if err := json.Unmarshal(raw, &nodes); err != nil {
+		return nil, err
+	}
+	result := make(map[string]qmpNode, len(nodes))
+	for _, node := range nodes {
+		result[node.NodeName] = node.qmpNode
+	}
+	return result, nil
+}
+
+// backingFilenames returns the image filenames in nodeName's live backing
+// chain, the node's own file included.
+func (c *qmpClient) backingFilenames(ctx context.Context, nodeName string) (map[string]bool, error) {
+	nodes, err := c.namedBlockNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	node, ok := nodes[nodeName]
+	if !ok {
+		return nil, fmt.Errorf("node %s not found in block graph", nodeName)
+	}
+	return node.Image.filenames(), nil
+}
+
+// checkReadOnly fails if the daemon holds the qcow2 image at path writable.
+// Pivots and commits reopen images read-only, which flushes qcow2's cached
+// metadata, but ignore a failed reopen; only a flushed image is consistent on
+// disk.
+func (c *qmpClient) checkReadOnly(ctx context.Context, path string) error {
+	nodes, err := c.namedBlockNodes(ctx)
+	if err != nil {
+		return err
+	}
+	for name, node := range nodes {
+		if node.Driver == "qcow2" && node.Image.Filename == path && !node.ReadOnly {
+			return fmt.Errorf("node %s still holds %s writable", name, path)
+		}
+	}
+	return nil
+}
+
+// writtenBytes reports whether anything was written to a node since the
+// daemon opened it, via wr_highest_offset. wr_bytes cannot be used here: the
+// daemon accounts it on the NBD export's block backend, so graph nodes always
+// report zero. wr_highest_offset is tracked on the node itself, and a freshly
+// created qcow2 overlay starts at zero, which makes this an exact "anything
+// changed since the last snapshot" signal for the head's file node.
+func (c *qmpClient) writtenBytes(ctx context.Context, nodeName string) (int64, error) {
+	raw, err := c.execute(ctx, types.QMPCommandQueryBlockstats, map[string]any{"query-nodes": true})
+	if err != nil {
+		return 0, err
+	}
+	var stats []struct {
+		NodeName string `json:"node-name"`
+		Stats    struct {
+			WrHighestOffset int64 `json:"wr_highest_offset"`
+		} `json:"stats"`
+	}
+	if err := json.Unmarshal(raw, &stats); err != nil {
+		return 0, err
+	}
+	for _, node := range stats {
+		if node.NodeName == nodeName {
+			return node.Stats.WrHighestOffset, nil
+		}
+	}
+	return 0, fmt.Errorf("node %s not found in block stats", nodeName)
+}
+
+func (c *qmpClient) quit(ctx context.Context) error {
+	_, err := c.execute(ctx, types.QMPCommandQuit, nil)
+	return err
+}

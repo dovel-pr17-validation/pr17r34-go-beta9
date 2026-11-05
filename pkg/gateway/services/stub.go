@@ -1,0 +1,1343 @@
+package gatewayservices
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strings"
+
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/beam-cloud/beta9/pkg/abstractions/endpoint"
+	"github.com/beam-cloud/beta9/pkg/abstractions/function"
+	"github.com/beam-cloud/beta9/pkg/abstractions/taskqueue"
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/compute"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/metadata"
+)
+
+// Capacity verdict values reported in GetOrCreateStubResponse.CapacityStatus.
+const (
+	StubCapacityStatusAvailable = "available"
+	StubCapacityStatusLow       = "low"
+	StubCapacityStatusNone      = "none"
+)
+
+func (gws *GatewayService) GetOrCreateStub(ctx context.Context, in *pb.GetOrCreateStubRequest) (*pb.GetOrCreateStubResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+
+	var warning string
+	var capacity stubCapacityVerdict
+
+	if err := repository.AuthorizeImage(ctx, gws.backendRepo, authInfo.Workspace.ExternalId, in.ImageId); err != nil {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+
+	resourcePolicy, err := gws.stubResourcePolicy(ctx, authInfo.Workspace.ExternalId, in.Pool, in.Name)
+	if err != nil {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+
+	// The scheduler decides again at placement; asking here turns "deployed,
+	// but nothing starts" into an immediate error. Same exemptions as there.
+	if !resourcePolicy.privatePoolTargeted && !types.StubType(in.StubType).IsPlatformWorkload() {
+		if err := gws.scheduler.CreditGate().Check(ctx, authInfo.Workspace.ExternalId); err != nil {
+			return &pb.GetOrCreateStubResponse{
+				Ok:     false,
+				ErrMsg: err.Error(),
+			}, nil
+		}
+	}
+
+	gpus := gpuTypesForStubRequest(in)
+
+	if errMsg := validateUseVM(in, gpus); errMsg != "" {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: errMsg,
+		}, nil
+	}
+
+	autoscaler := autoscalerFromProto(in.Autoscaler)
+
+	keepWarmSeconds := normalizeKeepWarmSeconds(in.KeepWarmSeconds, types.StubType(in.StubType))
+
+	// Pod keep-warm semantics:
+	//   -1: keep one container running until the deployment is stopped
+	//    0: scale to zero as soon as there are no active connections
+	//   >0: keep idle containers warm for that many seconds, then scale to zero
+	if in.StubType == types.StubTypePodDeployment {
+		if err := configurePodDeploymentAutoscaler(
+			autoscaler,
+			keepWarmSeconds,
+			resourcePolicy.maxReplicasLimit(gws.appConfig.GatewayService.StubLimits.MaxReplicas),
+		); err != nil {
+			return &pb.GetOrCreateStubResponse{
+				Ok:     false,
+				ErrMsg: err.Error(),
+			}, nil
+		}
+	}
+
+	if in.TaskPolicy == nil {
+		in.TaskPolicy = &pb.TaskPolicy{
+			MaxRetries: in.Retries,
+			Timeout:    in.Timeout,
+		}
+	}
+
+	if in.Extra == "" {
+		in.Extra = "{}"
+	}
+
+	if errMsg := resourcePolicy.validateManagedLimits(gws, in, authInfo.Workspace); errMsg != "" {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: errMsg,
+		}, nil
+	}
+
+	managedEndpoint, err := gws.managedEndpointStubConfig(ctx, authInfo, in)
+	if err != nil {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+	if managedGpus := managedGpuTypes(managedEndpoint); len(managedGpus) > 0 {
+		// The stub runtime carries the GPU types the app supports; the endpoint
+		// controller sets the exact type/count on each replica from config.yaml.
+		gpus = managedGpus
+	}
+
+	// If checkpoint/restore is enabled, we need to handle a few additional things to ensure dump/restore will work properly
+	if in.CheckpointEnabled {
+		checkpointWarning, err := gws.handleCheckpointEnabled(ctx, authInfo, in, gpus)
+		if err != nil {
+			return &pb.GetOrCreateStubResponse{
+				Ok:     false,
+				ErrMsg: err.Error(),
+			}, nil
+		}
+		warning = appendWarning(warning, checkpointWarning)
+	}
+
+	var inputs *types.Schema = nil
+	if in.Inputs != nil {
+		inputs = types.NewSchemaFromProto(in.Inputs)
+	}
+
+	var outputs *types.Schema = nil
+	if in.Outputs != nil {
+		outputs = types.NewSchemaFromProto(in.Outputs)
+	}
+
+	servingConfig := servingConfigFromProto(in.Serving)
+
+	// Secret/db references become bindings; URLs and integers are inlined.
+	expandedEnv, referenceBindings, err := gws.expandStubReferences(ctx, authInfo, in)
+	if err != nil {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+	in.Env = expandedEnv
+
+	stubConfig := types.StubConfigV1{
+		Runtime: types.Runtime{
+			Cpu:      in.Cpu,
+			Gpus:     gpus,
+			GpuCount: in.GpuCount,
+			Memory:   in.Memory,
+			ImageId:  in.ImageId,
+		},
+		Handler:            in.Handler,
+		OnStart:            in.OnStart,
+		OnDeploy:           in.OnDeploy,
+		OnDeployStubId:     in.OnDeployStubId,
+		CallbackUrl:        in.CallbackUrl,
+		PythonVersion:      in.PythonVersion,
+		TaskPolicy:         gws.configureTaskPolicy(in.TaskPolicy, types.StubType(in.StubType)),
+		KeepWarmSeconds:    keepWarmSeconds,
+		Workers:            uint(in.Workers),
+		ConcurrentRequests: uint(in.ConcurrentRequests),
+		MaxPendingTasks:    uint(in.MaxPendingTasks),
+		Volumes:            in.Volumes,
+		Secrets:            []types.Secret{},
+		Authorized:         in.Authorized,
+		Autoscaler:         autoscaler,
+		Extra:              json.RawMessage(in.Extra),
+		CheckpointEnabled:  in.CheckpointEnabled,
+		CheckpointTrigger:  types.NewCheckpointTriggerFromProto(in.CheckpointTrigger),
+		EntryPoint:         in.Entrypoint,
+		Ports:              in.Ports,
+		Env:                in.Env,
+		Inputs:             inputs,
+		Outputs:            outputs,
+		TCP:                in.Tcp,
+		BlockNetwork:       in.BlockNetwork,
+		AllowList:          in.AllowList,
+		DockerEnabled:      in.DockerEnabled,
+		UseVM:              in.UseVm,
+		Hostname:           in.Hostname,
+		IsService:          in.IsService,
+		Serving:            servingConfig,
+		Pool:               resourcePolicy.pool,
+		Disks:              in.Disks,
+		ManagedEndpoint:    managedEndpoint,
+	}
+	stubConfig.PreparationCacheKey = preparedStubCacheKey(ctx)
+
+	// A persistent root is shorthand for a qcow machine-root disk: the
+	// container's overlay upper layer lives on the volume, so disk snapshots
+	// capture the whole machine filesystem.
+	if in.PersistentRoot != nil {
+		rootName := in.PersistentRoot.Name
+		if rootName == "" {
+			rootName = types.DurableDiskDefaultRootName
+		}
+		stubConfig.Disks = append(stubConfig.Disks, &pb.DurableDisk{
+			Name:             rootName,
+			Size:             in.PersistentRoot.Size,
+			MountPath:        types.DurableDiskRootMountPath,
+			Driver:           types.DurableDiskDriverQcow,
+			SourceSnapshotId: in.PersistentRoot.SourceSnapshotId,
+		})
+	}
+
+	// Ensure GPU count is at least 1 if a GPU is required
+	if stubConfig.RequiresGPU() && in.GpuCount == 0 {
+		stubConfig.Runtime.GpuCount = 1
+	}
+
+	if stubConfig.RequiresGPU() {
+		if gws.computeService != nil {
+			if err := gws.computeService.ValidatePrivatePoolGPURequest(ctx, authInfo.Workspace.ExternalId, poolConfigName(resourcePolicy.pool), gpus); err != nil {
+				return &pb.GetOrCreateStubResponse{
+					Ok:     false,
+					ErrMsg: err.Error(),
+				}, nil
+			}
+		}
+
+		if resourcePolicy.checkManagedGPUCapacity() {
+			concurrencyLimit, err := gws.backendRepo.GetConcurrencyLimitByWorkspaceId(ctx, authInfo.Workspace.ExternalId)
+			if err != nil && concurrencyLimit != nil && concurrencyLimit.GPULimit <= 0 {
+				return &pb.GetOrCreateStubResponse{
+					Ok:     false,
+					ErrMsg: "GPU concurrency limit is 0.",
+				}, nil
+			}
+
+			if types.StubType(in.GetStubType()).IsServe() {
+				hasCapacity, err := gws.anyGpuAvailable(gpus)
+				if err != nil {
+					return &pb.GetOrCreateStubResponse{
+						Ok:     false,
+						ErrMsg: "Failed to check GPU availability.",
+					}, nil
+				}
+
+				if !hasCapacity {
+					errMsg := fmt.Sprintf("There is currently no GPU capacity for %s.", gpuList(gpus))
+					if gws.computeService != nil {
+						msg, err := gws.computeService.MissingPrivatePoolGPUWarning(ctx, authInfo.Workspace.ExternalId, gpus)
+						if err != nil {
+							return &pb.GetOrCreateStubResponse{
+								Ok:     false,
+								ErrMsg: "Failed to check private pool GPU availability.",
+							}, nil
+						}
+						if msg != "" {
+							errMsg = msg
+						}
+					}
+					return &pb.GetOrCreateStubResponse{
+						Ok:     false,
+						ErrMsg: errMsg,
+					}, nil
+				}
+			}
+
+			lowCapacityGpus, err := gws.getLowCapacityGpus(gpus)
+			if err != nil {
+				return &pb.GetOrCreateStubResponse{
+					Ok:     false,
+					ErrMsg: "Failed to check GPU availability.",
+				}, nil
+			}
+
+			// Only stubs with no pool config get a capacity verdict: targeting
+			// a pool is an explicit placement choice the scheduler will honor.
+			if resourcePolicy.pool == nil {
+				verdict, err := gws.computeCapacityVerdict(ctx, authInfo.Workspace.ExternalId, gpus, len(lowCapacityGpus) > 0)
+				if err != nil {
+					// The verdict is advisory; never fail stub creation over it.
+					log.Warn().Err(err).Str("workspace_id", authInfo.Workspace.ExternalId).Msg("failed to compute stub capacity verdict")
+				} else {
+					capacity = verdict
+				}
+			}
+
+			// A stub running on private/on-demand capacity — whether targeted
+			// explicitly or matched via the capacity verdict — doesn't depend
+			// on managed GPU availability, so warning about it is just noise.
+			onPrivateCapacity := resourcePolicy.privatePoolTargeted || capacity.matchedPrivatePool != ""
+			if len(lowCapacityGpus) > 0 && !onPrivateCapacity {
+				warning = appendWarning(warning, fmt.Sprintf("GPU capacity for %s is currently low.", strings.Join(lowCapacityGpus, ", ")))
+			}
+		}
+	}
+
+	// Requested secrets plus bindings from env references.
+	requestedSecrets := make([]secretBinding, 0, len(in.Secrets)+len(referenceBindings))
+	for _, requestedSecret := range in.Secrets {
+		requestedSecrets = append(requestedSecrets, secretBinding{Name: requestedSecret.Name})
+	}
+	requestedSecrets = append(requestedSecrets, referenceBindings...)
+	stubConfig.Secrets, err = gws.resolveSecretBindings(ctx, authInfo.Workspace, uniqueByEnvName(requestedSecrets))
+	if err == nil && types.StubType(in.StubType).IsSandbox() {
+		err = common.ValidateSandboxSecrets(stubConfig.Secrets, stubConfig.AllowList)
+	}
+	if err != nil {
+		return &pb.GetOrCreateStubResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+
+	err = gws.configureVolumes(ctx, in.Volumes, authInfo.Workspace)
+	if err != nil {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+
+	if err := gws.configureDurableDiskPlacement(ctx, authInfo.Workspace, &stubConfig); err != nil {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+
+	app, object, err := gws.prepareStubIdentity(ctx, authInfo.Workspace, in, stubConfig.Disks)
+	if err != nil {
+		return &pb.GetOrCreateStubResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+
+	stub, err := gws.backendRepo.GetOrCreateStub(ctx, in.Name, in.StubType, stubConfig, object.Id, authInfo.Workspace.Id, in.ForceCreate, app.Id)
+	if err != nil {
+		return &pb.GetOrCreateStubResponse{
+			Ok:     false,
+			ErrMsg: "Failed to get or create stub",
+		}, nil
+	}
+
+	if resourcePolicy.pool != nil && resourcePolicy.pool.RequiresReservation() {
+		res, err := gws.LaunchPoolCapacity(ctx, &pb.LaunchPoolCapacityRequest{
+			Pool: poolConfigToProto(resourcePolicy.pool),
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !res.Ok {
+			return &pb.GetOrCreateStubResponse{
+				Ok:     false,
+				ErrMsg: res.ErrMsg,
+			}, nil
+		}
+	}
+
+	gws.cachePreparedStub(ctx, authInfo.Workspace.ExternalId, stub.ExternalId)
+
+	return &pb.GetOrCreateStubResponse{
+		Ok:                 err == nil,
+		StubId:             stub.ExternalId,
+		WarnMsg:            warning,
+		CapacityStatus:     capacity.status,
+		UnsupportedGpus:    capacity.unsupportedGpus,
+		MatchedPrivatePool: capacity.matchedPrivatePool,
+	}, nil
+}
+
+// prepareStubIdentity overlaps independent records after resource validation.
+// The immutable stub is written only once every prerequisite succeeds.
+func (gws *GatewayService) prepareStubIdentity(ctx context.Context, workspace *types.Workspace, in *pb.GetOrCreateStubRequest, disks []*pb.DurableDisk) (*types.App, types.Object, error) {
+	group, prepareCtx := errgroup.WithContext(ctx)
+	var app *types.App
+	var object types.Object
+	group.Go(func() error {
+		for _, disk := range disks {
+			if disk == nil || disk.Name == "" {
+				continue
+			}
+			if _, err := gws.backendRepo.GetOrCreateDisk(prepareCtx, workspace.Id, &types.Disk{
+				Name: types.SafeDurableDiskName(disk.Name), Size: disk.Size,
+				Filesystem: disk.Filesystem, Driver: disk.Driver, MountPath: disk.MountPath,
+			}); err != nil {
+				log.Error().Err(err).Str("disk_name", disk.Name).Msg("failed to register durable disk record")
+				return fmt.Errorf("register disk %s: %s", disk.Name, err)
+			}
+		}
+		return nil
+	})
+	group.Go(func() error {
+		name := in.AppName
+		if name == "" {
+			name = in.Name
+		}
+		var err error
+		app, err = gws.backendRepo.GetOrCreateApp(prepareCtx, workspace.Id, name)
+		if err != nil {
+			return errors.New("Failed to get or create app")
+		}
+		return nil
+	})
+	group.Go(func() error {
+		var err error
+		if strings.TrimSpace(in.ObjectId) == "" {
+			if types.StubType(in.StubType).IsSandbox() {
+				object, err = abstractions.GetOrCreateEmptyStubObject(prepareCtx, gws.backendRepo, workspace)
+			} else {
+				object, err = gws.ensureEmptyStubObject(prepareCtx, workspace)
+			}
+		} else {
+			object, err = gws.backendRepo.GetObjectByExternalId(prepareCtx, in.ObjectId, workspace.Id)
+		}
+		if err != nil {
+			log.Error().Err(err).Str("workspace_id", workspace.ExternalId).Msg("failed to prepare canonical stub object")
+			return errors.New("Failed to prepare stub object")
+		}
+		return nil
+	})
+	if err := group.Wait(); err != nil {
+		return nil, types.Object{}, err
+	}
+	return app, object, nil
+}
+
+func (gws *GatewayService) cachePreparedStub(ctx context.Context, workspaceID, stubID string) {
+	if gws.redisClient == nil {
+		return
+	}
+	cacheKey := preparedStubCacheKey(ctx)
+	if cacheKey == "" {
+		return
+	}
+	_ = gws.redisClient.SetEx(
+		ctx,
+		common.RedisKeys.GatewayPreparedStub(workspaceID, cacheKey),
+		stubID,
+		common.PreparedStubCacheTTL,
+	).Err()
+}
+
+func preparedStubCacheKey(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	cacheKeys := md.Get(common.PreparedStubCacheMetadata)
+	if len(cacheKeys) == 0 {
+		return ""
+	}
+	return cacheKeys[0]
+}
+
+type stubCapacityVerdict struct {
+	status             string
+	unsupportedGpus    []string
+	matchedPrivatePool string
+}
+
+// gpuPoolChecker answers whether any serverless pool config supports a GPU
+// type. Implemented by *scheduler.Scheduler.
+type gpuPoolChecker interface {
+	HasManagedPoolForGPU(gpuType string) bool
+}
+
+// privatePoolFinder locates ready workspace private pools for a GPU request.
+// Implemented by *compute.Service.
+type privatePoolFinder interface {
+	FindReadyPrivatePoolForGPU(ctx context.Context, workspaceID string, gpus []types.GpuType) (string, error)
+}
+
+func (gws *GatewayService) computeCapacityVerdict(ctx context.Context, workspaceID string, gpus []types.GpuType, lowCapacity bool) (stubCapacityVerdict, error) {
+	if gws.scheduler == nil {
+		return stubCapacityVerdict{}, nil
+	}
+	var finder privatePoolFinder
+	if gws.computeService != nil {
+		finder = gws.computeService
+	}
+	return computeCapacityVerdict(ctx, gws.scheduler, finder, workspaceID, gpus, lowCapacity)
+}
+
+// computeCapacityVerdict determines whether a GPU request can ever be
+// scheduled on serverless pools. It is pool-config-based (mirroring the
+// scheduler's controller selection), so pools scaled to zero still count as
+// available. When no serverless pool supports any requested GPU — a
+// guaranteed scheduling blackhole — it checks the workspace's private pools
+// for ready capacity the client can target instead.
+func computeCapacityVerdict(ctx context.Context, checker gpuPoolChecker, finder privatePoolFinder, workspaceID string, gpus []types.GpuType, lowCapacity bool) (stubCapacityVerdict, error) {
+	verdict := stubCapacityVerdict{}
+	anySupported := false
+	for _, gpu := range gpus {
+		if gpu == types.NO_GPU {
+			continue
+		}
+		if checker.HasManagedPoolForGPU(gpu.String()) {
+			anySupported = true
+			continue
+		}
+		verdict.unsupportedGpus = append(verdict.unsupportedGpus, gpu.String())
+	}
+
+	if anySupported {
+		verdict.status = StubCapacityStatusAvailable
+		if lowCapacity {
+			verdict.status = StubCapacityStatusLow
+		}
+		return verdict, nil
+	}
+
+	if finder != nil {
+		matched, err := finder.FindReadyPrivatePoolForGPU(ctx, workspaceID, gpus)
+		if err != nil {
+			return stubCapacityVerdict{}, err
+		}
+		if matched != "" {
+			verdict.status = StubCapacityStatusAvailable
+			verdict.matchedPrivatePool = matched
+			return verdict, nil
+		}
+	}
+
+	verdict.status = StubCapacityStatusNone
+	return verdict, nil
+}
+
+func gpuTypesForStubRequest(in *pb.GetOrCreateStubRequest) []types.GpuType {
+	gpus := types.GPUTypesFromString(in.Gpu)
+	if in.GpuCount > 0 && len(gpus) == 0 {
+		return []types.GpuType{types.GPU_ANY}
+	}
+	return gpus
+}
+
+// validateUseVM rejects combinations the microvm runtime cannot serve at stub
+// creation, where the error is readable, rather than as a scheduler
+// "no suitable worker" later. Returns an empty string when the request is fine.
+func validateUseVM(in *pb.GetOrCreateStubRequest, gpus []types.GpuType) string {
+	if !in.UseVm {
+		if types.StubType(in.StubType).Kind() == types.StubTypeVM {
+			return "VMs require use_vm"
+		}
+		return ""
+	}
+	if !types.StubType(in.StubType).IsSandbox() {
+		return "use_vm is only supported for sandboxes and VMs"
+	}
+	if len(gpus) > 1 || in.GpuCount > 1 {
+		return "use_vm sandboxes and VMs support one GPU"
+	}
+	return ""
+}
+
+func normalizeKeepWarmSeconds(raw float32, stubType types.StubType) int {
+	seconds := int(raw)
+	if seconds > 0 && seconds < 10 {
+		return 10
+	}
+
+	if seconds < 0 && !stubTypeSupportsInfiniteKeepWarm(stubType) {
+		return 0
+	}
+
+	return seconds
+}
+
+func stubTypeSupportsInfiniteKeepWarm(stubType types.StubType) bool {
+	switch string(stubType) {
+	case types.StubTypePodDeployment, types.StubTypePodRun, types.StubTypeSandbox, types.StubTypeVM:
+		return true
+	default:
+		return false
+	}
+}
+
+func autoscalerFromProto(in *pb.Autoscaler) *types.Autoscaler {
+	if in == nil || in.Type == "" {
+		return &types.Autoscaler{
+			Type:              types.QueueDepthAutoscaler,
+			MaxContainers:     1,
+			TasksPerContainer: 1,
+		}
+	}
+
+	return &types.Autoscaler{
+		Type:              types.AutoscalerType(in.Type),
+		MaxContainers:     uint(in.MaxContainers),
+		TasksPerContainer: uint(in.TasksPerContainer),
+		MinContainers:     uint(in.MinContainers),
+	}
+}
+
+func configurePodDeploymentAutoscaler(autoscaler *types.Autoscaler, keepWarmSeconds int, maxReplicas uint64) error {
+	if autoscaler.MaxContainers == 0 {
+		autoscaler.MaxContainers = 1
+	}
+
+	// Only an explicit always-on request should introduce a billed replica floor.
+	if keepWarmSeconds < 0 && autoscaler.MinContainers == 0 {
+		autoscaler.MinContainers = 1
+	}
+
+	if autoscaler.MinContainers > autoscaler.MaxContainers {
+		return fmt.Errorf("min replicas must be less than or equal to max replicas")
+	}
+
+	if maxReplicas > 0 && uint64(autoscaler.MaxContainers) > maxReplicas {
+		return fmt.Errorf("max replicas must be %d or less", maxReplicas)
+	}
+
+	return nil
+}
+
+func poolConfigFromProto(in *pb.PoolConfig) *types.PoolConfig {
+	if in == nil {
+		return nil
+	}
+	return &types.PoolConfig{
+		Name:           in.Name,
+		GPUs:           types.NormalizeGPUStrings(in.Gpu),
+		Nodes:          in.Nodes,
+		OfferID:        in.OfferId,
+		TTL:            in.Ttl,
+		MaxSpend:       in.MaxSpend,
+		Providers:      in.Providers,
+		Regions:        in.Regions,
+		MinReliability: in.MinReliability,
+		Selector:       in.Selector,
+		Fallback:       in.Fallback,
+	}
+}
+
+func databaseConfigFromProto(in *pb.DatabaseServingConfig) *types.DatabaseServingConfig {
+	if in == nil {
+		return nil
+	}
+
+	return &types.DatabaseServingConfig{
+		Kind:                    in.Kind,
+		Port:                    in.Port,
+		ReadinessProbe:          in.ReadinessProbe,
+		ConnectionEnvName:       in.ConnectionEnvName,
+		CredentialSecretNames:   append([]string(nil), in.CredentialSecretNames...),
+		DurabilityMode:          in.DurabilityMode,
+		CommitLagMs:             in.CommitLagMs,
+		UsernameSecretName:      in.UsernameSecretName,
+		PasswordSecretName:      in.PasswordSecretName,
+		DatabaseSecretName:      in.DatabaseSecretName,
+		ConnectionURLSecretName: in.ConnectionUrlSecretName,
+	}
+}
+
+func servingConfigFromProto(in *pb.ServingConfig) *types.ServingConfig {
+	if in == nil {
+		return nil
+	}
+
+	return compactServingConfig(&types.ServingConfig{
+		AppKind:         in.AppKind,
+		ServingProtocol: in.ServingProtocol,
+		Database:        databaseConfigFromProto(in.Database),
+	})
+}
+
+func compactServingConfig(in *types.ServingConfig) *types.ServingConfig {
+	if in == nil {
+		return nil
+	}
+	if strings.TrimSpace(in.AppKind) == "" && strings.TrimSpace(in.ServingProtocol) == "" && in.Database == nil {
+		return nil
+	}
+	return in
+}
+
+func poolConfigToProto(in *types.PoolConfig) *pb.PoolConfig {
+	if in == nil {
+		return nil
+	}
+	return &pb.PoolConfig{
+		Name:           in.Name,
+		Gpu:            in.GPUs,
+		Nodes:          in.Nodes,
+		OfferId:        in.OfferID,
+		Ttl:            in.TTL,
+		MaxSpend:       in.MaxSpend,
+		Providers:      in.Providers,
+		Regions:        in.Regions,
+		MinReliability: in.MinReliability,
+		Selector:       in.Selector,
+		Fallback:       in.Fallback,
+	}
+}
+
+func poolConfigName(pool *types.PoolConfig) string {
+	if pool == nil {
+		return ""
+	}
+	return pool.Name
+}
+
+type stubResourcePolicy struct {
+	pool                *types.PoolConfig
+	privatePoolTargeted bool
+	fallback            string
+}
+
+func (gws *GatewayService) stubResourcePolicy(ctx context.Context, workspaceID string, protoPool *pb.PoolConfig, stubName string) (stubResourcePolicy, error) {
+	policy := stubResourcePolicy{pool: poolConfigFromProto(protoPool)}
+	if policy.pool == nil {
+		return policy, nil
+	}
+	configurePoolSelector(policy.pool, workspaceID, stubName)
+
+	policy.privatePoolTargeted = policy.pool.RequiresReservation()
+	policy.fallback = privatePoolFallback(policy.pool)
+
+	if !policy.privatePoolTargeted {
+		targeted, fallback, err := gws.lookupPrivatePoolPolicy(ctx, workspaceID, policy.pool)
+		if err != nil {
+			return policy, err
+		}
+		policy.privatePoolTargeted = targeted
+		if policy.pool.Fallback == "" && fallback != "" {
+			policy.fallback = fallback
+		}
+	}
+
+	policy.pool.Fallback = policy.fallback
+	return policy, nil
+}
+
+func (p stubResourcePolicy) checkManagedGPUCapacity() bool {
+	return !p.privatePoolTargeted
+}
+
+func (p stubResourcePolicy) maxReplicasLimit(defaultLimit uint64) uint64 {
+	if p.privatePoolTargeted {
+		return 0
+	}
+	return defaultLimit
+}
+
+func (p stubResourcePolicy) validateManagedLimits(gws *GatewayService, in *pb.GetOrCreateStubRequest, workspace *types.Workspace) string {
+	if p.privatePoolTargeted {
+		return ""
+	}
+	return gws.managedStubLimitError(in, workspace)
+}
+
+func privatePoolFallback(pool *types.PoolConfig) string {
+	if pool == nil || pool.Fallback == "" {
+		return types.PrivatePoolFallbackInternal
+	}
+	return pool.Fallback
+}
+
+func (gws *GatewayService) lookupPrivatePoolPolicy(ctx context.Context, workspaceID string, pool *types.PoolConfig) (bool, string, error) {
+	if pool == nil || gws == nil || gws.computeRepo == nil || workspaceID == "" {
+		return false, "", nil
+	}
+	for _, name := range []string{pool.Name, pool.Selector} {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		state, err := gws.computeRepo.GetPoolState(ctx, workspaceID, name)
+		if err != nil {
+			return false, "", err
+		}
+		if privatePoolStateMatches(state, name) {
+			return true, privatePoolStateFallback(state), nil
+		}
+	}
+
+	states, err := gws.computeRepo.ListPoolStates(ctx, workspaceID, 0)
+	if err != nil {
+		return false, "", err
+	}
+	for _, state := range states {
+		if privatePoolStateMatchesAny(state, pool.Name, pool.Selector) {
+			return true, privatePoolStateFallback(state), nil
+		}
+	}
+
+	return false, "", nil
+}
+
+func privatePoolStateMatchesAny(state *compute.PoolState, names ...string) bool {
+	for _, name := range names {
+		if privatePoolStateMatches(state, strings.TrimSpace(name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func privatePoolStateMatches(state *compute.PoolState, name string) bool {
+	if state == nil || name == "" || (state.Mode != "" && state.Mode != string(types.PoolModePrivate)) {
+		return false
+	}
+	if state.Name == name || state.Selector == name {
+		return true
+	}
+	return state.Config != nil && (state.Config.Name == name || state.Config.Selector == name)
+}
+
+func privatePoolStateFallback(state *compute.PoolState) string {
+	if state != nil && state.Config != nil && state.Config.Fallback != "" {
+		return state.Config.Fallback
+	}
+	if state != nil {
+		return state.Fallback
+	}
+	return ""
+}
+
+func (gws *GatewayService) managedStubLimitError(in *pb.GetOrCreateStubRequest, workspace *types.Workspace) string {
+	valid, errorMsg := types.ValidateCpuAndMemory(in.Cpu, in.Memory, gws.appConfig.GatewayService.StubLimits)
+	if !valid {
+		return errorMsg
+	}
+	if in.GpuCount > gws.appConfig.GatewayService.StubLimits.MaxGpuCount {
+		return fmt.Sprintf("GPU count must be %d or less.", gws.appConfig.GatewayService.StubLimits.MaxGpuCount)
+	}
+	if in.GpuCount > 1 && (workspace == nil || !workspace.MultiGpuEnabled) {
+		return "Multi-GPU containers are not enabled for this workspace."
+	}
+	if len(gws.appConfig.GatewayService.StubLimits.GPUBlackList.GPUTypes) > 0 {
+		if slices.Contains(gws.appConfig.GatewayService.StubLimits.GPUBlackList.GPUTypes, in.Gpu) {
+			return gws.appConfig.GatewayService.StubLimits.GPUBlackList.Message
+		}
+	}
+	return ""
+}
+
+func gpuList(gpus []types.GpuType) string {
+	values := types.GpuTypesToStrings(gpus)
+	if len(values) == 0 {
+		return "GPU"
+	}
+	return strings.Join(values, ", ")
+}
+
+func configurePoolSelector(pool *types.PoolConfig, workspaceID, stubName string) {
+	requiresReservation := pool.RequiresReservation()
+	if pool.Selector != "" {
+		if pool.Name == "" && requiresReservation {
+			pool.Name = pool.Selector
+		}
+		return
+	}
+	if pool.Name != "" {
+		pool.Selector = pool.Name
+		return
+	}
+	pool.Selector = sanitizePoolSelector(fmt.Sprintf("private-%s-%s", workspaceID, stubName))
+	if pool.Name == "" && requiresReservation {
+		pool.Name = pool.Selector
+	}
+}
+
+func sanitizePoolSelector(value string) string {
+	value = strings.ToLower(value)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-'
+		if ok {
+			b.WriteRune(r)
+			lastDash = r == '-'
+			continue
+		}
+		if !lastDash {
+			b.WriteRune('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-._")
+	if out == "" {
+		return "private-pool"
+	}
+	if len(out) > 128 {
+		return out[:128]
+	}
+	return out
+}
+
+// checkpointTriggerTypeHTTP mirrors the trigger type the worker uses to decide between
+// HTTP readiness polling and the runner signal file (see pkg/worker/criu.go)
+const checkpointTriggerTypeHTTP = "http"
+
+const checkpointCompileCacheRoot = "/tmp/beam-checkpoint-compile-cache"
+
+func appendWarning(existing, warning string) string {
+	if existing == "" {
+		return warning
+	}
+	if warning == "" {
+		return existing
+	}
+	return existing + " " + warning
+}
+
+func checkpointModelCacheVolumeName(in *pb.GetOrCreateStubRequest) string {
+	name := in.Name
+	if in.AppName != "" {
+		name = in.AppName
+	}
+	return types.CheckpointModelCacheVolumeName(name)
+}
+
+func checkpointCacheEnv(modelCachePath string) []string {
+	// Persist model files across checkpoint boots, but keep compiler/JIT artifacts and
+	// Xet's transfer cache on local disk so they do not inflate the workspace volume.
+	return []string{
+		fmt.Sprintf("HF_HOME=%s", modelCachePath),
+		fmt.Sprintf("HF_HUB_CACHE=%s/hub", modelCachePath),
+		fmt.Sprintf("HF_XET_CACHE=%s/hf-xet", checkpointCompileCacheRoot),
+		fmt.Sprintf("TRANSFORMERS_CACHE=%s", modelCachePath),
+		fmt.Sprintf("TRITON_CACHE_DIR=%s/triton", checkpointCompileCacheRoot),
+		fmt.Sprintf("TORCHINDUCTOR_CACHE_DIR=%s/torchinductor", checkpointCompileCacheRoot),
+		fmt.Sprintf("VLLM_CACHE_ROOT=%s/vllm", checkpointCompileCacheRoot),
+		fmt.Sprintf("CUDA_CACHE_PATH=%s/cuda", checkpointCompileCacheRoot),
+	}
+}
+
+func upsertCheckpointEnv(env []string, updates []string) []string {
+	for _, update := range updates {
+		name, _, ok := strings.Cut(update, "=")
+		if !ok {
+			continue
+		}
+		replaced := false
+		for i, existing := range env {
+			existingName, _, ok := strings.Cut(existing, "=")
+			if ok && existingName == name {
+				env[i] = update
+				replaced = true
+			}
+		}
+		if !replaced {
+			env = append(env, update)
+		}
+	}
+	return env
+}
+
+// handleCheckpointEnabled validates and configures a stub request that has checkpointing
+// enabled. It returns a user-facing warning message (empty if none) and an error.
+func (gws *GatewayService) handleCheckpointEnabled(ctx context.Context, authInfo *auth.AuthInfo, in *pb.GetOrCreateStubRequest, gpus []types.GpuType) (string, error) {
+	workspace := authInfo.Workspace
+
+	if in.GpuCount > 1 {
+		return "", fmt.Errorf("Checkpoints are yet not supported for multi-GPU")
+	}
+
+	if len(gpus) > 1 {
+		return "", fmt.Errorf("Checkpoints are yet not supported between multiple GPUs")
+	}
+
+	// Disable checkpoint for serves, but let the user know instead of failing silently
+	if types.StubType(in.StubType).IsServe() {
+		in.CheckpointEnabled = false
+		return "checkpointing is not supported for serve sessions; it has been disabled", nil
+	}
+
+	// Pods have no beta9 runner process to write the checkpoint readiness signal file,
+	// so automatic checkpoints require an HTTP readiness path. Sandboxes are exempt
+	// because they checkpoint via the manual snapshot APIs instead.
+	if types.StubType(in.StubType).Kind() == types.StubTypePod {
+		trigger := in.CheckpointTrigger
+		if trigger == nil || !strings.EqualFold(trigger.Type, checkpointTriggerTypeHTTP) || trigger.HttpPath == "" {
+			return "", fmt.Errorf("pods with checkpoint_enabled require checkpoint_readiness_path to be set (there is no runner to signal readiness)")
+		}
+	}
+
+	if !workspace.StorageAvailable() {
+		return "", fmt.Errorf("workspace storage is required for checkpoints")
+	}
+
+	volumeName := checkpointModelCacheVolumeName(in)
+	modelCachePath := fmt.Sprintf("/%s", volumeName)
+	volume, err := gws.backendRepo.GetOrCreateVolume(ctx, authInfo.Workspace.Id, volumeName)
+	if err != nil {
+		return "", err
+	}
+
+	in.Env = upsertCheckpointEnv(in.Env, checkpointCacheEnv(modelCachePath))
+
+	in.Volumes = append(in.Volumes, &pb.Volume{
+		Id:        volume.ExternalId,
+		MountPath: modelCachePath,
+	})
+
+	return "", nil
+}
+
+func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequest) (*pb.DeployStubResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+
+	stub, err := gws.backendRepo.GetStubByExternalId(ctx, in.StubId)
+	if err != nil || stub.Workspace.ExternalId != authInfo.Workspace.ExternalId {
+		return &pb.DeployStubResponse{
+			Ok: false,
+		}, nil
+	}
+
+	latestDeployment, err := gws.backendRepo.GetLatestDeploymentByName(ctx, authInfo.Workspace.Id, in.Name, string(stub.Type), false)
+	if err != nil {
+		return &pb.DeployStubResponse{
+			Ok: false,
+		}, nil
+	}
+
+	version := uint(1)
+	if latestDeployment != nil {
+		version = latestDeployment.Version + 1
+	}
+
+	activeDeployments, err := gws.activeDeploymentsForRollout(ctx, authInfo.Workspace.Id, in.Name, string(stub.Type))
+	if err != nil {
+		return &pb.DeployStubResponse{
+			Ok:     false,
+			ErrMsg: "Unable to check active deployments before rollout",
+		}, nil
+	}
+	rolloutLatestDeployment := latestDeployment
+	if rolloutLatestDeployment == nil || !rolloutLatestDeployment.Active {
+		rolloutLatestDeployment = latestActiveDeployment(activeDeployments)
+	}
+
+	var config types.StubConfigV1
+	if err := json.Unmarshal([]byte(stub.Config), &config); err != nil {
+		return &pb.DeployStubResponse{
+			Ok:     false,
+			ErrMsg: "Unable to parse stub configuration",
+		}, nil
+	}
+
+	if stub.Type.IsManagedEndpoint() {
+		current, err := gws.managedDeployment(ctx, stub, &config)
+		if err != nil {
+			return &pb.DeployStubResponse{Ok: false, ErrMsg: fmt.Sprintf("Failed to register managed endpoint: %v", err)}, nil
+		}
+		if current != nil {
+			return &pb.DeployStubResponse{Ok: true, Version: uint32(current.Version), RolloutAction: "unchanged"}, nil
+		}
+	}
+
+	rolloutPlan, err := gws.planDeploymentRollout(deploymentRolloutInput{
+		workspace: authInfo.Workspace,
+		stub:      stub,
+		config:    &config,
+		latest:    rolloutLatestDeployment,
+		mode:      normalizeRolloutMode(in.Rollout),
+	})
+	if err != nil {
+		return &pb.DeployStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+	if rolloutPlan.stopLatest {
+		deploymentsToStop := activeDeployments
+		if len(deploymentsToStop) == 0 && rolloutLatestDeployment != nil {
+			deploymentsToStop = []types.DeploymentWithRelated{*rolloutLatestDeployment}
+		}
+		if err := gws.stopDeployments(deploymentsToStop, ctx); err != nil {
+			return &pb.DeployStubResponse{
+				Ok:     false,
+				ErrMsg: "Unable to stop previous deployment before rollout",
+			}, nil
+		}
+	}
+
+	deployment, err := gws.backendRepo.CreateDeployment(ctx, authInfo.Workspace.Id, in.Name, version, stub.Id, string(stub.Type), stub.AppId)
+	if err != nil {
+		return &pb.DeployStubResponse{
+			Ok: false,
+		}, nil
+	}
+
+	if stub.Type.IsManagedEndpoint() {
+		if err := gws.registerManagedDeployment(ctx, stub, &config, deployment); err != nil {
+			log.Error().Err(err).Str("stub_id", stub.ExternalId).Msg("failed to register managed endpoint deployment")
+			return &pb.DeployStubResponse{
+				Ok:     false,
+				ErrMsg: fmt.Sprintf("Failed to register managed endpoint: %v", err),
+			}, nil
+		}
+	}
+
+	// TODO: Remove this field once `pkg/api/v1/stub.go:GetURL()` is used by frontend and SDK version can be force upgraded
+	invokeUrl := common.BuildDeploymentURL(gws.appConfig.GatewayService.HTTP.GetExternalURL(), common.InvokeUrlTypePath, stub, deployment)
+
+	if gws.eventRepo != nil {
+		go gws.eventRepo.PushDeployStubEvent(authInfo.Workspace.ExternalId, &stub.Stub, authInfo.Actor)
+	}
+
+	if rolloutReplicas(&config) > 0 {
+		gws.reloadInstances(stub.ExternalId, string(stub.Type))
+	}
+
+	return &pb.DeployStubResponse{
+		Ok:            true,
+		DeploymentId:  deployment.ExternalId,
+		Version:       uint32(deployment.Version),
+		InvokeUrl:     invokeUrl,
+		WarnMsg:       rolloutPlan.warning,
+		RolloutAction: rolloutPlan.action,
+	}, nil
+}
+
+func (gws *GatewayService) hasStubAccess(ctx context.Context, authInfo *auth.AuthInfo, stub *types.StubWithRelated, config *types.StubConfigV1) (bool, error) {
+	if !config.Authorized {
+		return true, nil
+	}
+
+	if stub.Workspace.ExternalId != authInfo.Workspace.ExternalId {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (gws *GatewayService) GetURL(ctx context.Context, in *pb.GetURLRequest) (*pb.GetURLResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+	if in.IsShell && !auth.HasInteractivePermission(authInfo) {
+		return &pb.GetURLResponse{
+			Ok:     false,
+			ErrMsg: "Unauthorized access",
+		}, nil
+	}
+
+	stub, err := gws.backendRepo.GetStubByExternalId(ctx, in.StubId)
+	if err != nil || stub == nil {
+		return &pb.GetURLResponse{
+			Ok:     false,
+			ErrMsg: "Invalid stub ID",
+		}, nil
+	}
+
+	stubConfig := &types.StubConfigV1{}
+	if err := json.Unmarshal([]byte(stub.Config), &stubConfig); err != nil {
+		return &pb.GetURLResponse{
+			Ok:     false,
+			ErrMsg: "Unable to get stub config",
+		}, nil
+	}
+
+	hasAccess, err := gws.hasStubAccess(ctx, authInfo, stub, stubConfig)
+	if err != nil || !hasAccess {
+		return &pb.GetURLResponse{
+			Ok:     false,
+			ErrMsg: "Invalid stub ID",
+		}, nil
+	}
+
+	if in.IsShell {
+		// Shell HTTP hijacking is registered on the path router. Host-style
+		// URLs bypass that route and cannot establish a tunnel.
+		in.UrlType = common.InvokeUrlTypePath
+	} else if in.UrlType == "" {
+		in.UrlType = gws.appConfig.GatewayService.InvokeURLType
+	}
+
+	// Get URL for Serves, Shells, or Pods
+	if stub.Type.IsServe() || stub.Type.Kind() == types.StubTypeShell || in.IsShell {
+		if in.IsShell {
+			stub.Type = types.StubType(types.StubTypeShell)
+		}
+
+		invokeUrl := common.BuildStubURL(gws.appConfig.GatewayService.HTTP.GetExternalURL(), in.UrlType, stub)
+		return &pb.GetURLResponse{
+			Ok:  true,
+			Url: invokeUrl,
+		}, nil
+	} else if stub.Type.Kind() == types.StubTypePod || stub.Type.IsSandbox() {
+		stubConfig := &types.StubConfigV1{}
+		if err := json.Unmarshal([]byte(stub.Config), &stubConfig); err != nil {
+			return &pb.GetURLResponse{
+				Ok:     false,
+				ErrMsg: "Unable to get config",
+			}, nil
+		}
+
+		externalUrl := gws.appConfig.GatewayService.HTTP.GetExternalURL()
+		if stubConfig.TCP {
+			externalUrl = gws.appConfig.Abstractions.Pod.TCP.GetExternalURL()
+			in.UrlType = common.InvokeUrlTypeHost
+			if in.DeploymentId != "" {
+				deployment, err := gws.backendRepo.GetDeploymentByExternalId(ctx, authInfo.Workspace.Id, in.DeploymentId)
+				if err != nil {
+					return &pb.GetURLResponse{
+						Ok:     false,
+						ErrMsg: "Unable to get deployment",
+					}, nil
+				}
+				return &pb.GetURLResponse{
+					Ok:  true,
+					Url: common.BuildPodDeploymentURL(externalUrl, in.UrlType, &deployment.Deployment, stubConfig),
+				}, nil
+			}
+		}
+
+		return &pb.GetURLResponse{
+			Ok:  true,
+			Url: common.BuildPodURL(externalUrl, in.UrlType, stub, stubConfig),
+		}, nil
+	}
+
+	// Get URL for Deployments
+	if in.DeploymentId == "" {
+		return &pb.GetURLResponse{
+			Ok:     false,
+			ErrMsg: "Deployment ID is required",
+		}, nil
+	}
+
+	deployment, err := gws.backendRepo.GetDeploymentByExternalId(ctx, authInfo.Workspace.Id, in.DeploymentId)
+	if err != nil {
+		return &pb.GetURLResponse{
+			Ok:     false,
+			ErrMsg: "Unable to get deployment",
+		}, nil
+	}
+
+	invokeUrl := common.BuildDeploymentURL(gws.appConfig.GatewayService.HTTP.GetExternalURL(), in.UrlType, stub, &deployment.Deployment)
+	return &pb.GetURLResponse{
+		Ok:  true,
+		Url: invokeUrl,
+	}, nil
+}
+
+func (gws *GatewayService) configureVolumes(ctx context.Context, volumes []*pb.Volume, workspace *types.Workspace) error {
+	for i, volume := range volumes {
+		if err := abstractions.ValidateVolume(volume); err != nil {
+			return err
+		}
+		if volume.Config == nil {
+			// The id becomes a path under the workspace's volumes directory:
+			// only a volume this workspace owns may be mounted.
+			owned, err := gws.backendRepo.GetVolumeByExternalId(ctx, workspace.Id, volume.Id)
+			if err != nil {
+				return fmt.Errorf("failed to resolve volume %q", volume.Id)
+			}
+			if owned == nil {
+				return fmt.Errorf("volume %q does not exist in this workspace", volume.Id)
+			}
+		} else {
+			// De-reference secrets
+			accessKey, err := gws.backendRepo.GetSecretByName(ctx, workspace, volume.Config.AccessKey)
+			if err != nil {
+				return fmt.Errorf("Failed to get secret: %s", volume.Config.AccessKey)
+			}
+			volumes[i].Config.AccessKey = accessKey.Value
+
+			secretKey, err := gws.backendRepo.GetSecretByName(ctx, workspace, volume.Config.SecretKey)
+			if err != nil {
+				return fmt.Errorf("Failed to get secret: %s", volume.Config.SecretKey)
+			}
+			volumes[i].Config.SecretKey = secretKey.Value
+		}
+	}
+
+	return nil
+}
+
+func (gws *GatewayService) configureTaskPolicy(policy *pb.TaskPolicy, stubType types.StubType) types.TaskPolicy {
+	p := types.TaskPolicy{
+		MaxRetries: uint(math.Min(float64(policy.MaxRetries), float64(types.MaxTaskRetries))),
+		Timeout:    int(policy.Timeout),
+		TTL:        uint32(math.Min(float64(policy.Ttl), float64(types.MaxTaskTTL))),
+	}
+
+	switch stubType.Kind() {
+	case types.StubTypeASGI:
+		fallthrough
+	case types.StubTypeEndpoint:
+		p.Timeout = int(math.Min(float64(policy.Timeout), float64(endpoint.DefaultEndpointRequestTimeoutS)))
+		if p.Timeout <= 0 {
+			p.Timeout = endpoint.DefaultEndpointRequestTimeoutS
+		}
+		p.MaxRetries = 0
+		if p.TTL == 0 {
+			p.TTL = endpoint.DefaultEndpointRequestTTL // Endpoints should still transition to expire from pending if it never runs
+		}
+	case types.StubTypeScheduledJob:
+		fallthrough
+	case types.StubTypeFunction:
+		if p.TTL == 0 {
+			p.TTL = function.DefaultFunctionTaskTTL
+		}
+	case types.StubTypeTaskQueue:
+		if p.TTL == 0 {
+			p.TTL = taskqueue.DefaultTaskQueueTaskTTL
+		}
+	}
+
+	return p
+}
+
+func (gws *GatewayService) anyGpuAvailable(gpus []types.GpuType) (bool, error) {
+	gpuAvailability, err := gws.workerRepo.GetGpuAvailability()
+	if err != nil {
+		return false, err
+	}
+	hasCapacity := false
+
+	if slices.Contains(gpus, types.GPU_ANY) {
+		hasCapacity = true
+	} else {
+		for _, gpu := range gpus {
+			if gpuAvailability[gpu.String()] {
+				hasCapacity = true
+				break
+			}
+		}
+	}
+	return hasCapacity, nil
+}
+
+func (gws *GatewayService) getLowCapacityGpus(gpus []types.GpuType) ([]string, error) {
+	preemptibleGpus := gws.workerRepo.GetPreemptibleGpus()
+	gpuCounts, err := gws.workerRepo.GetFreeGpuCounts()
+	if err != nil {
+		return nil, err
+	}
+
+	lowGpus := []string{}
+	for _, gpu := range gpus {
+		if gpuCounts[gpu.String()] <= 1 && !slices.Contains(preemptibleGpus, gpu.String()) {
+			lowGpus = append(lowGpus, gpu.String())
+		}
+	}
+	return lowGpus, nil
+}

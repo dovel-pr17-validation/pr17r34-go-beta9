@@ -1,0 +1,733 @@
+import os
+import time
+from typing import Dict, List, Optional
+
+import click
+import requests
+from betterproto import Casing
+from rich.table import Column, Table, box
+from rich.text import Text
+
+from .. import terminal
+from ..abstractions.image import Image
+from ..abstractions.service import (
+    DEFAULT_SERVICE_KEEP_WARM_SECONDS,
+    Service,
+    resolve_service_ports,
+)
+from ..channel import ServiceClient, rpc_timeout
+from ..cli import extraclick
+from ..clients.gateway import (
+    DeleteDeploymentRequest,
+    DeleteDeploymentResponse,
+    GetUrlRequest,
+    ListDeploymentsRequest,
+    ListDeploymentsResponse,
+    ScaleDeploymentRequest,
+    ScaleDeploymentResponse,
+    StartDeploymentRequest,
+    StartDeploymentResponse,
+    StopDeploymentRequest,
+    StopDeploymentResponse,
+    StringList,
+)
+from ..logging import StoredStdoutInterceptor
+from ..utils import load_module_spec
+from .extraclick import (
+    ClickCommonGroup,
+    ClickManagementGroup,
+    env_vars_to_dict,
+    handle_config_override,
+    image_from_dockerfile_option,
+    override_config_options,
+)
+
+
+@click.group(cls=ClickCommonGroup)
+def common(**_):
+    pass
+
+
+@common.command(
+    name="deploy",
+    help="""
+    Deploy a function, web service, or container.
+
+    HANDLER is in the format of "file:function". If no handler is supplied,
+    beta9 deploys a service from --dockerfile, --image, --command, or a local Dockerfile.
+    """,
+    epilog="""
+      Examples:
+
+        {cli_name} deploy app.py:handler --name api
+        {cli_name} deploy --dockerfile Dockerfile --name web --port 8000
+        \b
+    """,
+)
+@click.option(
+    "--name",
+    "-n",
+    type=click.STRING,
+    help="Name of the deployment.",
+    required=False,
+)
+@click.argument(
+    "handler",
+    nargs=1,
+    required=False,
+)
+@click.option(
+    "--url-type",
+    help="The type of URL to get back. [default is determined by the server] ",
+    type=click.Choice(["host", "path"]),
+)
+@click.option(
+    "--format",
+    type=click.Choice(["json"]),
+    default=None,
+    help="The format of the output after a successful deployment.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Output deployment details as JSON.",
+)
+@click.option(
+    "--rollout",
+    type=click.Choice(["auto", "blue-green", "replace"]),
+    default="auto",
+    show_default=True,
+    help="Rollout strategy for always-on deployments.",
+)
+@click.option(
+    "--replicas",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Set a fixed replica count (equivalent to matching min/max replicas).",
+)
+@click.option(
+    "--no-ports",
+    "no_ports",
+    is_flag=True,
+    default=False,
+    help="Expose no port (a background worker), even if the Dockerfile has EXPOSE.",
+)
+@override_config_options
+@extraclick.config_context_option
+@click.pass_context
+def deploy(
+    ctx: click.Context,
+    name: str,
+    handler: str,
+    url_type: str,
+    format: str,
+    json_output: bool,
+    rollout: str,
+    replicas: Optional[int],
+    context: str = None,
+    **kwargs,
+):
+    if replicas is not None:
+        for option in ("min_replicas", "max_replicas"):
+            configured = kwargs.get(option)
+            if configured is not None and configured != replicas:
+                raise click.UsageError(
+                    f"--replicas conflicts with --{option.replace('_', '-')}={configured}"
+                )
+            kwargs[option] = replicas
+
+    ctx.invoke(
+        create_deployment,
+        name=name,
+        handler=handler,
+        url_type=url_type,
+        format="json" if json_output else format,
+        json_output=False,
+        rollout=rollout,
+        context=context,
+        **kwargs,
+    )
+
+
+@click.group(
+    name="deployment",
+    help="Manage deployments.",
+    cls=ClickManagementGroup,
+)
+def management():
+    pass
+
+
+class DeploymentNotReady(Exception):
+    def __init__(self, message: str, code: str = "ERROR"):
+        super().__init__(message)
+        self.code = code
+
+
+def _deployment_by_id(service: ServiceClient, deployment_id: str):
+    result = service.gateway.list_deployments(
+        ListDeploymentsRequest(filters={"id": StringList([deployment_id])}, limit=1)
+    )
+    if not result.ok or not result.deployments:
+        raise DeploymentNotReady(
+            result.err_msg or f"Deployment {deployment_id} was not found.", "NOT_FOUND"
+        )
+    return result.deployments[0]
+
+
+def wait_for_deployment(service: ServiceClient, deployment_id: str, timeout: float) -> Dict:
+    """Block until the deployment serves: health checks for endpoint/ASGI, active for the rest."""
+    start = time.monotonic()
+    deadline = start + timeout
+    with rpc_timeout(timeout):
+        deployment = _deployment_by_id(service, deployment_id)
+        if deployment.stub_type not in ("endpoint/deployment", "asgi/deployment"):
+            while not deployment.active and time.monotonic() < deadline:
+                time.sleep(1)
+                deployment = _deployment_by_id(service, deployment_id)
+            if not deployment.active:
+                raise DeploymentNotReady(
+                    f"Deployment {deployment_id} did not become active within {timeout}s", "TIMEOUT"
+                )
+            return {
+                "deployment_id": deployment_id,
+                "stub_id": deployment.stub_id,
+                "stub_type": deployment.stub_type,
+                "version": deployment.version,
+                "status": "active",
+                "ready_seconds": time.monotonic() - start,
+            }
+        if not deployment.active:
+            raise DeploymentNotReady(f"Deployment {deployment_id} is not active", "INACTIVE")
+        url = service.gateway.get_url(
+            GetUrlRequest(deployment_id=deployment_id, stub_id=deployment.stub_id, url_type="path")
+        )
+        if not url.ok:
+            raise DeploymentNotReady(url.err_msg)
+    last_error = "No healthy response"
+    next_active_check = time.monotonic() + 2
+    with requests.Session() as session:
+        session.headers["Authorization"] = f"Bearer {service._config.token}"
+        while (remaining := deadline - time.monotonic()) > 0:
+            if time.monotonic() >= next_active_check:
+                next_active_check = time.monotonic() + 2
+                if not _deployment_by_id(service, deployment_id).active:
+                    raise DeploymentNotReady(
+                        f"Deployment {deployment_id} was stopped or superseded before it became ready",
+                        "INACTIVE",
+                    )
+            try:
+                response = session.get(
+                    url.url.rstrip("/") + "/health",
+                    timeout=min(5, remaining),
+                    allow_redirects=False,
+                )
+                if (
+                    response.status_code == 200
+                    and response.headers.get("X-Beta9-Stub-Id") == deployment.stub_id
+                ):
+                    return {
+                        "deployment_id": deployment_id,
+                        "stub_id": deployment.stub_id,
+                        "version": deployment.version,
+                        "status": "ready",
+                        "ready_seconds": time.monotonic() - start,
+                    }
+                last_error = f"HTTP {response.status_code}; revision {response.headers.get('X-Beta9-Stub-Id', 'unknown')}: {response.text[:200]}"
+                if response.status_code in (401, 403):
+                    break
+            except requests.RequestException as exc:
+                last_error = str(exc)
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+    raise DeploymentNotReady(
+        f"Deployment {deployment_id} did not become ready within {timeout}s: {last_error}",
+        "TIMEOUT",
+    )
+
+
+@management.command(
+    "wait", help="Wait for an endpoint's exact deployed revision to serve health checks."
+)
+@click.argument("deployment_id")
+@click.option("--timeout", type=click.FloatRange(min=0, min_open=True), default=300)
+@extraclick.pass_service_client
+def wait_deployment(service: ServiceClient, deployment_id: str, timeout: float):
+    try:
+        terminal.print_json(wait_for_deployment(service, deployment_id, timeout))
+    except DeploymentNotReady as exc:
+        terminal.error(str(exc), code=exc.code)
+
+
+def _merge_port_options(kwargs: Dict) -> None:
+    ports = list(kwargs.get("ports") or [])
+    for port in kwargs.pop("port", ()) or ():
+        if port not in ports:
+            ports.append(port)
+    kwargs["ports"] = ports
+
+
+def _autodetect_dockerfile(kwargs: Dict) -> None:
+    if kwargs.get("dockerfile") is not None or kwargs.get("image") is not None:
+        return
+
+    dockerfile = "Dockerfile"
+    if not os.path.exists(dockerfile):
+        return
+
+    kwargs["dockerfile"] = dockerfile
+
+
+def _materialize_dockerfile_image(kwargs: Dict) -> Optional[Image]:
+    dockerfile = kwargs.get("dockerfile")
+    if dockerfile is None:
+        return None
+
+    image = image_from_dockerfile_option(
+        dockerfile,
+        kwargs.get("context_dir"),
+        kwargs.get("build_target"),
+        kwargs.get("build_args") or (),
+    )
+    kwargs["dockerfile"] = image
+    return image
+
+
+def _service_image_option(kwargs: Dict) -> Optional[Image]:
+    if kwargs.get("dockerfile") is not None and kwargs.get("image") is not None:
+        raise ValueError("Specify either --dockerfile or --image, not both.")
+
+    dockerfile_image = _materialize_dockerfile_image(kwargs)
+    if dockerfile_image is not None:
+        return dockerfile_image
+    return kwargs.get("image")
+
+
+def _service_checkpoint_options(kwargs: Dict) -> Dict:
+    options = {
+        "checkpoint_enabled": bool(kwargs.get("checkpoint_enabled")),
+    }
+    if kwargs.get("checkpoint_readiness_path"):
+        options.update(
+            {
+                "checkpoint_readiness_path": kwargs.get("checkpoint_readiness_path"),
+                "checkpoint_readiness_port": kwargs.get("checkpoint_readiness_port"),
+                "checkpoint_readiness_timeout": kwargs.get("checkpoint_readiness_timeout") or 600,
+                "checkpoint_readiness_interval": kwargs.get("checkpoint_readiness_interval") or 1,
+            }
+        )
+    return options
+
+
+def _generate_service_module(name: Optional[str], kwargs: Dict) -> Service:
+    service_image = _service_image_option(kwargs)
+    ports = resolve_service_ports(
+        ports=kwargs.get("ports"),
+        image=service_image,
+        default=service_image is not None,
+    )
+    keep_warm_seconds = kwargs.get("keep_warm_seconds")
+    service_kwargs = {
+        "name": name or os.path.basename(os.getcwd()),
+        "entrypoint": kwargs.get("entrypoint"),
+        "ports": ports,
+        "image": service_image or Image(),
+        "env": env_vars_to_dict(kwargs.get("env")),
+        "keep_warm_seconds": (
+            DEFAULT_SERVICE_KEEP_WARM_SECONDS if keep_warm_seconds is None else keep_warm_seconds
+        ),
+        "min_replicas": kwargs.get("min_replicas") or 0,
+        "max_replicas": kwargs.get("max_replicas"),
+        "always_on": bool(kwargs.get("always_on")),
+        "pool": kwargs.get("pool"),
+        "tcp": bool(kwargs.get("tcp")),
+    }
+    service_kwargs.update(_service_checkpoint_options(kwargs))
+
+    for key in ("cpu", "memory", "gpu", "gpu_count", "secrets", "disks"):
+        value = kwargs.get(key)
+        if value is not None and value != ():
+            service_kwargs[key] = list(value) if key == "disks" else value
+
+    service = Service(**service_kwargs)
+    if kwargs.get("no_ports"):
+        service.clear_ports()
+    return service
+
+
+@management.command(
+    name="create",
+    help="Create a new deployment.",
+    epilog="""
+      Examples:
+
+        {cli_name} deploy --name my-app --entrypoint app.py:handler
+
+        {cli_name} deploy --name web --dockerfile Dockerfile
+
+        {cli_name} deploy --name web --dockerfile Dockerfile --pool web-cpu
+
+        {cli_name} deploy --name web --dockerfile Dockerfile --min-replicas 2 --max-replicas 4
+        \b
+    """,
+)
+@click.option(
+    "--name",
+    "-n",
+    help="The name of the deployment.",
+    required=False,
+)
+@click.option(
+    "--handler",
+    help='The name the handler e.g. "file:function" or script to run.',
+)
+@click.option(
+    "--url-type",
+    help="The type of URL to get back. [default is determined by the server] ",
+    type=click.Choice(["host", "path"]),
+)
+@click.option(
+    "--format",
+    type=click.Choice(["json"]),
+    default=None,
+    help="The format of the output after a successful deployment.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Output deployment details as JSON.",
+)
+@click.option(
+    "--rollout",
+    type=click.Choice(["auto", "blue-green", "replace"]),
+    default="auto",
+    show_default=True,
+    help="Rollout strategy for always-on deployments.",
+)
+@click.option(
+    "--no-ports",
+    "no_ports",
+    is_flag=True,
+    default=False,
+    help="Expose no port (a background worker), even if the Dockerfile has EXPOSE.",
+)
+@override_config_options
+@extraclick.pass_service_client
+def create_deployment(
+    service: ServiceClient,
+    name: str,
+    handler: str,
+    url_type: str,
+    format: str,
+    json_output: bool,
+    rollout: str,
+    **kwargs,
+):
+    if json_output or terminal.json_output():
+        format = "json"
+    _merge_port_options(kwargs)
+    entrypoint = kwargs["entrypoint"]
+
+    logs = []
+
+    with StoredStdoutInterceptor(capture_logs=format == "json") as capture_logs:
+        if handler:
+            user_obj, module_name, obj_name = load_module_spec(handler, "deploy")
+
+            if hasattr(user_obj, "set_handler"):
+                user_obj.set_handler(f"{module_name}:{obj_name}")
+
+        else:
+            try:
+                _autodetect_dockerfile(kwargs)
+                if (
+                    entrypoint
+                    or kwargs.get("dockerfile") is not None
+                    or kwargs.get("image") is not None
+                ):
+                    user_obj = _generate_service_module(name, kwargs)
+                else:
+                    terminal.error("No handler, entrypoint, image, or Dockerfile specified")
+                    return
+            except (OSError, ValueError) as exc:
+                terminal.error(f"Invalid service configuration: {exc}")
+                return
+
+        if not handle_config_override(user_obj, kwargs):
+            raise click.exceptions.Exit(1)
+
+        if hasattr(user_obj, "generate_deployment_artifacts"):
+            user_obj.generate_deployment_artifacts(**kwargs)
+
+        response, ok = user_obj.deploy(
+            name=name,
+            context=service._config,
+            rollout=rollout,
+            url_type=url_type,
+        )
+        if not ok:
+            terminal.error("Deployment failed")
+            return
+
+        if hasattr(user_obj, "cleanup_deployment_artifacts"):
+            user_obj.cleanup_deployment_artifacts()
+
+        if capture_logs.capture_logs:
+            logs.extend(capture_logs.logs)
+
+    if format == "json":
+        terminal.print_json(
+            {
+                "logs": logs,
+                **response,
+            }
+        )
+    else:
+        cli = extraclick.command_hint()
+        actions = {}
+        if getattr(user_obj, "deployment_stub_type", None) in (
+            "endpoint/deployment",
+            "asgi/deployment",
+        ):
+            actions["Wait"] = f"{cli} deployment wait {response['deployment_id']}"
+        if response.get("stub_id"):
+            actions["Logs"] = f"{cli} logs --stub-id {response['stub_id']}"
+        actions["Stop"] = f"{cli} deployment stop {response['deployment_id']}"
+        terminal.resource("Next steps", actions, show_labels=False)
+
+
+@management.command(
+    name="list",
+    help="List all deployments.",
+    epilog="""
+    Examples:
+
+      # List the first 10 deployments
+      {cli_name} deployment list --limit 10
+
+      # List deployments that are at version 9
+      {cli_name} deployment list --filter version=9
+
+      # List deployments that are not active
+      {cli_name} deployment list --filter active=false
+      {cli_name} deployment list --filter active=no
+
+      # List deployments and output in JSON format
+      {cli_name} deployment list --format json
+      \b
+    """,
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 100),
+    default=20,
+    help="The number of deployments to fetch.",
+)
+@click.option(
+    "--format",
+    type=click.Choice(["json", "none", "table"]),
+    default="table",
+    show_default=True,
+    help="Change the format of the output.",
+)
+@click.option(
+    "--filter",
+    multiple=True,
+    callback=extraclick.filter_values_callback,
+    help="Filters deployments. Add this option for each field you want to filter on.",
+)
+@extraclick.pass_service_client
+@click.option("--details", is_flag=True, help="Include source, workspace, and full deployment IDs.")
+def list_deployments(
+    service: ServiceClient,
+    limit: int,
+    format: str,
+    filter: Dict[str, StringList],
+    details: bool,
+):
+    res: ListDeploymentsResponse
+    res = service.gateway.list_deployments(ListDeploymentsRequest(filter, limit))
+
+    if not res.ok:
+        terminal.error(res.err_msg)
+
+    if terminal.json_output(format):
+        deployments = [d.to_dict(casing=Casing.SNAKE) for d in res.deployments]  # type:ignore
+        terminal.print_json(deployments)
+        return
+
+    if format == "none":
+        return
+
+    if not res.deployments:
+        terminal.resource(
+            "No deployments",
+            {"Deploy": f"{extraclick.command_hint()} deploy app.py:handler --name api"},
+        )
+        return
+
+    columns = [
+        Column("Name"),
+        Column("State"),
+        Column("Version", justify="right"),
+        Column("Updated"),
+    ]
+    if details:
+        columns.extend([Column("ID"), Column("Source"), Column("Workspace")])
+    table = Table(*columns, box=box.SIMPLE, header_style="bold cyan")
+
+    for deployment in res.deployments:
+        row = [
+            Text(deployment.name),
+            "[green]Active[/green]" if deployment.active else "[dim]Stopped[/dim]",
+            f"v{deployment.version}",
+            terminal.humanize_date(deployment.updated_at),
+        ]
+        if details:
+            row.extend(
+                Text(value)
+                for value in (deployment.id, deployment.stub_name, deployment.workspace_name)
+            )
+        table.add_row(*row)
+
+    table.add_section()
+    table.add_row(f"[bold]{len(res.deployments)} total")
+    terminal.print(table)
+    terminal.detail("Use --details or --format json for deployment IDs.")
+
+
+@management.command(
+    name="stop",
+    help="Stop deployments.",
+    epilog="""
+    Examples:
+
+      # Stop a deployment
+      {cli_name} deployment stop 5bd2e248-6d7c-417b-ac7b-0b92aa0a5572
+
+      # Stop multiple deployments
+      {cli_name} deployment stop 5bd2e248-6d7c-417b-ac7b-0b92aa0a5572 7b968ad5-c001-4df3-ba05-e99895aa9596
+      \b
+    """,
+)
+@click.argument(
+    "deployment_ids",
+    nargs=-1,
+    type=click.STRING,
+    required=True,
+)
+@extraclick.pass_service_client
+def stop_deployments(service: ServiceClient, deployment_ids: List[str]):
+    failed = False
+    for id in deployment_ids:
+        res: StopDeploymentResponse
+        res = service.gateway.stop_deployment(StopDeploymentRequest(id))
+
+        if not res.ok:
+            terminal.error(res.err_msg, exit=False)
+            failed = True
+            continue
+
+        terminal.success(f"Stopped deployment: {id}")
+    if failed:
+        raise click.exceptions.Exit(1)
+
+
+@management.command(
+    name="start",
+    help="Start an inactive deployment.",
+    epilog="""
+    Examples:
+
+        # Start a deployment
+        {cli_name} deployment start 5bd2e248-6d7c-417b-ac7b-0b92aa0a5572
+        """,
+)
+@click.argument(
+    "deployment_id",
+    type=click.STRING,
+    required=True,
+)
+@extraclick.pass_service_client
+def start_deployment(service: ServiceClient, deployment_id: str):
+    res: StartDeploymentResponse
+    res = service.gateway.start_deployment(StartDeploymentRequest(id=deployment_id))
+
+    if not res.ok:
+        terminal.error(res.err_msg)
+
+    terminal.print(f"Starting deployment: {deployment_id}")
+
+
+@management.command(
+    name="delete",
+    help="Delete a deployment.",
+    epilog="""
+    Examples:
+
+        # Delete a deployment
+        {cli_name} deployment delete 5bd2e248-6d7c-417b-ac7b-0b92aa0a5572
+        \b
+     """,
+)
+@click.argument(
+    "deployment_id",
+    nargs=1,
+    type=click.STRING,
+    required=True,
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+@extraclick.pass_service_client
+def delete_deployment(service: ServiceClient, deployment_id: str, yes: bool):
+    if not yes and not terminal.confirm(f"Delete deployment {deployment_id}?", default=False):
+        terminal.error("Cancelled.", code="CANCELLED")
+
+    res: DeleteDeploymentResponse
+    res = service.gateway.delete_deployment(DeleteDeploymentRequest(deployment_id))
+
+    if not res.ok:
+        terminal.error(res.err_msg)
+
+    if terminal.json_output():
+        terminal.print_json({"deleted": deployment_id})
+    else:
+        terminal.print(f"Deleted {deployment_id}")
+
+
+@management.command(
+    name="scale",
+    help="Scale an active deployment.",
+    epilog="""
+    Examples:
+
+        # Keep two replicas running
+        {cli_name} deployment scale 5bd2e248-6d7c-417b-ac7b-0b92aa0a5572 --replicas 2
+        """,
+)
+@click.argument(
+    "deployment_id",
+    type=click.STRING,
+    required=True,
+)
+@click.option(
+    "--containers",
+    "--replicas",
+    "containers",
+    type=click.IntRange(min=0),
+    required=True,
+    help="The fixed replica count to run.",
+)
+@extraclick.pass_service_client
+def scale_deployment(service: ServiceClient, deployment_id: str, containers: int):
+    res: ScaleDeploymentResponse
+    res = service.gateway.scale_deployment(
+        ScaleDeploymentRequest(id=deployment_id, containers=containers)
+    )
+
+    if not res.ok:
+        terminal.error(res.err_msg)
+
+    terminal.print(f"Scaled deployment {deployment_id} to {containers} replicas")

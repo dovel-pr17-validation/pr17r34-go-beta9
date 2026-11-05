@@ -1,0 +1,994 @@
+package disk
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/rs/zerolog/log"
+)
+
+// Volume is one attached qcow2-backed disk: a backing chain of immutable
+// layers, a writable head, one qemu-storage-daemon, and either one NBD device
+// mounted as ext4 at Mountpoint or a vhost-user-blk socket a VM consumes.
+type Volume struct {
+	manager *Manager
+	mu      sync.Mutex
+
+	dir        string
+	state      *volumeState
+	qsd        *qsdProcess
+	nbd        *nbdDevice
+	fmtNode    string
+	journal    *Journal
+	journalLag time.Duration
+	journalNBD *journalNBD
+
+	// freeze quiesces the filesystem before a pivot when the host has not
+	// mounted it (ExportVhostUser). Nil means crash-consistent pivots only.
+	freeze func(ctx context.Context) (func(), error)
+	owner  string
+
+	// freshHead is true when the current head file was created within this
+	// daemon session, which is what makes a zero write-offset on its file
+	// node a safe "nothing changed" signal. Reused heads and adopted volumes
+	// may hold data written before the daemon's statistics started counting,
+	// so their first seal is never skipped.
+	freshHead bool
+
+	// thawed is the journal sequence of the newest seal's thaw (see Changed).
+	thawed uint64
+}
+
+// ExportMode selects how the daemon serves the writable head.
+type ExportMode string
+
+const (
+	// ExportNBD connects a kernel NBD device and mounts ext4 at Mountpoint.
+	ExportNBD ExportMode = ""
+	// ExportVhostUser serves the head over a vhost-user-blk socket for a
+	// virtual machine; nothing is connected or mounted on the host.
+	ExportVhostUser ExportMode = "vhost-user-blk"
+)
+
+// AttachSpec describes a volume attachment.
+type AttachSpec struct {
+	// Key is a stable, path-safe identifier. Attachments with the same key
+	// reuse locally cached layers across container restarts.
+	Key              string
+	VirtualSizeBytes int64
+	ReadOnly         bool
+	// Mountpoint is the host directory where the ext4 filesystem is mounted.
+	// Required for ExportNBD, ignored for ExportVhostUser.
+	Mountpoint string
+	// Chain is the published backing chain to materialize, base first. Empty
+	// means a fresh formatted disk (or reuse of whatever exists locally).
+	Chain []ChainLayer
+	// Export is the serving mode; the zero value is ExportNBD.
+	Export ExportMode
+	// Freeze is called before every pivot in ExportVhostUser mode so the
+	// consumer can quiesce the filesystem it has mounted; it returns the
+	// matching thaw. Optional.
+	Freeze func(ctx context.Context) (thaw func(), err error)
+	// Owner names who attached the volume (a container id); see DetachOwned.
+	Owner string
+	// Journal makes flush completion conditional on remote persistence.
+	Journal *Journal
+	// JournalLag lets a flush complete before its remote commit as long as
+	// no flush completed that way has waited this long for its own. Zero
+	// completes every flush only once it is committed.
+	JournalLag time.Duration
+}
+
+// ChainLayer is one published generation of a volume.
+type ChainLayer struct {
+	SnapshotID string
+	Layer      *types.DiskSnapshotFile
+}
+
+// SealedLayer is an immutable local layer that has not been published yet.
+type SealedLayer struct {
+	Path string
+	// ParentSnapshotID is the published generation this layer builds on. It is
+	// empty when the parent is itself unpublished (the adapter must publish
+	// sealed layers in order, so this only ever refers to the previous seal).
+	ParentSnapshotID string
+}
+
+func (v *Volume) Mountpoint() string { return v.state.Mountpoint }
+func (v *Volume) Depth() int         { return v.state.depth() }
+func (v *Volume) ReadOnly() bool     { return v.state.ReadOnly }
+
+// ExportSocket is the vhost-user-blk socket path of an ExportVhostUser
+// volume; empty for NBD volumes.
+func (v *Volume) ExportSocket() string { return v.state.ExportSocket }
+
+// Journaled reports whether the volume was attached with a journal, which
+// makes acknowledged writes durable without publishing a generation. It says
+// nothing about the journal's health; Check does.
+func (v *Volume) Journaled() bool { return v.journal != nil }
+
+// Backlogged reports whether the volume's journal took enough writes since
+// the newest seal to want another checkpoint. Sealed writes do not count:
+// publishing them is what the caller is doing.
+func (v *Volume) Backlogged() bool {
+	if v.journal == nil {
+		return false
+	}
+	v.mu.Lock()
+	var sealed uint64
+	if n := len(v.state.Pending); n > 0 {
+		sealed = v.state.Pending[n-1].JournalSequence
+	}
+	v.mu.Unlock()
+	return v.journal.NeedsCheckpointAfter(sealed)
+}
+
+// Changed reports whether the journaled volume holds writes its newest
+// published generation lacks: sealed layers awaiting publication, or writes
+// committed since the newest seal's thaw. The thaw's own superblock rewrite
+// does not count; it would otherwise give an idle disk a new generation on
+// every checkpoint interval, each sealed by a freeze whose thaw writes again.
+func (v *Volume) Changed() bool {
+	if v.journal == nil {
+		return true
+	}
+	v.mu.Lock()
+	pending, thawed := len(v.state.Pending) > 0, v.thawed
+	v.mu.Unlock()
+	_, written := v.journal.firstAfter(thawed)
+	return pending || written
+}
+
+// Check reports why the volume's journal stopped committing writes. From
+// then on nothing may be sealed or published: the head can hold writes whose
+// flush failed, and the journal can no longer checkpoint a published layer.
+func (v *Volume) Check() error {
+	if v.journal == nil {
+		return nil
+	}
+	return v.journal.Check()
+}
+
+// attach materializes the chain and brings the volume online. Called with the
+// manager registration already reserved for this key.
+func (m *Manager) attach(ctx context.Context, spec AttachSpec, source ChunkSource) (*Volume, error) {
+	dir, err := m.resolveVolumeDir(spec.Key)
+	if err != nil {
+		return nil, err
+	}
+	state, err := loadVolumeState(dir)
+	if err != nil {
+		return nil, err
+	}
+	if state != nil && state.Attached {
+		// Recovery marks crashed volumes detached at startup, so a state that
+		// still claims attachment belongs to a live volume.
+		return nil, fmt.Errorf("volume %s is already attached", spec.Key)
+	}
+
+	fresh := state == nil && len(spec.Chain) == 0 && !spec.ReadOnly
+	// Fresh exports can adopt a formatted spare. A VM switches its export
+	// from NBD to vhost-user without formatting on the launch path.
+	if fresh && spec.Journal == nil {
+		m.rememberSpareSize(spec.VirtualSizeBytes)
+		defer m.replenishSpares(spec.VirtualSizeBytes)
+		if volume := m.adoptSpare(ctx, spec); volume != nil {
+			return volume, nil
+		}
+	}
+
+	layersDir := filepath.Join(dir, layersSubdir)
+	if err := os.MkdirAll(layersDir, 0o700); err != nil {
+		return nil, err
+	}
+
+	freshHead := false
+	if spec.Journal != nil || !reusableState(state, spec) {
+		if state != nil {
+			log.Info().Str("volume", spec.Key).Msg("discarding stale local volume state")
+		}
+		if err := os.RemoveAll(layersDir); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(layersDir, 0o700); err != nil {
+			return nil, err
+		}
+		state, err = m.materializeChain(ctx, spec, layersDir, source)
+		if err != nil {
+			return nil, err
+		}
+		freshHead = true
+	} else {
+		log.Info().Str("volume", spec.Key).Int("layers", state.depth()).Msg("reusing local volume state")
+	}
+	if state.VirtualSizeBytes > spec.VirtualSizeBytes {
+		return nil, fmt.Errorf("volume %s cannot shrink from %d to %d bytes", spec.Key, state.VirtualSizeBytes, spec.VirtualSizeBytes)
+	}
+	if state.VirtualSizeBytes < spec.VirtualSizeBytes {
+		if spec.ReadOnly || spec.Export == ExportVhostUser {
+			return nil, fmt.Errorf("volume %s: growth requires a writable host-mounted filesystem", spec.Key)
+		}
+		if _, err := m.run(ctx, m.binaries.QemuImg, "resize", "-q", state.HeadPath, strconv.FormatInt(spec.VirtualSizeBytes, 10)); err != nil {
+			return nil, fmt.Errorf("grow volume %s: %w", spec.Key, err)
+		}
+	}
+	state.Mountpoint = spec.Mountpoint
+	state.Owner = spec.Owner
+	state.ReadOnly = spec.ReadOnly
+	state.VirtualSizeBytes = spec.VirtualSizeBytes
+	state.Export = string(spec.Export)
+	state.Journal = spec.Journal != nil
+	if spec.Export == ExportVhostUser {
+		state.Mountpoint = ""
+	}
+
+	volume := &Volume{manager: m, dir: dir, state: state, freshHead: freshHead, freeze: spec.Freeze, owner: spec.Owner, journal: spec.Journal, journalLag: spec.JournalLag}
+	if err := volume.start(ctx); err != nil {
+		return nil, err
+	}
+	return volume, nil
+}
+
+// reusableState reports whether the local layer stack can serve the requested
+// chain without refetching. Local state is reusable when it already contains
+// the newest requested generation: it is then equal to or ahead of the remote
+// chain (pending seals and head writes that were never published).
+func reusableState(state *volumeState, spec AttachSpec) bool {
+	if state == nil || spec.ReadOnly {
+		return false
+	}
+	if len(spec.Chain) == 0 {
+		// No remote generations exist. Local state is only reusable if it never
+		// published anything either; otherwise the remote rows were deleted and
+		// the local stack is stale.
+		return len(state.Chain) == 0 && state.HeadPath != "" && fileExists(state.HeadPath) && layersExist(state)
+	}
+	latest := spec.Chain[len(spec.Chain)-1].SnapshotID
+	if latest == "" || !state.publishedIDs()[latest] {
+		return false
+	}
+	return state.HeadPath != "" && fileExists(state.HeadPath) && layersExist(state)
+}
+
+func layersExist(state *volumeState) bool {
+	for _, layer := range append(append([]stateLayer{}, state.Chain...), state.Pending...) {
+		if !fileExists(layer.Path) {
+			return false
+		}
+	}
+	return true
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// materializeChain downloads every published layer and links them into a local
+// backing chain, then creates the writable head (or a fresh formatted base).
+func (m *Manager) materializeChain(ctx context.Context, spec AttachSpec, layersDir string, source ChunkSource) (*volumeState, error) {
+	state := &volumeState{Key: spec.Key, VirtualSizeBytes: spec.VirtualSizeBytes, ReadOnly: spec.ReadOnly}
+
+	// Layers are independent objects; fetch them in parallel and link the
+	// chain afterwards. Chunk parallelism is a single budget shared by every
+	// layer, so restore speed does not depend on how the data is split.
+	localPaths := make([]string, len(spec.Chain))
+	gate := newChunkGate(chunkFetchConcurrency)
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(layerFetchConcurrency)
+	for i, chainLayer := range spec.Chain {
+		if chainLayer.Layer == nil || chainLayer.SnapshotID == "" {
+			return nil, fmt.Errorf("chain layer %d for volume %s is incomplete", i, spec.Key)
+		}
+		localPaths[i] = filepath.Join(layersDir, fmt.Sprintf("%03d-%s.qcow2", i, chainLayer.SnapshotID))
+		group.Go(func() error {
+			if err := fetchLayer(groupCtx, source, chainLayer.Layer, localPaths[i], gate); err != nil {
+				return fmt.Errorf("fetch layer %s: %w", chainLayer.SnapshotID, err)
+			}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	previousPath := ""
+	for i, chainLayer := range spec.Chain {
+		if i > 0 {
+			// Downloaded layers carry the origin host's backing path; repoint
+			// them at the local copy of their parent.
+			if err := m.rebaseQcow(ctx, localPaths[i], previousPath); err != nil {
+				return nil, err
+			}
+		}
+		state.Chain = append(state.Chain, stateLayer{SnapshotID: chainLayer.SnapshotID, Path: localPaths[i]})
+		previousPath = localPaths[i]
+	}
+
+	if spec.ReadOnly {
+		if previousPath == "" {
+			return nil, fmt.Errorf("read-only volume %s requires at least one published layer", spec.Key)
+		}
+		return state, nil
+	}
+
+	headPath := headLayerPath(layersDir, state.PivotCount)
+	if previousPath == "" {
+		if err := m.createQcowBase(ctx, headPath, spec.VirtualSizeBytes); err != nil {
+			return nil, err
+		}
+	} else if err := m.createQcowOverlay(ctx, headPath, previousPath, spec.VirtualSizeBytes); err != nil {
+		return nil, err
+	}
+	state.HeadPath = headPath
+	return state, nil
+}
+
+// start launches the daemon and either serves a vhost-user export or connects
+// the NBD device, formats a fresh disk and mounts it. Spares have no
+// mountpoint and stay unmounted.
+func (v *Volume) start(ctx context.Context) (err error) {
+	m := v.manager
+	state := v.state
+	freshDisk := !state.ReadOnly && len(state.Chain) == 0 && !state.Formatted
+	if v.journal != nil {
+		freshDisk = !v.journal.Initialized()
+		state.Formatted = !freshDisk
+		if state.exportMode() != ExportNBD {
+			return fmt.Errorf("synchronous durable disks require a host-mounted NBD export")
+		}
+	}
+
+	openPath := state.HeadPath
+	if state.ReadOnly {
+		openPath = state.lastLayerPath()
+	}
+	v.fmtNode = fmtNodeName(state.PivotCount)
+
+	// The attach log carries per-phase timings, so a slow attach can be
+	// blamed on the daemon, the kernel, mkfs, or the mount without a
+	// profiler. The phases that completed are logged on failure too.
+	phases := common.NewPhaseTimer()
+	defer func() {
+		event, msg := log.Info(), "qcow volume attached"
+		if err != nil {
+			event, msg = log.Warn().Err(err), "qcow volume attach failed"
+		}
+		event.Str("volume", state.Key).Bool("fresh", freshDisk).Int("layers", len(state.Chain)).Str("export", string(state.exportMode()))
+		phases.Fields(event).Msg(msg)
+	}()
+
+	if freshDisk && v.journal == nil {
+		if err := m.formatQcowBase(ctx, openPath, state.VirtualSizeBytes); err != nil {
+			return err
+		}
+		state.Formatted = true
+		v.freshHead = false // These writes predate the daemon's counters.
+		phases.Mark("mkfs")
+	}
+
+	if state.exportMode() == ExportVhostUser {
+		return v.startExported(ctx, openPath, phases)
+	}
+
+	qsd, err := m.startQSD(ctx, m.runtimeDir(state.Key), openPath, v.fmtNode, state.ReadOnly, ExportNBD)
+	if err != nil {
+		return err
+	}
+	phases.Mark("qsd")
+
+	defer func() {
+		if err == nil {
+			return
+		}
+		if v.nbd != nil {
+			_ = m.disconnectNBDDevice(context.Background(), v.nbd)
+			v.nbd = nil
+		}
+		if v.journalNBD != nil {
+			v.journalNBD.Close()
+			v.journalNBD = nil
+		}
+		_ = m.stopQSD(context.Background(), qsd)
+	}()
+
+	nbdSocket := qsd.nbdSocket
+	if v.journal != nil {
+		nbdSocket = filepath.Join(m.runtimeDir(state.Key), "durable.sock")
+		v.journalNBD, err = startJournalNBD(ctx, nbdSocket, qsd.nbdSocket, v.journal, v.journalLag)
+		if err != nil {
+			return err
+		}
+	}
+	nbd, err := m.acquireNBDDevice(ctx, nbdSocket, state.VirtualSizeBytes)
+	if err != nil {
+		return err
+	}
+	v.nbd = nbd
+	phases.Mark("nbd")
+
+	if freshDisk && v.journal != nil {
+		if err := m.formatExt4(ctx, nbd.Path); err != nil {
+			return err
+		}
+		if _, err := m.run(ctx, "blockdev", "--flushbufs", nbd.Path); err != nil {
+			return err
+		}
+		if err := v.journal.Initialize(ctx); err != nil {
+			return err
+		}
+		state.Formatted = true
+		phases.Mark("mkfs")
+	}
+	if state.Mountpoint != "" {
+		if err := m.mountExt4(ctx, nbd.Path, state.Mountpoint, state.ReadOnly); err != nil {
+			return err
+		}
+		if !freshDisk && !state.ReadOnly {
+			// The overlay may have grown, including when restored onto a new worker.
+			// Grow ext4 too; changing only the advertised block size leaves the old limit.
+			if _, err := m.run(ctx, "resize2fs", nbd.Path); err != nil {
+				_ = m.unmount(context.Background(), state.Mountpoint)
+				return fmt.Errorf("grow filesystem for %s: %w", state.Key, err)
+			}
+		}
+		phases.Mark("mount")
+	}
+
+	v.qsd = qsd
+	state.Attached = true
+	state.QSDPid = qsd.pid
+	state.QMPSocket = qsd.qmpSocket
+	state.NBDSocket = qsd.nbdSocket
+	state.NBDDevice = nbd.Path
+	if err := saveVolumeState(v.dir, state); err != nil {
+		_ = m.unmount(context.Background(), state.Mountpoint)
+		return err
+	}
+	return nil
+}
+
+// startExported serves the prepared head over vhost-user-blk for a VM.
+func (v *Volume) startExported(ctx context.Context, openPath string, phases *common.PhaseTimer) error {
+	m := v.manager
+	state := v.state
+	runtimeDir := m.runtimeDir(state.Key)
+
+	qsd, err := m.startQSD(ctx, runtimeDir, openPath, v.fmtNode, state.ReadOnly, ExportVhostUser)
+	if err != nil {
+		return err
+	}
+	phases.Mark("qsd")
+
+	v.qsd = qsd
+	state.Attached = true
+	state.QSDPid = qsd.pid
+	state.QMPSocket = qsd.qmpSocket
+	state.NBDSocket = ""
+	state.NBDDevice = ""
+	state.ExportSocket = qsd.exportSocket
+	if err := saveVolumeState(v.dir, state); err != nil {
+		_ = m.stopQSD(context.Background(), qsd)
+		return err
+	}
+	return nil
+}
+
+// Seal pivots the writable head onto a new empty overlay and returns every
+// sealed-but-unpublished layer, oldest first. The caller must publish them in
+// order and confirm each with MarkPublished. When force is false and nothing
+// was written since the last pivot (and nothing is pending), Seal skips the
+// pivot and returns skipped=true.
+func (v *Volume) Seal(ctx context.Context, force bool) ([]SealedLayer, bool, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	state := v.state
+	if !state.Attached || state.ReadOnly {
+		return nil, false, fmt.Errorf("volume %s is not attached writable", state.Key)
+	}
+	if err := v.Check(); err != nil {
+		return nil, false, fmt.Errorf("seal volume %s: %w", state.Key, err)
+	}
+
+	if v.fmtNode != fmtNodeName(state.PivotCount) {
+		if err := v.reconcileHeadNode(ctx); err != nil {
+			return nil, false, err
+		}
+	}
+
+	client, err := dialQMP(ctx, state.QMPSocket)
+	if err != nil {
+		return nil, false, err
+	}
+	defer client.Close()
+	if err := client.finishCommitJobs(ctx); err != nil {
+		return nil, false, fmt.Errorf("finish compaction for volume %s: %w", state.Key, err)
+	}
+
+	if !force && len(state.Pending) == 0 && v.freshHead {
+		written, err := client.writtenBytes(ctx, qsdFileNodePrefix+v.fmtNode)
+		if err == nil && written == 0 {
+			return nil, true, nil
+		}
+	}
+
+	if state.depth() >= v.manager.maxChainDepth {
+		return nil, false, fmt.Errorf("volume %s reached the maximum chain depth of %d: %w", state.Key, v.manager.maxChainDepth, ErrMaxChainDepth)
+	}
+
+	// Pre-create the empty overlay, then record the intent before asking the
+	// daemon to pivot: after a crash the state file must never point at a
+	// layer that other layers build on.
+	sealedPath := state.HeadPath
+	newPivot := state.PivotCount + 1
+	newHeadPath := headLayerPath(filepath.Join(v.dir, layersSubdir), newPivot)
+	newNode := fmtNodeName(newPivot)
+	if err := v.manager.createQcowOverlay(ctx, newHeadPath, sealedPath, state.VirtualSizeBytes); err != nil {
+		return nil, false, err
+	}
+
+	previousState := *state
+	state.Pending = append(state.Pending, stateLayer{Path: sealedPath})
+	state.HeadPath = newHeadPath
+	state.PivotCount = newPivot
+	if err := saveVolumeState(v.dir, state); err != nil {
+		*state = previousState
+		os.Remove(newHeadPath)
+		return nil, false, err
+	}
+
+	err = client.addOverlay(ctx, newNode, qsdFileNodePrefix+newNode, newHeadPath)
+	if err != nil {
+		// Older workers left compacted nodes open. Reclaim those references
+		// before retrying a daemon already at its descriptor limit.
+		if cleanupErr := client.releaseUnusedNodes(ctx, v.fmtNode); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		} else {
+			err = client.addOverlay(ctx, newNode, qsdFileNodePrefix+newNode, newHeadPath)
+		}
+	}
+	if err != nil {
+		v.rollbackSeal(previousState, newHeadPath)
+		return nil, false, fmt.Errorf("add overlay for volume %s: %w", state.Key, err)
+	}
+	thaw, err := v.quiesceFlushing(ctx)
+	if err != nil {
+		_ = client.removeNode(ctx, newNode)
+		v.rollbackSeal(previousState, newHeadPath)
+		return nil, false, err
+	}
+	var position uint64
+	if v.journal != nil {
+		_, position, _ = v.journal.State()
+		state.Pending[len(state.Pending)-1].JournalSequence = position
+		if err := saveVolumeState(v.dir, state); err != nil {
+			thaw()
+			v.rollbackSeal(previousState, newHeadPath)
+			return nil, false, err
+		}
+	}
+	pivotErr := client.pivot(ctx, v.fmtNode, newNode)
+	thaw()
+
+	if pivotErr != nil {
+		// The monitor accepts one connection. Release the failed connection
+		// before resolving the transaction, even when its caller was cancelled.
+		client.Close()
+		recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), qmpDialTimeout)
+		err := v.reconcileHeadNode(recovery)
+		cancel()
+		if err != nil {
+			// Preserve the intent and both files until the live graph is known.
+			return nil, false, errors.Join(pivotErr, err)
+		}
+		if v.fmtNode != newNode {
+			return nil, false, fmt.Errorf("pivot volume %s: %w", state.Key, pivotErr)
+		}
+	}
+
+	v.fmtNode = newNode
+	v.freshHead = true
+	if v.journal != nil {
+		// Thawing the host-mounted ext4 rewrites its superblock with FUA
+		// before any writer resumes, so the first commit after the seal is
+		// that block alone. A larger one would carry writes, which count.
+		v.thawed = position
+		if first, ok := v.journal.firstAfter(position); ok && state.exportMode() == ExportNBD && first.Bytes <= thawCommitBytes {
+			v.thawed = first.Sequence
+		}
+	}
+	return v.sealedLayers(), false, nil
+}
+
+// thawCommitBytes bounds the journal commit of an ext4 thaw: one record (an
+// 8-byte offset and a 4-byte length) holding the block with the superblock.
+const thawCommitBytes = 12 + 4096
+
+// ErrMaxChainDepth is returned by Seal when the local backing chain is at its
+// cap. Compaction follows a publish, so only failed compactions or publishes
+// leave a chain there, and nothing more seals until it shrinks.
+var ErrMaxChainDepth = errors.New("layers are not being compacted or published")
+
+// Unpublished resolves an uncertain pivot before returning the immutable
+// layers awaiting publication, oldest first, without sealing another.
+func (v *Volume) Unpublished(ctx context.Context) ([]SealedLayer, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.fmtNode != fmtNodeName(v.state.PivotCount) {
+		if err := v.reconcileHeadNode(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return v.sealedLayers(), nil
+}
+
+func (v *Volume) sealedLayers() []SealedLayer {
+	state := v.state
+	sealed := make([]SealedLayer, 0, len(state.Pending))
+	parentID := ""
+	if n := len(state.Chain); n > 0 {
+		parentID = state.Chain[n-1].SnapshotID
+	}
+	for i, layer := range state.Pending {
+		if i > 0 {
+			parentID = ""
+		}
+		sealed = append(sealed, SealedLayer{Path: layer.Path, ParentSnapshotID: parentID})
+	}
+	return sealed
+}
+
+// quiesceFlushing quiesces the head with its journal letting writes past its
+// limits until the returned thaw has run. The freeze flushes every dirty page
+// through the journal and the thaw rewrites the superblock before writers
+// resume; the seal waits for both, so neither can wait for the room the seal
+// is about to make. Writes after the thaw wait like any other. Flushes the
+// proxy answered early are committed before it returns, so the journal
+// position the seal records covers everything in the frozen head.
+func (v *Volume) quiesceFlushing(ctx context.Context) (func(), error) {
+	if v.journal == nil {
+		return v.quiesce(ctx)
+	}
+	v.journal.Flushing(true)
+	thaw, err := v.quiesce(ctx)
+	if err == nil && v.journalNBD != nil {
+		if err = v.journalNBD.CommitAnswered(); err != nil {
+			thaw()
+		}
+	}
+	if err != nil {
+		v.journal.Flushing(false)
+		return nil, err
+	}
+	return func() {
+		thaw()
+		v.journal.Flushing(false)
+	}, nil
+}
+
+// quiesce freezes the head's filesystem for the pivot: host fsfreeze for an
+// NBD mount, the consumer's Freeze hook for a vhost-user export.
+func (v *Volume) quiesce(ctx context.Context) (func(), error) {
+	if v.state.exportMode() == ExportVhostUser {
+		if v.freeze == nil {
+			return func() {}, nil
+		}
+		return v.freeze(ctx)
+	}
+	return v.manager.freezeFS(ctx, v.state.Mountpoint)
+}
+
+func (v *Volume) rollbackSeal(previous volumeState, newHeadPath string) {
+	*v.state = previous
+	if err := saveVolumeState(v.dir, v.state); err != nil {
+		log.Error().Str("volume", v.state.Key).Err(err).Msg("failed to roll back seal state")
+		return
+	}
+	os.Remove(newHeadPath)
+}
+
+// reconcileHeadNode aligns adopted state with the daemon's actual graph. A
+// crash between recording a seal intent and committing the pivot leaves the
+// state one pivot ahead of the daemon; the intent is rolled back so writes
+// continue landing in the layer the daemon is actually using. The overlay
+// node may already exist without being wired in (crash between blockdev-add
+// and the pivot transaction), which counts as uncommitted.
+func (v *Volume) reconcileHeadNode(ctx context.Context) error {
+	client, err := dialQMP(ctx, v.state.QMPSocket)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	nodes, err := client.namedBlockNodes(ctx)
+	if err != nil {
+		return err
+	}
+	expected := fmtNodeName(v.state.PivotCount)
+	if node, ok := nodes[expected]; ok {
+		// A pivot intent (Pending non-empty) is only committed once the
+		// overlay has a backing chain; a base head never has one.
+		if len(v.state.Pending) == 0 || node.BackingFileDepth > 0 {
+			v.fmtNode = expected
+			return nil
+		}
+		if err := client.removeNode(ctx, expected); err != nil {
+			return err
+		}
+	}
+
+	previousNode := fmtNodeName(v.state.PivotCount - 1)
+	if _, ok := nodes[previousNode]; !ok || len(v.state.Pending) == 0 {
+		return fmt.Errorf("daemon graph has neither %s nor %s", expected, previousNode)
+	}
+	orphanHead := v.state.HeadPath
+	last := len(v.state.Pending) - 1
+	v.state.HeadPath = v.state.Pending[last].Path
+	v.state.Pending = v.state.Pending[:last]
+	v.state.PivotCount--
+	v.fmtNode = previousNode
+	if err := saveVolumeState(v.dir, v.state); err != nil {
+		return err
+	}
+	v.fmtNode = previousNode
+	os.Remove(orphanHead)
+	log.Warn().Str("volume", v.state.Key).Msg("rolled back uncommitted pivot intent during adoption")
+	return nil
+}
+
+// ErrNotCheckpointed reports that MarkPublished did not record a published
+// layer as its journal's checkpoint. The journal, not the snapshot catalog,
+// decides what a journaled disk restores, so the snapshot must not stand as
+// the disk's latest generation.
+var ErrNotCheckpointed = errors.New("published layer is not the journal's checkpoint")
+
+// MarkPublished records that a sealed layer was durably published as the
+// given snapshot, moving it from the pending list into the chain.
+func (v *Volume) MarkPublished(sealedPath, snapshotID string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.state.Pending) == 0 || v.state.Pending[0].Path != sealedPath {
+		err := fmt.Errorf("sealed layer %s is not the oldest pending layer of volume %s", sealedPath, v.state.Key)
+		if v.journal != nil {
+			return fmt.Errorf("%w: %w", ErrNotCheckpointed, err)
+		}
+		return err
+	}
+	if v.journal != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), journalLease)
+		defer cancel()
+		if err := v.journal.Checkpoint(ctx, v.state.Pending[0].JournalSequence, snapshotID); err != nil {
+			return fmt.Errorf("%w: %w", ErrNotCheckpointed, err)
+		}
+	}
+	v.state.Chain = append(v.state.Chain, stateLayer{SnapshotID: snapshotID, Path: sealedPath})
+	v.state.Pending = v.state.Pending[1:]
+	return saveVolumeState(v.dir, v.state)
+}
+
+// Flatten collapses a sealed layer and its whole backing chain into one
+// parentless image at destPath, used to bound published chain depth.
+func (v *Volume) Flatten(ctx context.Context, sealedPath, destPath string) error {
+	return v.manager.flattenQcow(ctx, sealedPath, destPath)
+}
+
+// Compact folds every published layer into the base image with a live
+// intermediate block-commit; the daemon keeps serving I/O. Pending layers are
+// deltas the publisher still needs byte-for-byte, so compaction waits until
+// the whole chain is published.
+func (v *Volume) Compact(ctx context.Context) error {
+	_, err := v.merge(ctx, 0, false)
+	return err
+}
+
+// PublishedLayer is a layer of the local published chain.
+type PublishedLayer struct {
+	SnapshotID string
+	Path       string
+}
+
+// Published returns the local published chain, base first, and whether
+// sealed layers wait to be published above it.
+func (v *Volume) Published() ([]PublishedLayer, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	layers := make([]PublishedLayer, len(v.state.Chain))
+	for i, layer := range v.state.Chain {
+		layers[i] = PublishedLayer{SnapshotID: layer.SnapshotID, Path: layer.Path}
+	}
+	return layers, len(v.state.Pending) > 0
+}
+
+// Merge commits the published layers above layer first into it, like
+// Compact, and returns the merged layer, which takes the newest one's
+// snapshot ID. Nobody waits for a merge, so the daemon's commit is cancelled
+// with ctx; what a cancelled commit wrote stays shadowed by its source layers.
+func (v *Volume) Merge(ctx context.Context, first int) (PublishedLayer, error) {
+	return v.merge(ctx, first, true)
+}
+
+func (v *Volume) merge(ctx context.Context, first int, cancel bool) (PublishedLayer, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	state := v.state
+	last := len(state.Chain) - 1
+	if !state.Attached || state.ReadOnly || len(state.Pending) > 0 || first < 0 || first >= last {
+		return PublishedLayer{}, nil
+	}
+
+	client, err := dialQMP(ctx, state.QMPSocket)
+	if err != nil {
+		return PublishedLayer{}, err
+	}
+	defer client.Close()
+	if err := client.finishCommitJobs(ctx); err != nil {
+		return PublishedLayer{}, fmt.Errorf("finish compaction for volume %s: %w", state.Key, err)
+	}
+
+	// The live graph decides what needs merging: a crash after a completed
+	// commit but before the state save leaves the files already merged.
+	live, err := client.backingFilenames(ctx, v.fmtNode)
+	if err != nil {
+		return PublishedLayer{}, err
+	}
+	base, top, err := state.committedRun(live)
+	if err != nil {
+		return PublishedLayer{}, fmt.Errorf("merge layers of volume %s: %w", state.Key, err)
+	}
+	if top < 0 {
+		base, top = first, last
+		if err := client.commitChain(ctx, v.fmtNode, state.Chain[top].Path, state.Chain[base].Path); err != nil {
+			if cancel && ctx.Err() != nil {
+				client.Close()
+				err = errors.Join(err, cancelCommitJobs(state.QMPSocket))
+			}
+			return PublishedLayer{}, fmt.Errorf("merge layers of volume %s: %w", state.Key, err)
+		}
+	}
+	if err := client.releaseUnusedNodes(ctx, v.fmtNode); err != nil {
+		return PublishedLayer{}, fmt.Errorf("merge layers of volume %s: %w", state.Key, err)
+	}
+	if err := client.checkReadOnly(ctx, state.Chain[base].Path); err != nil {
+		return PublishedLayer{}, fmt.Errorf("merge layers of volume %s: %w", state.Key, err)
+	}
+
+	// A partially committed base stays invisible behind the intact overlays,
+	// so merged files are deleted only after the collapsed state is durable.
+	merged := state.Chain[base+1 : top+1]
+	layer := stateLayer{SnapshotID: state.Chain[top].SnapshotID, Path: state.Chain[base].Path}
+	state.Chain = slices.Concat(state.Chain[:base], []stateLayer{layer}, state.Chain[top+1:])
+	if err := saveVolumeState(v.dir, state); err != nil {
+		return PublishedLayer{}, err
+	}
+	for _, old := range merged {
+		os.Remove(old.Path)
+	}
+	log.Info().Str("volume", state.Key).Int("base", base).Int("layers", len(merged)+1).Msg("merged qcow layers")
+	return PublishedLayer{SnapshotID: layer.SnapshotID, Path: layer.Path}, nil
+}
+
+// committedRun finds published layers missing from the live graph, which a
+// commit whose state save was lost merged into the nearest live layer below.
+// It returns that layer's index and the newest merged one's, or top -1.
+func (s *volumeState) committedRun(live map[string]bool) (base, top int, err error) {
+	base, top = -1, -1
+	for i, layer := range s.Chain {
+		switch {
+		case !live[layer.Path] && i == 0:
+			return 0, 0, fmt.Errorf("base layer %s is not in the live chain", layer.Path)
+		case !live[layer.Path]:
+			top = i
+		case top >= 0:
+			return base, top, nil
+		default:
+			base = i
+		}
+	}
+	return base, top, nil
+}
+
+// Republished records that a merge republished generations under new IDs,
+// old to new. An attach naming an old ID still reuses the local chain. A
+// failed save changes nothing.
+func (v *Volume) Republished(ids map[string]string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	state := *v.state
+	state.Chain = slices.Clone(state.Chain)
+	state.Superseded = slices.Clone(state.Superseded)
+	for i, layer := range state.Chain {
+		if id, ok := ids[layer.SnapshotID]; ok {
+			state.supersede(layer.SnapshotID, id)
+			state.Chain[i].SnapshotID = id
+		}
+	}
+	if err := saveVolumeState(v.dir, &state); err != nil {
+		return err
+	}
+	*v.state = state
+	return nil
+}
+
+// detach unmounts, disconnects, and stops the daemon. Layer files and state
+// stay behind for reuse by the next attachment.
+func (v *Volume) detach(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.state.Attached {
+		return nil
+	}
+
+	if v.state.exportMode() == ExportVhostUser {
+		if err := v.manager.stopQSD(ctx, v.qsd); err != nil {
+			return err
+		}
+		v.qsd = nil
+		v.state.Attached = false
+		v.state.QSDPid = 0
+		v.state.QMPSocket = ""
+		v.state.ExportSocket = ""
+		if err := saveVolumeState(v.dir, v.state); err != nil {
+			return err
+		}
+		return os.RemoveAll(v.manager.runtimeDir(v.state.Key))
+	}
+
+	// Nothing checkpoints a detaching volume, so the unmount's flush cannot
+	// wait for room; the next owner recovers what it adds.
+	if v.journal != nil {
+		v.journal.Flushing(true)
+		defer v.journal.Flushing(false)
+	}
+	if err := v.manager.unmount(ctx, v.state.Mountpoint); err != nil {
+		return err
+	}
+	var disconnectErr error
+	if v.nbd != nil {
+		if err := v.manager.disconnectNBDDevice(ctx, v.nbd); err != nil {
+			disconnectErr = err
+		} else {
+			v.nbd = nil
+		}
+	}
+	if v.journalNBD != nil {
+		v.journalNBD.Close()
+		v.journalNBD = nil
+	}
+	var journalErr error
+	if v.journal != nil {
+		journalErr = v.journal.Close()
+	}
+	stopErr := v.manager.stopQSD(ctx, v.qsd)
+	if stopErr == nil {
+		v.qsd = nil
+	}
+	// A dead daemon closes its NBD socket. If that cleared a failed
+	// disconnect, allow the state to be finalized instead of leaking it.
+	if v.nbd != nil && !v.manager.nbdDeviceBusy(v.nbd.name) {
+		v.nbd = nil
+		disconnectErr = nil
+	}
+	if err := errors.Join(disconnectErr, stopErr); err != nil {
+		return errors.Join(err, journalErr)
+	}
+
+	v.state.Attached = false
+	v.state.QSDPid = 0
+	v.state.QMPSocket = ""
+	v.state.NBDSocket = ""
+	v.state.NBDDevice = ""
+	if err := saveVolumeState(v.dir, v.state); err != nil {
+		return errors.Join(err, journalErr)
+	}
+	return errors.Join(journalErr, os.RemoveAll(v.manager.runtimeDir(v.state.Key)))
+}

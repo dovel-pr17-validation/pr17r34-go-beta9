@@ -1,0 +1,241 @@
+package scheduler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/google/uuid"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+const (
+	Beta9WorkerLabelKey         string  = "run.beam.cloud/role"
+	Beta9WorkerLabelValue       string  = "worker"
+	Beta9WorkerJobPrefix        string  = "worker"
+	Beta9MachineLabelIDKey      string  = "run.beam.cloud/machine-id"
+	Beta9WorkerLabelIDKey       string  = "run.beam.cloud/worker-id"
+	Beta9WorkerLabelPoolNameKey string  = "run.beam.cloud/worker-pool-name"
+	PrometheusPortKey           string  = "prometheus.io/port"
+	PrometheusScrapeKey         string  = "prometheus.io/scrape"
+	tmpVolumeName               string  = "beta9-tmp"
+	imagesVolumeName            string  = "beta9-images"
+	cacheVolumeName             string  = "beta9-cache"
+	durableDiskVolumeName       string  = "beta9-durable-disks"
+	kernelModulesVolumeName     string  = "host-kernel-modules"
+	devicePluginVolumeName      string  = "kubelet-device-plugins"
+	defaultDevicePluginPath     string  = "/var/lib/kubelet/device-plugins"
+	defaultContainerName        string  = "worker"
+	defaultWorkerInit           string  = "/usr/bin/tini"
+	defaultWorkerEntrypoint     string  = "/usr/local/bin/worker"
+	defaultImagesPath           string  = "/images"
+	defaultCachePath            string  = "/var/lib/beta9/cache"
+	defaultSharedMemoryPct      float32 = 0.5
+	defaultWorkerStopGraceS     int64   = 30
+	minWorkerPodGraceS          int64   = 120
+	poolMonitoringInterval              = 1 * time.Second
+	poolHealthCheckInterval             = 10 * time.Second
+)
+
+func workerPodCommand() []string {
+	return []string{defaultWorkerInit, "-g", "--", defaultWorkerEntrypoint}
+}
+
+type WorkerPoolController interface {
+	AddWorker(cpu int64, memory int64, gpuCount uint32) (*types.Worker, error)
+	AddWorkerToMachine(cpu int64, memory int64, gpuType string, gpuCount uint32, machineId string) (*types.Worker, error)
+	Name() string
+	FreeCapacity() (*WorkerPoolCapacity, error)
+	Context() context.Context
+	IsPreemptable() bool
+	State() (*types.WorkerPoolState, error)
+	RequiresPoolSelector() bool
+	Mode() types.PoolMode
+	ContainerRuntime() string
+}
+
+type WorkerPoolConfig struct {
+	DefaultWorkerCpuRequest    int64
+	DefaultWorkerMemoryRequest int64
+}
+
+type WorkerPoolCapacity struct {
+	FreeCpu       int64
+	FreeMemory    int64
+	FreeGpu       uint
+	PendingCpu    int64
+	PendingMemory int64
+	PendingGpu    uint
+}
+
+type WorkerPoolControllerOptions struct {
+	Name            string
+	Context         context.Context
+	Config          types.AppConfig
+	BackendRepo     repository.BackendRepository
+	WorkerRepo      repository.WorkerRepository
+	WorkerPoolRepo  repository.WorkerPoolRepository
+	ContainerRepo   repository.ContainerRepository
+	EventRepo       repository.EventRepository
+	PushPoolMetrics func(types.EventComputeSchema)
+}
+
+func GenerateWorkerId() string {
+	return uuid.New().String()[:8]
+}
+
+func workerCacheEnabled(config types.AppConfig, poolConfig types.WorkerPoolConfig) bool {
+	if !config.Cache.Enabled || !config.Worker.CacheEnabled {
+		return false
+	}
+	if poolConfig.Cache.Enabled != nil && !*poolConfig.Cache.Enabled {
+		return false
+	}
+	if poolConfig.Cache.Disk.Enabled != nil {
+		return *poolConfig.Cache.Disk.Enabled
+	}
+	return config.Cache.Disk.Enabled
+}
+
+// workerImagesHostPath returns the host path backing the worker's /images
+// volume (clip decompressed-layer disk cache, layer index artifacts, and
+// image mounts). Pools can override it to place the cache on a different
+// host disk; the in-pod mount path stays /images.
+func workerImagesHostPath(poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.ImagesPath != "" {
+		return poolConfig.ImagesPath
+	}
+	return defaultImagesPath
+}
+
+func workerDurableDisksHostPath(poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.DurableDisksPath != "" {
+		return poolConfig.DurableDisksPath
+	}
+	if poolConfig.StoragePath != "" {
+		return filepath.Join(poolConfig.StoragePath, "durable-disks")
+	}
+	return types.DefaultDurableDisksPath
+}
+
+func workerCacheHostPath(config types.AppConfig, poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.Cache.Disk.HostPath != "" {
+		return poolConfig.Cache.Disk.HostPath
+	}
+	if config.Cache.Disk.HostPath != "" {
+		return config.Cache.Disk.HostPath
+	}
+	return defaultCachePath
+}
+
+func workerCacheMountPath(config types.AppConfig, poolConfig types.WorkerPoolConfig) string {
+	if poolConfig.Cache.Disk.MountPath != "" {
+		return poolConfig.Cache.Disk.MountPath
+	}
+	if config.Cache.Disk.MountPath != "" {
+		return config.Cache.Disk.MountPath
+	}
+	return defaultCachePath
+}
+
+func workerPodTerminationGracePeriod(workerStopGraceS int64) int64 {
+	if workerStopGraceS <= 0 {
+		workerStopGraceS = defaultWorkerStopGraceS
+	}
+
+	// Covers task drain, forced nested-container stop, and FUSE unmounts.
+	grace := types.WorkerShutdownGraceSeconds(workerStopGraceS)
+	if grace < minWorkerPodGraceS {
+		return minWorkerPodGraceS
+	}
+	return grace
+}
+
+func MonitorPoolSize(wpc WorkerPoolController,
+	config types.AppConfig,
+	workerPoolConfig *types.WorkerPoolConfig,
+	workerPoolRepo repository.WorkerPoolRepository) error {
+	poolSizer, err := NewWorkerPoolSizer(wpc, config, workerPoolConfig, workerPoolRepo)
+	if err != nil {
+		return err
+	}
+
+	go poolSizer.Start()
+	return nil
+}
+
+func MonitorPoolHealth(opts PoolHealthMonitorOptions) error {
+	poolHealthMonitor := NewPoolHealthMonitor(opts)
+	go poolHealthMonitor.Start()
+	return nil
+}
+
+func freePoolCapacity(workerRepo repository.WorkerRepository, poolName string) (*WorkerPoolCapacity, error) {
+	workers, err := workerRepo.GetAllWorkersInPool(poolName)
+	if err != nil {
+		return nil, err
+	}
+	return poolCapacityFromWorkers(workers), nil
+}
+
+// poolCapacityFromWorkers sums schedulable capacity across a pool's workers.
+func poolCapacityFromWorkers(workers []*types.Worker) *WorkerPoolCapacity {
+	capacity := &WorkerPoolCapacity{
+		FreeCpu:    0,
+		FreeMemory: 0,
+		FreeGpu:    0,
+	}
+
+	for _, worker := range workers {
+		switch worker.Status {
+		case types.WorkerStatusDisabled:
+			continue
+		case types.WorkerStatusPending:
+			capacity.PendingCpu += worker.FreeCpu
+			capacity.PendingMemory += worker.FreeMemory
+			if worker.Gpu != "" && worker.FreeCpu > 0 && worker.FreeMemory > 0 {
+				capacity.PendingGpu += uint(worker.TotalGpuCount)
+			}
+		default:
+			// Physical idle capacity only: a GPU held by a managed endpoint
+			// replica does not satisfy the minimum-free floor.
+			capacity.FreeCpu += worker.FreeCpu
+			capacity.FreeMemory += worker.FreeMemory
+			if worker.Gpu != "" && (worker.FreeCpu > 0 && worker.FreeMemory > 0) {
+				capacity.FreeGpu += uint(worker.FreeGpuCount)
+			}
+		}
+	}
+
+	return capacity
+}
+
+func calculateMemoryQuantity(percentStr string, memoryTotal int64) resource.Quantity {
+	percent, err := parseMemoryPercentage(percentStr)
+	if err != nil {
+		percent = defaultSharedMemoryPct
+	}
+
+	return resource.MustParse(fmt.Sprintf("%dMi", int64(float32(memoryTotal)*percent)))
+}
+
+func parseMemoryPercentage(percentStr string) (float32, error) {
+	ps := strings.TrimSuffix(percentStr, "%")
+
+	percent, err := strconv.ParseFloat(ps, 32)
+	if err != nil {
+		return 0, err
+	}
+
+	if percent <= 0 {
+		return 0, errors.New("percent must be greater than 0")
+	}
+
+	return float32(percent) / 100, nil
+}

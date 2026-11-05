@@ -1,0 +1,462 @@
+syntax = "proto3";
+
+option go_package = "github.com/beam-cloud/beta9/proto";
+
+package pod;
+
+import "types.proto";
+import "google/api/annotations.proto";
+
+service PodService {
+  rpc CreatePod(CreatePodRequest) returns (CreatePodResponse) {
+    option (google.api.http) = {
+      post : "/pods"
+      body : "*"
+    };
+  }
+  rpc SandboxExec(PodSandboxExecRequest) returns (PodSandboxExecResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/exec"
+      body : "*"
+    };
+  }
+  rpc SandboxStatus(PodSandboxStatusRequest)
+      returns (PodSandboxStatusResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/status"
+    };
+  }
+  rpc SandboxStdout(PodSandboxStdoutRequest)
+      returns (PodSandboxStdoutResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/stdout"
+    };
+  }
+  rpc SandboxStderr(PodSandboxStderrRequest)
+      returns (PodSandboxStderrResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/stderr"
+    };
+  }
+  rpc SandboxKill(PodSandboxKillRequest) returns (PodSandboxKillResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/kill"
+      body : "*"
+    };
+  }
+  rpc SandboxListProcesses(PodSandboxListProcessesRequest)
+      returns (PodSandboxListProcessesResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/processes"
+    };
+  }
+  rpc SandboxUploadFile(PodSandboxUploadFileRequest)
+      returns (PodSandboxUploadFileResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/files/upload"
+      body : "*"
+    };
+  }
+  rpc SandboxDownloadFile(PodSandboxDownloadFileRequest)
+      returns (PodSandboxDownloadFileResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/files/download/{container_path=**}"
+    };
+  }
+  rpc SandboxStatFile(PodSandboxStatFileRequest)
+      returns (PodSandboxStatFileResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/files/stat"
+    };
+  }
+  rpc SandboxListFiles(PodSandboxListFilesRequest)
+      returns (PodSandboxListFilesResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/files"
+    };
+  }
+  rpc SandboxDeleteFile(PodSandboxDeleteFileRequest)
+      returns (PodSandboxDeleteFileResponse) {
+    option (google.api.http) = {
+      delete : "/pods/{container_id}/files/{container_path=**}"
+    };
+  }
+  rpc SandboxCreateDirectory(PodSandboxCreateDirectoryRequest)
+      returns (PodSandboxCreateDirectoryResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/directories"
+      body : "*"
+    };
+  }
+  rpc SandboxDeleteDirectory(PodSandboxDeleteDirectoryRequest)
+      returns (PodSandboxDeleteDirectoryResponse) {
+    option (google.api.http) = {
+      delete : "/pods/{container_id}/directories/{container_path=**}"
+    };
+  }
+  rpc SandboxExposePort(PodSandboxExposePortRequest)
+      returns (PodSandboxExposePortResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/ports/expose"
+      body : "*"
+    };
+  }
+  rpc SandboxUpdateNetworkPermissions(PodSandboxUpdateNetworkPermissionsRequest)
+      returns (PodSandboxUpdateNetworkPermissionsResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/network/update"
+      body : "*"
+    };
+  }
+  rpc SandboxReplaceInFiles(PodSandboxReplaceInFilesRequest)
+      returns (PodSandboxReplaceInFilesResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/files/replace"
+      body : "*"
+    };
+  }
+  rpc SandboxFindInFiles(PodSandboxFindInFilesRequest)
+      returns (PodSandboxFindInFilesResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/files/find"
+      body : "*"
+    };
+  }
+  rpc SandboxConnect(PodSandboxConnectRequest)
+      returns (PodSandboxConnectResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/connect"
+      body : "*"
+    };
+  }
+  rpc SandboxUpdateTTL(PodSandboxUpdateTTLRequest)
+      returns (PodSandboxUpdateTTLResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/ttl"
+      body : "*"
+    };
+  }
+  rpc SandboxCreateImageFromFilesystem(
+      PodSandboxCreateImageFromFilesystemRequest)
+      returns (PodSandboxCreateImageFromFilesystemResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/create-image-from-filesystem"
+      body : "*"
+    };
+  }
+  rpc SandboxSnapshotMemory(PodSandboxSnapshotMemoryRequest)
+      returns (PodSandboxSnapshotMemoryResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/snapshot-memory"
+      body : "*"
+    };
+  }
+  rpc SandboxSnapshotDisks(PodSandboxSnapshotDisksRequest)
+      returns (PodSandboxSnapshotDisksResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/snapshot-disks"
+      body : "*"
+    };
+  }
+  rpc SandboxListUrls(PodSandboxListUrlsRequest)
+      returns (PodSandboxListUrlsResponse) {
+    option (google.api.http) = {
+      get : "/pods/{container_id}/urls"
+    };
+  }
+}
+
+message CreatePodRequest {
+  string stub_id = 1;
+  optional string image_id = 2;
+  optional string checkpoint_id = 3;
+  optional string machine_id = 4;
+}
+
+message CreatePodResponse {
+  bool ok = 1;
+  string container_id = 2;
+  string error_msg = 3;
+  string stub_id = 4;
+  string task_id = 5;
+  string app_id = 6;
+}
+
+message PodSandboxExecRequest {
+  string container_id = 1;
+  string command = 2;
+  string cwd = 3;
+  map<string, string> env = 4;
+  bool wait = 5;
+  // Secret names to resolve in the authenticated workspace.
+  repeated string secrets = 6;
+}
+
+message PodSandboxExecResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  int32 pid = 3;
+  bool done = 4;
+  int32 exit_code = 5;
+  string stdout = 6;
+  string stderr = 7;
+}
+
+message PodSandboxStatusRequest {
+  string container_id = 1;
+  int32 pid = 2;
+}
+
+message PodSandboxStatusResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string status = 3;
+  int32 exit_code = 4;
+}
+
+message PodSandboxStdoutRequest {
+  string container_id = 1;
+  int32 pid = 2;
+}
+
+message PodSandboxStdoutResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string stdout = 3;
+}
+
+message PodSandboxStderrRequest {
+  string container_id = 1;
+  int32 pid = 2;
+}
+
+message PodSandboxStderrResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string stderr = 3;
+}
+
+message PodSandboxKillRequest {
+  string container_id = 1;
+  int32 pid = 2;
+}
+
+message PodSandboxKillResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxUploadFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+  int32 mode = 3;
+  bytes data = 4;
+  int64 offset = 5; // Zero starts a new file; nonzero offsets overwrite a chunk.
+}
+
+message PodSandboxUploadFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxDownloadFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+  int64 offset = 3;
+  int32 length = 4; // Zero preserves the legacy whole-file download.
+}
+
+message PodSandboxDownloadFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  bytes data = 3;
+}
+
+message PodSandboxListFilesRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message PodSandboxListFilesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated PodSandboxFileInfo files = 3;
+}
+
+message PodSandboxDeleteFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message PodSandboxDeleteFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxCreateDirectoryRequest {
+  string container_id = 1;
+  string container_path = 2;
+  int32 mode = 3;
+}
+
+message PodSandboxCreateDirectoryResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxDeleteDirectoryRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message PodSandboxDeleteDirectoryResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxStatFileRequest {
+  string container_id = 1;
+  string container_path = 2;
+}
+
+message PodSandboxStatFileResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  PodSandboxFileInfo file_info = 3;
+}
+
+message PodSandboxFileInfo {
+  int32 mode = 1;
+  int64 size = 2;
+  int64 mod_time = 3;
+  string owner = 4;
+  string group = 5;
+  bool is_dir = 6;
+  string name = 7;
+  uint32 permissions = 8;
+}
+
+message PodSandboxReplaceInFilesRequest {
+  string container_id = 1;
+  string container_path = 2;
+  string pattern = 3;
+  string new_string = 4;
+}
+
+message PodSandboxReplaceInFilesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxExposePortRequest {
+  string container_id = 1;
+  string stub_id = 2;
+  int32 port = 3;
+}
+
+message PodSandboxExposePortResponse {
+  bool ok = 1;
+  string url = 2;
+  string error_msg = 3;
+}
+
+message PodSandboxUpdateNetworkPermissionsRequest {
+  string container_id = 1;
+  string stub_id = 2;
+  bool block_network = 3;
+  repeated string allow_list = 4;
+}
+
+message PodSandboxUpdateNetworkPermissionsResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxFindInFilesRequest {
+  string container_id = 1;
+  string container_path = 2;
+  string pattern = 3;
+}
+
+message PodSandboxFindInFilesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated types.FileSearchResult results = 3;
+}
+
+message PodSandboxConnectRequest { string container_id = 1; }
+
+message PodSandboxConnectResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string stub_id = 3;
+}
+
+message PodSandboxUpdateTTLRequest {
+  string container_id = 1;
+  int32 ttl = 2;
+}
+
+message PodSandboxUpdateTTLResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message PodSandboxCreateImageFromFilesystemRequest {
+  string stub_id = 1;
+  string container_id = 2;
+}
+
+message PodSandboxCreateImageFromFilesystemResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string image_id = 3;
+}
+
+message PodSandboxSnapshotMemoryRequest {
+  string stub_id = 1;
+  string container_id = 2;
+  bool terminate_after_checkpoint = 3;
+}
+
+message PodSandboxSnapshotMemoryResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  string checkpoint_id = 3;
+  string runtime = 4;
+  // Durable disk snapshots captured at the same boundary as the memory image.
+  repeated PodSandboxDiskSnapshot disk_snapshots = 5;
+}
+
+message PodSandboxSnapshotDisksRequest {
+  string stub_id = 1;
+  string container_id = 2;
+}
+
+message PodSandboxDiskSnapshot {
+  string snapshot_id = 1;
+  string disk_name = 2;
+  int64 generation = 3;
+}
+
+message PodSandboxSnapshotDisksResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated PodSandboxDiskSnapshot snapshots = 3;
+}
+
+message PodSandboxListProcessesRequest { string container_id = 1; }
+
+message PodSandboxListProcessesResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  repeated types.ProcessInfo processes = 3;
+}
+
+message PodSandboxListUrlsRequest { string container_id = 1; }
+
+message PodSandboxListUrlsResponse {
+  bool ok = 1;
+  map<int32, string> urls = 2;
+  string error_msg = 3;
+}

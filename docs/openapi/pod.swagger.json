@@ -1,0 +1,1620 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "pod.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "PodService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/pods": {
+      "post": {
+        "operationId": "PodService_CreatePod",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podCreatePodResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/podCreatePodRequest"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/connect": {
+      "post": {
+        "operationId": "PodService_SandboxConnect",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxConnectResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxConnectBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/create-image-from-filesystem": {
+      "post": {
+        "operationId": "PodService_SandboxCreateImageFromFilesystem",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxCreateImageFromFilesystemResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxCreateImageFromFilesystemBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/directories": {
+      "post": {
+        "operationId": "PodService_SandboxCreateDirectory",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxCreateDirectoryResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxCreateDirectoryBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/directories/{containerPath}": {
+      "delete": {
+        "operationId": "PodService_SandboxDeleteDirectory",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxDeleteDirectoryResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "containerPath",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": ".+"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/exec": {
+      "post": {
+        "operationId": "PodService_SandboxExec",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxExecResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxExecBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/files": {
+      "get": {
+        "operationId": "PodService_SandboxListFiles",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxListFilesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "containerPath",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/files/download/{containerPath}": {
+      "get": {
+        "operationId": "PodService_SandboxDownloadFile",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxDownloadFileResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "containerPath",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": ".+"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "int64"
+          },
+          {
+            "name": "length",
+            "description": "Zero preserves the legacy whole-file download.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/files/find": {
+      "post": {
+        "operationId": "PodService_SandboxFindInFiles",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxFindInFilesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxFindInFilesBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/files/replace": {
+      "post": {
+        "operationId": "PodService_SandboxReplaceInFiles",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxReplaceInFilesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxReplaceInFilesBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/files/stat": {
+      "get": {
+        "operationId": "PodService_SandboxStatFile",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxStatFileResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "containerPath",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/files/upload": {
+      "post": {
+        "operationId": "PodService_SandboxUploadFile",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxUploadFileResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxUploadFileBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/files/{containerPath}": {
+      "delete": {
+        "operationId": "PodService_SandboxDeleteFile",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxDeleteFileResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "containerPath",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": ".+"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/kill": {
+      "post": {
+        "operationId": "PodService_SandboxKill",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxKillResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxKillBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/network/update": {
+      "post": {
+        "operationId": "PodService_SandboxUpdateNetworkPermissions",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxUpdateNetworkPermissionsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxUpdateNetworkPermissionsBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/ports/expose": {
+      "post": {
+        "operationId": "PodService_SandboxExposePort",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxExposePortResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxExposePortBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/processes": {
+      "get": {
+        "operationId": "PodService_SandboxListProcesses",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxListProcessesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/snapshot-disks": {
+      "post": {
+        "operationId": "PodService_SandboxSnapshotDisks",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxSnapshotDisksResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxSnapshotDisksBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/snapshot-memory": {
+      "post": {
+        "operationId": "PodService_SandboxSnapshotMemory",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxSnapshotMemoryResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxSnapshotMemoryBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/status": {
+      "get": {
+        "operationId": "PodService_SandboxStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pid",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/stderr": {
+      "get": {
+        "operationId": "PodService_SandboxStderr",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxStderrResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pid",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/stdout": {
+      "get": {
+        "operationId": "PodService_SandboxStdout",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxStdoutResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "pid",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/ttl": {
+      "post": {
+        "operationId": "PodService_SandboxUpdateTTL",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxUpdateTTLResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PodServiceSandboxUpdateTTLBody"
+            }
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    },
+    "/pods/{containerId}/urls": {
+      "get": {
+        "operationId": "PodService_SandboxListUrls",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/podPodSandboxListUrlsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "PodService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "PodServiceSandboxConnectBody": {
+      "type": "object"
+    },
+    "PodServiceSandboxCreateDirectoryBody": {
+      "type": "object",
+      "properties": {
+        "containerPath": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "PodServiceSandboxCreateImageFromFilesystemBody": {
+      "type": "object",
+      "properties": {
+        "stubId": {
+          "type": "string"
+        }
+      }
+    },
+    "PodServiceSandboxExecBody": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "wait": {
+          "type": "boolean"
+        },
+        "secrets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Secret names to resolve in the authenticated workspace."
+        }
+      }
+    },
+    "PodServiceSandboxExposePortBody": {
+      "type": "object",
+      "properties": {
+        "stubId": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "PodServiceSandboxFindInFilesBody": {
+      "type": "object",
+      "properties": {
+        "containerPath": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        }
+      }
+    },
+    "PodServiceSandboxKillBody": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "PodServiceSandboxReplaceInFilesBody": {
+      "type": "object",
+      "properties": {
+        "containerPath": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "newString": {
+          "type": "string"
+        }
+      }
+    },
+    "PodServiceSandboxSnapshotDisksBody": {
+      "type": "object",
+      "properties": {
+        "stubId": {
+          "type": "string"
+        }
+      }
+    },
+    "PodServiceSandboxSnapshotMemoryBody": {
+      "type": "object",
+      "properties": {
+        "stubId": {
+          "type": "string"
+        },
+        "terminateAfterCheckpoint": {
+          "type": "boolean"
+        }
+      }
+    },
+    "PodServiceSandboxUpdateNetworkPermissionsBody": {
+      "type": "object",
+      "properties": {
+        "stubId": {
+          "type": "string"
+        },
+        "blockNetwork": {
+          "type": "boolean"
+        },
+        "allowList": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PodServiceSandboxUpdateTTLBody": {
+      "type": "object",
+      "properties": {
+        "ttl": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "PodServiceSandboxUploadFileBody": {
+      "type": "object",
+      "properties": {
+        "containerPath": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "data": {
+          "type": "string",
+          "format": "byte"
+        },
+        "offset": {
+          "type": "string",
+          "format": "int64",
+          "description": "Zero starts a new file; nonzero offsets overwrite a chunk."
+        }
+      }
+    },
+    "podCreatePodRequest": {
+      "type": "object",
+      "properties": {
+        "stubId": {
+          "type": "string"
+        },
+        "imageId": {
+          "type": "string"
+        },
+        "checkpointId": {
+          "type": "string"
+        },
+        "machineId": {
+          "type": "string"
+        }
+      }
+    },
+    "podCreatePodResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "containerId": {
+          "type": "string"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "stubId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "appId": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxConnectResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "stubId": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxCreateDirectoryResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxCreateImageFromFilesystemResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "imageId": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxDeleteDirectoryResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxDeleteFileResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxDiskSnapshot": {
+      "type": "object",
+      "properties": {
+        "snapshotId": {
+          "type": "string"
+        },
+        "diskName": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "string",
+          "format": "int64"
+        }
+      }
+    },
+    "podPodSandboxDownloadFileResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "data": {
+          "type": "string",
+          "format": "byte"
+        }
+      }
+    },
+    "podPodSandboxExecResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "done": {
+          "type": "boolean"
+        },
+        "exitCode": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxExposePortResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxFileInfo": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "size": {
+          "type": "string",
+          "format": "int64"
+        },
+        "modTime": {
+          "type": "string",
+          "format": "int64"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "group": {
+          "type": "string"
+        },
+        "isDir": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "permissions": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "podPodSandboxFindInFilesResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/typesFileSearchResult"
+          }
+        }
+      }
+    },
+    "podPodSandboxKillResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxListFilesResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/podPodSandboxFileInfo"
+          }
+        }
+      }
+    },
+    "podPodSandboxListProcessesResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/typesProcessInfo"
+          }
+        }
+      }
+    },
+    "podPodSandboxListUrlsResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "urls": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxReplaceInFilesResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxSnapshotDisksResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "snapshots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/podPodSandboxDiskSnapshot"
+          }
+        }
+      }
+    },
+    "podPodSandboxSnapshotMemoryResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "checkpointId": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "diskSnapshots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/podPodSandboxDiskSnapshot"
+          },
+          "description": "Durable disk snapshots captured at the same boundary as the memory image."
+        }
+      }
+    },
+    "podPodSandboxStatFileResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "fileInfo": {
+          "$ref": "#/definitions/podPodSandboxFileInfo"
+        }
+      }
+    },
+    "podPodSandboxStatusResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "exitCode": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "podPodSandboxStderrResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxStdoutResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "stdout": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxUpdateNetworkPermissionsResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxUpdateTTLResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "podPodSandboxUploadFileResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    },
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "typesFileSearchMatch": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "$ref": "#/definitions/typesFileSearchRange"
+        },
+        "content": {
+          "type": "string"
+        }
+      }
+    },
+    "typesFileSearchPosition": {
+      "type": "object",
+      "properties": {
+        "line": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "column": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "typesFileSearchRange": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "$ref": "#/definitions/typesFileSearchPosition"
+        },
+        "end": {
+          "$ref": "#/definitions/typesFileSearchPosition"
+        }
+      }
+    },
+    "typesFileSearchResult": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/typesFileSearchMatch"
+          }
+        }
+      }
+    },
+    "typesProcessInfo": {
+      "type": "object",
+      "properties": {
+        "running": {
+          "type": "boolean"
+        },
+        "pid": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "cmd": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exitCode": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    }
+  }
+}

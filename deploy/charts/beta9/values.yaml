@@ -1,0 +1,230 @@
+# -- See the common values.yaml for all the options you can set.
+# https://github.com/bjw-s/helm-charts/blob/common-2.5.0/charts/library/common/values.yaml
+global:
+  labels: {}
+  annotations: {}
+  nameOverride: beta9
+
+# -- Beta9's configuration.
+# https://github.com/beam-cloud/beta9/blob/main/pkg/common/config.default.yaml
+config:
+  worker:
+    imageRegistry: public.ecr.aws/n4e0e1y0
+    imagePVCName: ""
+  imageService:
+    runner:
+      baseImageRegistry: public.ecr.aws/n4e0e1y0
+  managedCompute:
+    billableMarginPct: 0.10
+    byoc:
+      pricing:
+        memoryHourlyMicrosPerGB: 4500
+        cpuHourlyMicrosPerVCPU: 9500
+      aws:
+        templateUrl: ""
+    billing:
+      mode: noop
+      endpoint: ""
+      authToken: ""
+      required: false
+      timeout: 5s
+      reconcileInterval: 1m
+      minimumCreditCents: 2500
+
+images:
+  gateway:
+    repository: public.ecr.aws/n4e0e1y0/beta9-gateway
+    tag:        # Defaults to chart's app version
+    pullPolicy: # Defaults to IfNotPresent
+  worker:
+    repository: public.ecr.aws/n4e0e1y0/beta9-worker
+    tag:        # Defaults to chart's app version
+    pullPolicy: # Defaults to IfNotPresent
+
+cacheServer:
+  enabled: false
+  configSecretName: beta9-config-helm
+  poolName: default
+  locality: default
+  serverPort: 2050
+  hostPath: /var/lib/beta9/cache
+  mountPath: /var/lib/beta9/cache
+  # Must match the host path mounted at /images on workers in this locality.
+  # Ignored when config.worker.imagePVCName is set.
+  imagesHostPath: /images
+  hostNetwork: true
+  priorityClassName:
+  image:
+    repository: # Defaults to images.worker.repository
+    tag:        # Defaults to images.worker.tag or chart app version
+    pullPolicy: # Defaults to images.worker.pullPolicy or IfNotPresent
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  securityContext:
+    privileged: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+controllers:
+  gateway:
+    annotations: {}
+    labels: {}
+    replicas: 1
+    pod:
+      # 180s gateway shutdownTimeout + 10s readiness propagation + 5s buffer.
+      terminationGracePeriodSeconds: "195"
+    strategy: RollingUpdate
+    rollingUpdate:
+      unavailable: 1
+      surge: "0"
+    initContainers:
+      wait-on-backends:
+        image:
+          repository: busybox
+          tag: 1.37.0
+        command:
+        - sh
+        - -c
+        - |
+          until nc -z postgresql 5432; do echo "Waiting on PostgreSQL..."; sleep 2; done;
+          until nc -z redis-master 6379; do echo "Waiting on Redis..."; sleep 2; done;
+          echo "All systems ready!"
+
+persistence:
+  images:
+    enabled: true
+    type: persistentVolumeClaim
+    size: 50Gi
+    storageClass: local-path
+    accessMode: ReadWriteOnce
+
+service:
+  gateway:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9090"
+    labels: {}
+    ports:
+      grpc:
+        port: 1993
+        targetPort: 1993
+        protocol: TCP
+      http:
+        primary: true
+        port: 1994
+        targetPort: 1994
+        protocol: TCP
+      metrics:
+        port: 9090
+        targetPort: 9090
+        protocol: TCP
+    type: ClusterIP
+
+ingress:
+  gateway:
+    enabled: false
+    annotations: {}
+    labels: {}
+
+serviceAccount:
+  name: beta9
+  annotations: {}
+  labels: {}
+
+# -- In-memory cache for container images.
+# https://github.com/beam-cloud/blobcache/deploy/charts/blobcache/values.yaml
+blobcache:
+  enabled: false
+
+# -- Needed by Gateway
+redis:
+  enabled: true
+  nameOverride: redis
+  fullnameOverride: redis
+  architecture: standalone
+  auth:
+    enabled: false
+  master:
+    configuration: |
+      activedefrag yes
+      notify-keyspace-events AKE
+    persistence:
+      size: 1Gi
+
+# -- Needed by Gateway
+postgresql:
+  enabled: true
+  nameOverride: postgresql
+  fullnameOverride: postgresql
+  global:
+    postgresql:
+      auth:
+        username: root
+        password: password
+        database: main
+  primary:
+    extendedConfiguration: |
+      max_connections=400
+      shared_buffers='400MB'
+  volumePermissions:
+    enabled: true
+  persistence:
+    enabled: true
+    size: 1Gi
+
+# -- Enables deployment of victoria-metrics and grafana
+metrics:
+  enabled: false
+
+grafana:
+  nameOverride: grafana
+  fullnameOverride: grafana
+  datasources:
+   datasources.yaml:
+     apiVersion: 1
+     datasources:
+     - name: Victoria Metrics
+       type: prometheus
+       url: http://victoria-metrics-single:8428
+       access: proxy
+       isDefault: true
+
+victoria-metrics-agent:
+  nameOverride: victoria-metrics-agent
+  fullnameOverride: victoria-metrics-agent
+  remoteWriteUrls:
+  - http://victoria-metrics-single:8428/api/v1/write
+  extraScrapeConfigs:
+  - job_name: beta9-pods
+    metrics_path: /metrics
+    scheme: http
+    honor_labels: true
+    scrape_timeout: 10s
+    scrape_interval: 15s
+    kubernetes_sd_configs:
+    - role: pod
+      namespaces:
+        names:
+        - beta9
+    relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_label_prometheus_io_scrape]
+      action: keep
+      regex: true
+    - source_labels: [__meta_kubernetes_pod_container_port_number]
+      action: keep
+      regex: 9090
+
+victoria-metrics-single:
+  server:
+    fullnameOverride: victoria-metrics-single
+
+# -- Used to add any custom manifests
+manifests:
+  resources: []
+  templates: []

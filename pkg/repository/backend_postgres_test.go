@@ -1,0 +1,782 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	pkgCommon "github.com/beam-cloud/beta9/pkg/common"
+	repositoryCommon "github.com/beam-cloud/beta9/pkg/repository/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
+	"github.com/stretchr/testify/require"
+)
+
+const adminWorkspaceQueryPattern = `SELECT w\.id, w\.external_id.*WHERE w\.is_cluster_admin`
+
+func TestSetWorkspaceTokensDisabledSkipsClusterTokens(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	mock.ExpectQuery(`UPDATE token SET disabled_by_cluster_admin = \$2 WHERE workspace_id = \$1 AND token_type NOT IN \(\$3, \$4\)`).
+		WithArgs(uint(1), true, types.TokenTypeClusterAdmin, types.TokenTypeWorker).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "token_type"}).AddRow("key-1", types.TokenTypeWorkspace).AddRow("key-2", types.TokenTypeWorkerPrivate))
+
+	keys, err := repo.SetWorkspaceTokensDisabled(context.Background(), 1, true)
+	require.NoError(t, err)
+	require.Equal(t, []string{"key-1", "key-2"}, keys)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestListTokensListsOnlyWorkspaceTokens(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	mock.ExpectQuery(`token_type IN \('workspace_primary', 'workspace', 'workspace_restricted', 'platform_deployer'\)`).
+		WithArgs(uint(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "token_type"}).AddRow("key-1", types.TokenTypeWorkspace))
+
+	tokens, err := repo.ListTokens(context.Background(), 1)
+	require.NoError(t, err)
+	require.Len(t, tokens, 1)
+	require.Equal(t, "key-1", tokens[0].Key)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRetrieveActiveTokenReturnsTheNewestTokenOfItsType(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	mock.ExpectQuery(`token_type = \$2 AND disabled_by_cluster_admin = FALSE ORDER BY created_at DESC, id DESC LIMIT 1`).
+		WithArgs(uint(1), types.TokenTypeWorkspaceRestricted).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "token_type"}).AddRow("key-1", types.TokenTypeWorkspaceRestricted))
+
+	token, err := repo.RetrieveActiveToken(context.Background(), 1, types.TokenTypeWorkspaceRestricted)
+	require.NoError(t, err)
+	require.Equal(t, "key-1", token.Key)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGenerateDSNSSLMode(t *testing.T) {
+	t.Run("disabled", func(t *testing.T) {
+		dsn := GenerateDSN(types.PostgresConfig{EnableTLS: false})
+		require.Contains(t, dsn, "sslmode=disable")
+	})
+
+	t.Run("required", func(t *testing.T) {
+		dsn := GenerateDSN(types.PostgresConfig{EnableTLS: true})
+		require.Contains(t, dsn, "sslmode=require")
+	})
+}
+
+func TestListStubsQueryBuilderFiltersPreparationCacheKey(t *testing.T) {
+	query, args, err := (&PostgresBackendRepository{}).listStubsQueryBuilder(types.StubFilter{
+		PreparationCacheKey: "cache-key",
+	}).ToSql()
+	require.NoError(t, err)
+	require.Contains(t, query, "s.config->>'preparation_cache_key' = $1")
+	require.Contains(t, query, "ORDER BY s.updated_at DESC, s.id DESC LIMIT 1")
+	require.Equal(t, []interface{}{"cache-key"}, args)
+}
+
+func TestListTaskWithRelated(t *testing.T) {
+	// Remove this skip if you are testing on local data
+	t.Skip()
+	ctx := context.Background()
+
+	dbName := "control_plane"
+	dbUser := "pguser"
+	connStr := fmt.Sprintf("postgres://%s@localhost:5433/%s?sslmode=disable", dbUser, dbName)
+	db, err := sql.Open("postgres", connStr)
+	require.NoError(t, err)
+	client := sqlx.NewDb(db, "postgres")
+	require.NotNil(t, client)
+	r := PostgresBackendRepository{
+		client: client,
+	}
+
+	workspaceId := uint(0)
+	stubId := uuid.New().String()
+	firstPageId := uint(0)
+	secondPageId := uint(0)
+
+	res, err := r.ListTasksWithRelatedPaginated(ctx, types.TaskFilter{WorkspaceID: workspaceId, StubIds: []string{stubId}})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, 10, len(res.Data))
+	require.Equal(t, firstPageId, res.Data[0].Id)
+	require.NotNil(t, res.Next)
+
+	res, err = r.ListTasksWithRelatedPaginated(ctx, types.TaskFilter{WorkspaceID: workspaceId, StubIds: []string{stubId}, Cursor: res.Next})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, 10, len(res.Data))
+	require.Equal(t, secondPageId, res.Data[0].Id)
+	require.NotNil(t, res.Next)
+}
+
+func TestListTasksWithRelatedPaginatedAppliesCursorBeforeHydration(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	cursorTime := time.Date(2026, time.July, 22, 16, 42, 45, 0, time.UTC)
+	cursor := repositoryCommon.EncodeCursor(repositoryCommon.DatetimeCursor{Value: cursorTime.Format(repositoryCommon.CursorTimestampFormat), Id: 77})
+
+	mock.ExpectQuery(`FROM \(SELECT t\.id, t\.created_at FROM task t JOIN stub s ON t\.stub_id = s\.id JOIN app a ON s\.app_id = a\.id WHERE t\.workspace_id = \$1 AND a\.workspace_id = \$2 AND a\.external_id = \$3 AND a\.deleted_at IS NULL AND \(t\.created_at < \$4 OR \(t\.created_at = \$5 AND t\.id < \$6\)\) ORDER BY t\.created_at DESC, t\.id DESC LIMIT 3\) AS page JOIN task t ON t\.id = page\.id JOIN workspace w ON t\.workspace_id = w\.id JOIN stub s ON t\.stub_id = s\.id LEFT JOIN LATERAL \(SELECT d\.external_id, d\.name, d\.version FROM deployment d WHERE d\.stub_id = s\.id AND d\.deleted_at IS NULL ORDER BY d\.created_at DESC, d\.id DESC LIMIT 1\) d ON true ORDER BY page\.created_at DESC, page\.id DESC LIMIT 3`).
+		WithArgs(uint(11), uint(11), "app-external", cursorTime, cursorTime, uint(77)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	result, err := repo.ListTasksWithRelatedPaginated(context.Background(), types.TaskFilter{
+		WorkspaceID: 11,
+		AppId:       "app-external",
+		Cursor:      cursor,
+		BaseFilter:  types.BaseFilter{Limit: 2},
+	})
+
+	require.NoError(t, err)
+	require.Empty(t, result.Data)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetAdminWorkspaceMapsExternalID(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	createdAt := time.Now().UTC()
+	mock.ExpectQuery(adminWorkspaceQueryPattern).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "external_id", "name", "created_at", "concurrency_limit_id", "volume_cache_enabled", "multi_gpu_enabled",
+	}).AddRow(uint(7), "admin-workspace", "Admin", createdAt, nil, true, true))
+
+	workspace, err := repo.GetAdminWorkspace(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "admin-workspace", workspace.ExternalId)
+	require.Equal(t, uint(7), workspace.Id)
+	require.True(t, workspace.VolumeCacheEnabled)
+	require.True(t, workspace.MultiGpuEnabled)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetAdminWorkspaceIncludesStorageForAgentScheduling(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	createdAt := time.Now().UTC()
+	mock.ExpectQuery(adminWorkspaceQueryPattern).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "external_id", "name", "created_at", "storage.id", "storage.bucket_name", "storage.endpoint_url", "storage.region",
+	}).AddRow(uint(7), "admin-workspace", "Admin", createdAt, uint(9), "admin-model-cache", "https://storage.example.com", "us-east-1"))
+
+	workspace, err := repo.GetAdminWorkspace(context.Background())
+	require.NoError(t, err)
+	require.True(t, workspace.StorageAvailable(), "hosted replicas need workspace storage to use agent workers")
+	require.Equal(t, "admin-model-cache", *workspace.Storage.BucketName)
+	require.True(t, (&types.ContainerRequest{Workspace: *workspace}).StorageAvailable())
+	// The cached record must retain the same storage metadata.
+	cached, err := repo.GetAdminWorkspace(context.Background())
+	require.NoError(t, err)
+	require.True(t, cached.StorageAvailable())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// The scheduler passes the workspace copied onto a container request, which
+// carries no signing key. Decryption must load it instead of dereferencing nil.
+func TestGetImageCredentialsLoadsSigningKeyWhenWorkspaceLacksIt(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	signingKey := "sk_pKz38fK8v7lz01AneJI8MJnR70akmP2CtDNf1IufKcY="
+	key, err := pkgCommon.ParseSecretKey(signingKey)
+	require.NoError(t, err)
+	encryptedUser, err := pkgCommon.Encrypt(key, "user")
+	require.NoError(t, err)
+	encryptedToken, err := pkgCommon.Encrypt(key, "token")
+	require.NoError(t, err)
+	now := time.Now().UTC()
+
+	mock.ExpectQuery(`SELECT credential_secret_names FROM image WHERE image_id = \$1`).
+		WithArgs("image-1").
+		WillReturnRows(sqlmock.NewRows([]string{"credential_secret_names"}).AddRow(pq.StringArray{"REG_USERNAME", "REG_PASSWORD"}))
+	mock.ExpectQuery(`SELECT id, name, created_at, concurrency_limit_id, signing_key, volume_cache_enabled, multi_gpu_enabled FROM workspace WHERE external_id = \$1`).
+		WithArgs("workspace-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "created_at", "concurrency_limit_id", "signing_key", "volume_cache_enabled", "multi_gpu_enabled"}).
+			AddRow(uint(7), "Workspace", now, nil, signingKey, false, false))
+	mock.ExpectQuery(`SELECT hosts, placeholder, id, external_id, name, value, workspace_id, last_updated_by, created_at, updated_at FROM workspace_secret WHERE name = ANY\(\$1\) AND workspace_id = \$2`).
+		WithArgs(pq.Array([]string{"REG_USERNAME", "REG_PASSWORD"}), uint(7)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "external_id", "name", "value", "workspace_id", "last_updated_by", "created_at", "updated_at"}).
+			AddRow(uint(1), "secret-1", "REG_USERNAME", encryptedUser, uint(7), uint(1), now, now).
+			AddRow(uint(2), "secret-2", "REG_PASSWORD", encryptedToken, uint(7), uint(1), now, now))
+
+	request := &types.ContainerRequest{
+		ImageId:     "image-1",
+		WorkspaceId: "workspace-1",
+		Workspace:   types.Workspace{Id: 7, ExternalId: "workspace-1"},
+	}
+	credentials, err := repo.GetImageCredentials(context.Background(), &request.Workspace, request.ImageId)
+	require.NoError(t, err)
+	require.Contains(t, credentials, "user")
+	require.Contains(t, credentials, "token")
+	require.Nil(t, request.Workspace.SigningKey, "the caller's copy must not gain the signing key")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetSecretsByNameDecryptedRejectsWorkspaceWithoutSigningKey(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+
+	_, err := repo.GetSecretsByNameDecrypted(context.Background(), &types.Workspace{Id: 7, ExternalId: "workspace-1"}, []string{"REG_USERNAME"})
+	require.ErrorContains(t, err, "no signing key")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func waitForAdminWorkspaceLoad(t *testing.T, repo *PostgresBackendRepository) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		repo.adminWorkspaceMu.Lock()
+		defer repo.adminWorkspaceMu.Unlock()
+		return repo.adminWorkspaceLoading != nil
+	}, time.Second, time.Millisecond, "admin workspace load did not start")
+}
+
+func TestGetAdminWorkspaceCanceledCallerDoesNotWaitForLoad(t *testing.T) {
+	repository, mock := NewBackendPostgresRepositoryForTest()
+	repo := repository.(*PostgresBackendRepository)
+	createdAt := time.Now().UTC()
+	mock.ExpectQuery(adminWorkspaceQueryPattern).
+		WillDelayFor(200 * time.Millisecond).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "external_id", "name", "created_at", "concurrency_limit_id", "volume_cache_enabled", "multi_gpu_enabled",
+		}).AddRow(uint(7), "admin-workspace", "Admin", createdAt, nil, true, true))
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := repo.GetAdminWorkspace(context.Background())
+		firstResult <- err
+	}()
+
+	waitForAdminWorkspaceLoad(t, repo)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := repo.GetAdminWorkspace(ctx)
+	require.True(t, errors.Is(err, context.Canceled), "error = %v", err)
+	require.NoError(t, <-firstResult)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetAdminWorkspaceSharesFailedLoadWithWaiters(t *testing.T) {
+	repository, mock := NewBackendPostgresRepositoryForTest()
+	repo := repository.(*PostgresBackendRepository)
+	loadErr := errors.New("database unavailable")
+	mock.ExpectQuery(adminWorkspaceQueryPattern).
+		WillDelayFor(200 * time.Millisecond).
+		WillReturnError(loadErr)
+
+	const waiterCount = 8
+	results := make(chan error, waiterCount+1)
+	go func() {
+		_, err := repo.GetAdminWorkspace(context.Background())
+		results <- err
+	}()
+
+	waitForAdminWorkspaceLoad(t, repo)
+
+	for range waiterCount {
+		go func() {
+			_, err := repo.GetAdminWorkspace(context.Background())
+			results <- err
+		}()
+	}
+
+	for range waiterCount + 1 {
+		require.ErrorIs(t, <-results, loadErr)
+	}
+
+	createdAt := time.Now().UTC()
+	mock.ExpectQuery(adminWorkspaceQueryPattern).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "external_id", "name", "created_at", "concurrency_limit_id", "volume_cache_enabled", "multi_gpu_enabled",
+	}).AddRow(uint(7), "admin-workspace", "Admin", createdAt, nil, true, true))
+	workspace, err := repo.GetAdminWorkspace(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "admin-workspace", workspace.ExternalId)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetAdminWorkspaceRetriesCanceledSharedLoad(t *testing.T) {
+	repository, mock := NewBackendPostgresRepositoryForTest()
+	repo := repository.(*PostgresBackendRepository)
+	loading := &adminWorkspaceLoad{done: make(chan struct{})}
+	repo.adminWorkspaceLoading = loading
+
+	createdAt := time.Now().UTC()
+	mock.ExpectQuery(adminWorkspaceQueryPattern).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "external_id", "name", "created_at", "concurrency_limit_id", "volume_cache_enabled", "multi_gpu_enabled",
+	}).AddRow(uint(7), "admin-workspace", "Admin", createdAt, nil, true, true))
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		repo.adminWorkspaceMu.Lock()
+		loading.err = context.Canceled
+		repo.adminWorkspaceLoading = nil
+		close(loading.done)
+		repo.adminWorkspaceMu.Unlock()
+	}()
+
+	workspace, err := repo.GetAdminWorkspace(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "admin-workspace", workspace.ExternalId)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestHandleTaskEventUsesProvidedTaskSnapshot(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	postgresRepo := repo.(*PostgresBackendRepository)
+
+	taskSnapshot := types.Task{
+		ExternalId:  "task-123",
+		Status:      types.TaskStatusComplete,
+		ContainerId: "container-123",
+		WorkspaceId: 1,
+		StubId:      2,
+	}
+
+	expectTaskWithRelatedQuery(mock, taskSnapshot, types.TaskStatusRunning)
+
+	var eventTask *types.TaskWithRelated
+	postgresRepo.handleTaskEvent(taskSnapshot, func(task *types.TaskWithRelated) {
+		eventTask = task
+	})
+
+	require.NotNil(t, eventTask)
+	require.Equal(t, types.TaskStatusComplete, eventTask.Status)
+	require.Equal(t, "stub-123", eventTask.Stub.ExternalId)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestTaskEventPublisherPreservesOrder(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	postgresRepo := repo.(*PostgresBackendRepository)
+	publisher := newTaskEventPublisher(postgresRepo)
+
+	runningSnapshot := types.Task{
+		ExternalId:  "task-123",
+		Status:      types.TaskStatusRunning,
+		ContainerId: "container-123",
+		WorkspaceId: 1,
+		StubId:      2,
+	}
+	completeSnapshot := runningSnapshot
+	completeSnapshot.Status = types.TaskStatusComplete
+
+	expectTaskWithRelatedQuery(mock, runningSnapshot, types.TaskStatusRunning)
+	expectTaskWithRelatedQuery(mock, completeSnapshot, types.TaskStatusRunning)
+
+	statuses := make(chan types.TaskStatus, 2)
+	publisher.enqueue(taskEventJob{
+		task: runningSnapshot,
+		callback: func(task *types.TaskWithRelated) {
+			statuses <- task.Status
+		},
+	})
+	publisher.enqueue(taskEventJob{
+		task: completeSnapshot,
+		callback: func(task *types.TaskWithRelated) {
+			statuses <- task.Status
+		},
+	})
+
+	require.Equal(t, types.TaskStatusRunning, receiveTaskEventStatus(t, statuses))
+	require.Equal(t, types.TaskStatusComplete, receiveTaskEventStatus(t, statuses))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestUpdateDeploymentDoesNotMatchDeletedRowsByNumericID(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	postgresRepo := repo.(*PostgresBackendRepository)
+
+	updatedAt := time.Now()
+	mock.ExpectQuery(`WHERE \(id = \$1 OR external_id = \$2\) AND deleted_at IS NULL`).
+		WithArgs(uint(10), "deployment-id", "service-probe", false, uint(1)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id",
+			"external_id",
+			"name",
+			"active",
+			"version",
+			"workspace_id",
+			"stub_id",
+			"stub_type",
+			"created_at",
+			"updated_at",
+		}).AddRow(
+			uint(10),
+			"deployment-id",
+			"service-probe",
+			false,
+			uint(1),
+			uint(1),
+			uint(20),
+			string(types.StubTypePodDeployment),
+			updatedAt,
+			updatedAt,
+		))
+
+	deployment, err := postgresRepo.UpdateDeployment(context.Background(), types.Deployment{
+		Id:         10,
+		ExternalId: "deployment-id",
+		Name:       "service-probe",
+		Active:     false,
+		Version:    1,
+	})
+
+	require.NoError(t, err)
+	require.False(t, deployment.Active)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetOrCreateStubTouchesExistingAppScopedStub(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	postgresRepo := repo.(*PostgresBackendRepository)
+
+	updatedAt := time.Now()
+	mock.ExpectQuery(`WITH existing AS MATERIALIZED`).
+		WithArgs("stub-name", string(types.StubTypeFunction), uint(7), sqlmock.AnyArg(), uint(11), uint(13), false).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id", "updated_at"}).AddRow(5, 11, updatedAt))
+	stub, err := postgresRepo.GetOrCreateStub(context.Background(), "stub-name", string(types.StubTypeFunction), types.StubConfigV1{}, 7, 11, false, 13)
+
+	require.NoError(t, err)
+	require.Equal(t, uint(5), stub.Id)
+	require.Equal(t, uint(11), stub.WorkspaceId)
+	require.True(t, stub.UpdatedAt.Time.Equal(updatedAt))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetOrCreateStubIntegration(t *testing.T) {
+	dsn := os.Getenv("BETA9_VM_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set BETA9_VM_TEST_DSN for a development database")
+	}
+	db, err := sqlx.Connect("postgres", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	// Temporary tables on one session exercise the migrated column types
+	// without reading or modifying existing workspace records.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	_, err = db.Exec(`
+		CREATE TEMP TABLE app (LIKE public.app INCLUDING DEFAULTS);
+		CREATE TEMP TABLE stub (LIKE public.stub INCLUDING DEFAULTS);
+		CREATE TEMP SEQUENCE stub_test_id;
+		ALTER TABLE stub ALTER COLUMN id SET DEFAULT nextval('stub_test_id');
+		INSERT INTO app (id, name, workspace_id, description, updated_at)
+		VALUES (1, 'stub-test', 1, '', NOW() - INTERVAL '1 hour'),
+		       (2, 'stub-test-other', 1, '', NOW() - INTERVAL '1 hour');`)
+	require.NoError(t, err)
+	repo := &PostgresBackendRepository{client: db}
+	ctx := context.Background()
+	create := func(app uint, force bool, image string) (types.Stub, error) {
+		config := types.StubConfigV1{Runtime: types.Runtime{ImageId: image}}
+		return repo.GetOrCreateStub(ctx, "stub-test", string(types.StubTypeVM), config, 1, 1, force, app)
+	}
+	first, err := create(1, false, "stub-test")
+	require.NoError(t, err)
+
+	t.Run("reuse updates activity", func(t *testing.T) {
+		_, err := db.Exec(`UPDATE stub SET updated_at=NOW() - INTERVAL '1 hour' WHERE id=$1`, first.Id)
+		require.NoError(t, err)
+		reused, err := create(1, false, "stub-test")
+		require.NoError(t, err)
+		require.Equal(t, first.Id, reused.Id)
+		require.Equal(t, first.CreatedAt, reused.CreatedAt)
+		require.WithinDuration(t, time.Now(), reused.UpdatedAt.Time, time.Minute)
+		var active bool
+		require.NoError(t, db.Get(&active, `SELECT updated_at > NOW() - INTERVAL '1 minute' FROM app WHERE id=1`))
+		require.True(t, active)
+	})
+	for _, test := range []struct {
+		name, image string
+		app         uint
+		force       bool
+	}{
+		{name: "different app", image: "stub-test", app: 2},
+		{name: "forced creation", image: "stub-test", app: 1, force: true},
+		{name: "different config", image: "different-image", app: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stub, err := create(test.app, test.force, test.image)
+			require.NoError(t, err)
+			require.NotEqual(t, first.Id, stub.Id)
+		})
+	}
+	t.Run("activity failure rolls back creation", func(t *testing.T) {
+		_, err := db.Exec(`UPDATE app SET updated_at='2000-01-01';
+			ALTER TABLE app ADD CHECK (updated_at < '2020-01-01');`)
+		require.NoError(t, err)
+		_, err = create(1, true, "stub-test")
+		require.Error(t, err)
+		var count int
+		require.NoError(t, db.Get(&count, `SELECT count(*) FROM stub`))
+		require.Equal(t, 4, count)
+	})
+}
+
+func TestAppListingsSkipVMApp(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("list", func(t *testing.T) {
+		repo, mock := NewBackendPostgresRepositoryForTest()
+		mock.ExpectQuery(`SELECT \* FROM app WHERE workspace_id = \$1 and deleted_at is null and name <> \$2`).
+			WithArgs(uint(11), types.VMAppName).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+		_, err := repo.(*PostgresBackendRepository).ListApps(ctx, 11)
+		require.NoError(t, err)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("paginated", func(t *testing.T) {
+		repo, mock := NewBackendPostgresRepositoryForTest()
+		mock.ExpectQuery(`FROM app a WHERE workspace_id = \$1 AND deleted_at IS NULL AND a\.name <> \$2`).
+			WithArgs(uint(11), types.VMAppName).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+		_, err := repo.ListAppsPaginated(ctx, 11, types.AppFilter{})
+		require.NoError(t, err)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("count", func(t *testing.T) {
+		repo, mock := NewBackendPostgresRepositoryForTest()
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM app WHERE workspace_id = \$1 AND deleted_at IS NULL AND name <> \$2`).
+			WithArgs(uint(11), types.VMAppName).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(3))
+
+		count, err := repo.CountApps(ctx, 11)
+		require.NoError(t, err)
+		require.Equal(t, 3, count)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("stub app ids", func(t *testing.T) {
+		repo, mock := NewBackendPostgresRepositoryForTest()
+		mock.ExpectQuery(`AND a\.deleted_at IS NULL\s+AND a\.name <> \$3`).
+			WithArgs("workspace-1", pq.Array([]string{"stub-1"}), types.VMAppName).
+			WillReturnRows(sqlmock.NewRows([]string{"stub_external_id", "app_external_id"}).AddRow("stub-1", "app-1"))
+
+		appIDs, err := repo.ListAppIDsByStubExternalIDs(ctx, "workspace-1", []string{"stub-1"})
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{"stub-1": "app-1"}, appIDs)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+func TestAggregateTasksByTimeWindowScopesAppStubSubquery(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	postgresRepo := repo.(*PostgresBackendRepository)
+
+	mock.ExpectQuery(`FROM task t JOIN stub s ON t\.stub_id = s\.id WHERE t\.workspace_id = \$2 AND s\.external_id IN \(\$3\) AND t\.stub_id IN \(SELECT app_stub\.id FROM stub app_stub JOIN app app_scope ON app_stub\.app_id = app_scope\.id WHERE app_scope\.workspace_id = \$4 AND app_scope\.external_id = \$5 AND app_scope\.deleted_at IS NULL\)`).
+		WithArgs("hour", uint(11), "stub-external", uint(11), "app-external").
+		WillReturnRows(sqlmock.NewRows([]string{"time", "count", "status_counts"}))
+
+	result, err := postgresRepo.AggregateTasksByTimeWindow(context.Background(), types.TaskFilter{
+		WorkspaceID: 11,
+		StubIds:     []string{"stub-external"},
+		AppId:       "app-external",
+	})
+
+	require.NoError(t, err)
+	require.Empty(t, result)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestListStaleCheckpointsRequiresStubUpdatedBeforeCutoff(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	postgresRepo := repo.(*PostgresBackendRepository)
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+
+	mock.ExpectQuery(`s\.updated_at < \$2 AND NOT EXISTS .*memory_checkpoint_id.*desired_state`).
+		WithArgs(sqlmock.AnyArg(), cutoff).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"checkpoint_id",
+			"external_id",
+			"source_container_id",
+			"container_ip",
+			"status",
+			"remote_key",
+			"workspace_id",
+			"stub_id",
+			"stub_type",
+			"app_id",
+			"exposed_ports",
+			"created_at",
+			"last_restored_at",
+			"cache_hash",
+			"cache_size_bytes",
+			"origin_key",
+			"locality",
+			"accelerator",
+			"runtime",
+			"compatibility_key",
+		}).AddRow(
+			"checkpoint-123",
+			"external-123",
+			"sandbox-stub-123-container",
+			"10.0.0.12",
+			string(types.CheckpointStatusAvailable),
+			"checkpoint-123",
+			uint(1),
+			uint(2),
+			types.StubTypeSandbox,
+			uint(3),
+			"{8080}",
+			cutoff.Add(-time.Hour),
+			cutoff.Add(-30*time.Minute),
+			"sha256-cache",
+			int64(128),
+			"checkpoints/checkpoint-123.tar",
+			"default",
+			"cpu",
+			types.ContainerRuntimeRunc.String(),
+			"v1:profile-a",
+		))
+
+	checkpoints, err := postgresRepo.ListStaleCheckpoints(context.Background(), []string{"workspace|active-stub"}, cutoff)
+
+	require.NoError(t, err)
+	require.Len(t, checkpoints, 1)
+	require.Equal(t, "checkpoint-123", checkpoints[0].CheckpointId)
+	require.Equal(t, []uint32{8080}, checkpoints[0].ExposedPorts)
+	require.Equal(t, types.ContainerRuntimeRunc.String(), checkpoints[0].Runtime)
+	require.Equal(t, "v1:profile-a", checkpoints[0].CompatibilityKey)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func checkpointQueryRows(key string) *sqlmock.Rows {
+	now := time.Now()
+	return sqlmock.NewRows([]string{
+		"checkpoint_id", "external_id", "source_container_id", "container_ip", "status", "remote_key",
+		"workspace_id", "stub_id", "stub_type", "app_id", "exposed_ports", "created_at", "last_restored_at",
+		"cache_hash", "cache_size_bytes", "origin_key", "locality", "accelerator", "runtime", "compatibility_key",
+	}).AddRow(
+		"checkpoint-available", "external-available", "container-available", "10.0.0.12", "available", "checkpoint-available",
+		uint(1), uint(2), types.StubTypeASGI, uint(3), "{8001}", now.Add(-time.Minute), now,
+		"sha256-cache", int64(128), "checkpoints/checkpoint-available.tar", "default", "cpu", "gvisor", key,
+	)
+}
+
+func TestGetCheckpointByIdRetainsCompatibilityKey(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	mock.ExpectQuery(`c\.runtime, c\.compatibility_key FROM checkpoint c`).
+		WithArgs("checkpoint-available").WillReturnRows(checkpointQueryRows("v1:profile-a"))
+
+	checkpoint, err := repo.GetCheckpointById(context.Background(), "checkpoint-available")
+	require.NoError(t, err)
+	require.Equal(t, "checkpoint-available", checkpoint.CheckpointId)
+	require.Equal(t, "v1:profile-a", checkpoint.CompatibilityKey)
+	require.Equal(t, []uint32{8001}, checkpoint.ExposedPorts)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCheckpointWriteAndListResultsRetainCompatibilityKey(t *testing.T) {
+	repo, mock := NewBackendPostgresRepositoryForTest()
+	ctx := context.Background()
+	checkpoint := &types.Checkpoint{CheckpointId: "checkpoint-available", Status: "available"}
+	const key = "v1:profile-a"
+
+	mock.ExpectQuery(`INSERT INTO checkpoint AS c`).WillReturnRows(checkpointQueryRows(key))
+	created, err := repo.CreateCheckpoint(ctx, checkpoint, key)
+	require.NoError(t, err)
+	mock.ExpectQuery(`UPDATE checkpoint AS c SET status = \$1`).
+		WithArgs("available", checkpoint.CheckpointId).WillReturnRows(checkpointQueryRows(key))
+	updated, err := repo.UpdateCheckpoint(ctx, checkpoint)
+	require.NoError(t, err)
+	mock.ExpectQuery(`INNER JOIN workspace w`).WithArgs("workspace").WillReturnRows(checkpointQueryRows(key))
+	listed, err := repo.ListCheckpoints(ctx, "workspace")
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	mock.ExpectQuery(`UPDATE checkpoint c SET deleted_at.*NOT EXISTS .*memory_checkpoint_id.*desired_state' <> 'deleted'`).
+		WithArgs(pq.StringArray{checkpoint.CheckpointId}).WillReturnRows(checkpointQueryRows(key))
+	pruned, err := repo.PruneCheckpoints(ctx, []string{checkpoint.CheckpointId})
+	require.NoError(t, err)
+	require.Len(t, pruned, 1)
+
+	for _, result := range []*types.Checkpoint{created, updated, &listed[0], &pruned[0]} {
+		require.Equal(t, checkpoint.CheckpointId, result.CheckpointId)
+		require.Equal(t, key, result.CompatibilityKey)
+		require.Equal(t, []uint32{8001}, result.ExposedPorts)
+		require.Equal(t, "gvisor", result.Runtime)
+	}
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetLatestCheckpointByStubIdOnlyReturnsAvailable(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, legacyKey, storedKey string
+	}{
+		{"unfiltered latest", "", "", "v1:profile-a"},
+		{"current device layout", "v2:profile-a", "v1:profile-a", "v2:profile-a"},
+		{"older compatible layout", "v2:profile-a", "v1:profile-a", "v1:profile-a"},
+		{"unrelated profile excluded", "v2:profile-b", "v1:profile-b", ""},
+		{"reverse migration excluded", "v1:profile-a", "v1:profile-a", ""},
+		{"empty profile not broadened", "v2:", "v2:", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, mock := NewBackendPostgresRepositoryForTest()
+			query := mock.ExpectQuery(`c\.status = \$2 AND \(\$3 = '' OR c\.compatibility_key IN \(\$3, \$4\)\) ORDER BY c\.created_at DESC LIMIT 1`).
+				WithArgs("stub-123", string(types.CheckpointStatusAvailable), tc.key, tc.legacyKey)
+			if tc.storedKey == "" {
+				query.WillReturnError(sql.ErrNoRows)
+			} else {
+				query.WillReturnRows(checkpointQueryRows(tc.storedKey))
+			}
+			checkpoint, err := repo.GetLatestCheckpointByStubId(context.Background(), "stub-123", tc.key)
+			if tc.storedKey == "" {
+				require.IsType(t, &types.ErrCheckpointNotFound{}, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "checkpoint-available", checkpoint.CheckpointId)
+				require.Equal(t, "available", checkpoint.Status)
+				require.Equal(t, tc.storedKey, checkpoint.CompatibilityKey)
+				require.Equal(t, []uint32{8001}, checkpoint.ExposedPorts)
+				require.Equal(t, "gvisor", checkpoint.Runtime)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func expectTaskWithRelatedQuery(mock sqlmock.Sqlmock, taskSnapshot types.Task, dbStatus types.TaskStatus) {
+	mock.ExpectQuery("SELECT").
+		WithArgs(taskSnapshot.ExternalId).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"external_id",
+			"status",
+			"container_id",
+			"workspace_id",
+			"stub_id",
+			"workspace.external_id",
+			"workspace.name",
+			"stub.external_id",
+			"stub.name",
+			"stub.type",
+			"app.id",
+			"app.external_id",
+			"app.name",
+		}).AddRow(
+			taskSnapshot.ExternalId,
+			dbStatus,
+			taskSnapshot.ContainerId,
+			taskSnapshot.WorkspaceId,
+			taskSnapshot.StubId,
+			"workspace-123",
+			"workspace",
+			"stub-123",
+			"stub",
+			types.StubTypeASGIDeployment,
+			3,
+			"app-123",
+			"app",
+		))
+}
+
+func receiveTaskEventStatus(t *testing.T, statuses <-chan types.TaskStatus) types.TaskStatus {
+	t.Helper()
+
+	select {
+	case status := <-statuses:
+		return status
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for task event")
+		return ""
+	}
+}

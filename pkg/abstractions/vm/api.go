@@ -1,0 +1,794 @@
+package vm
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+	"github.com/lib/pq"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+)
+
+// Bound request bodies, reject unknown fields, and reject trailing JSON.
+func decode(c echo.Context, dst any) error {
+	d := json.NewDecoder(io.LimitReader(c.Request().Body, 1<<20))
+	d.DisallowUnknownFields()
+	if err := d.Decode(dst); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+
+	if err := d.Decode(new(any)); err != io.EOF {
+		return echo.NewHTTPError(http.StatusBadRequest, "expected one JSON object")
+	}
+
+	return nil
+}
+
+func requestContext(c echo.Context) (context.Context, *auth.AuthInfo) {
+	info := c.(*auth.HttpAuthContext).AuthInfo
+	return auth.ContextWithAuthInfo(c.Request().Context(), info), info
+}
+
+func apiError(err error) error {
+	var httpErr *echo.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr
+	}
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return echo.NewHTTPError(http.StatusNotFound, "VM not found")
+	}
+
+	var pg *pq.Error
+	if errors.As(err, &pg) && pg.Code == "23505" {
+		return echo.NewHTTPError(http.StatusConflict, "name already exists")
+	}
+
+	if strings.Contains(err.Error(), "operation already in progress") {
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
+	}
+
+	return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+}
+
+// Keep the complete launch spec in storage, but never return environment
+// values in management responses or template listings.
+func (s *Service) response(v *types.VM) types.VM {
+	copy := *v
+	copy.Spec = redactedSpec(v.Spec)
+	copy.CreationDigest = ""
+	copy.TrafficAccessToken = ""
+	s.urls(&copy)
+	return copy
+}
+
+// Blocking launch responses verify the same process-manager readiness as
+// SandboxConnect, saving a client round trip without persisting lifecycle state.
+func (s *Service) launchResponse(c echo.Context, status int, v *types.VM) error {
+	response := s.response(v)
+	if c.QueryParam("wait") != "exec" || v.DesiredState != types.VMStateRunning || v.ContainerID == "" || v.Status == types.VMStateError {
+		return c.JSON(status, response)
+	}
+
+	ctx, _ := requestContext(c)
+	ready, err := s.runtime.SandboxConnect(ctx, &pb.PodSandboxConnectRequest{ContainerId: v.ContainerID})
+	if err != nil {
+		return apiError(err)
+	}
+
+	if ready == nil || !ready.Ok {
+		// Start is already committed. A pending readiness probe must not turn
+		// a successful restore into a failed operation; clients can keep waiting
+		// without changing the checkpoint or bypassing authenticated readiness.
+		response.Status = types.VMStateStarting
+		return c.JSON(status, response)
+	}
+
+	response.Status = types.VMStateRunning
+	return c.JSON(status, struct {
+		types.VM
+		ExecReady bool `json:"exec_ready"`
+	}{response, true})
+}
+
+func artifactResponse(a types.VMArtifact) types.VMArtifact {
+	a.Spec = redactedSpec(a.Spec)
+	return a
+}
+
+func redactedSpec(spec types.VMSpec) types.VMSpec {
+	spec.Env = nil
+	spec.Kiosk = spec.Kiosk.WithoutCredentials()
+	volumes := spec.Volumes
+	spec.Volumes = make([]*pb.Volume, len(volumes))
+	for i, volume := range volumes {
+		if volume == nil {
+			continue
+		}
+
+		copy := proto.Clone(volume).(*pb.Volume)
+		if copy.Config != nil {
+			config := types.NewMountPointConfigFromProto(copy.Config).WithoutCredentials()
+			copy.Config = config.ToProto()
+		}
+
+		spec.Volumes[i] = copy
+	}
+
+	return spec
+}
+
+func (s *Service) lockedVM(ctx context.Context, workspace uint, name string) (*types.VM, func(), error) {
+	v, err := s.repo.GetVM(ctx, workspace, name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	unlock, err := s.repo.LockVM(ctx, v.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	v, err = s.repo.GetVM(ctx, workspace, v.ID)
+	if err != nil {
+		unlock()
+		return nil, nil, err
+	}
+
+	return v, unlock, nil
+}
+
+const maxPageSize = 200
+
+// Listings return every item as an array unless ?limit= asks for a page, as
+// the SDK, CLI and MCP tools expect. A zero limit returns only the totals.
+func pageParams(c echo.Context) (limit, offset int, err error) {
+	limit, err = strconv.Atoi(c.QueryParam("limit"))
+	if err != nil || limit < 0 || limit > maxPageSize {
+		return 0, 0, echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("limit must be an integer from 0 to %d", maxPageSize))
+	}
+
+	if value := c.QueryParam("offset"); value != "" {
+		if offset, err = strconv.Atoi(value); err != nil || offset < 0 {
+			return 0, 0, echo.NewHTTPError(http.StatusBadRequest, "offset must be a non-negative integer")
+		}
+	}
+
+	return limit, offset, nil
+}
+
+type vmPage struct {
+	Data  []types.VM `json:"data"`
+	Total int        `json:"total"`
+	// VMs by stored status, ignoring the status and search filters.
+	Counts map[string]int `json:"counts"`
+}
+
+func (s *Service) list(c echo.Context) error {
+	ctx, info := requestContext(c)
+	var metadata map[string]string
+	if filter := c.QueryParam("metadata"); filter != "" {
+		if err := json.Unmarshal([]byte(filter), &metadata); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "metadata filter must be a JSON object of strings")
+		}
+	}
+
+	if c.QueryParams().Has("limit") {
+		return s.listPage(c, metadata)
+	}
+
+	vms, err := s.repo.ListVMs(ctx, info.Workspace.Id)
+	if err != nil {
+		return apiError(err)
+	}
+
+	result := []types.VM{}
+	for _, v := range vms {
+		if v.DesiredState == types.VMStateDeleted && c.QueryParam("all") != "true" {
+			continue
+		}
+
+		status, err := s.launchStatus(v)
+		if err != nil {
+			return apiError(err)
+		}
+
+		if filter := c.QueryParam("status"); filter != "" && status != filter {
+			continue
+		}
+
+		match := true
+		for key, value := range metadata {
+			actual, exists := v.Metadata[key]
+			match = match && exists && actual == value
+		}
+
+		if !match {
+			continue
+		}
+
+		response := s.response(v)
+		response.Status = status
+		result = append(result, response)
+	}
+
+	return c.JSON(http.StatusOK, result)
+}
+
+// Unlike the full listing, which matches the projected launch status, a page
+// filters on stored status: a comma-separated list, matched in the database.
+func (s *Service) listPage(c echo.Context, metadata map[string]string) error {
+	ctx, info := requestContext(c)
+	limit, offset, err := pageParams(c)
+	if err != nil {
+		return err
+	}
+
+	filter := types.VMFilter{
+		Limit:    limit,
+		Offset:   offset,
+		Search:   c.QueryParam("q"),
+		Metadata: metadata,
+		All:      c.QueryParam("all") == "true",
+	}
+	if status := c.QueryParam("status"); status != "" {
+		filter.Statuses = strings.Split(status, ",")
+	}
+
+	page, err := s.repo.ListVMPage(ctx, info.Workspace.Id, filter)
+	if err != nil {
+		return apiError(err)
+	}
+
+	result := vmPage{Data: []types.VM{}, Total: page.Total, Counts: page.Counts}
+	for _, v := range page.VMs {
+		response := s.response(v)
+		if response.Status, err = s.launchStatus(v); err != nil {
+			return apiError(err)
+		}
+
+		result.Data = append(result.Data, response)
+	}
+
+	return c.JSON(http.StatusOK, result)
+}
+
+func (s *Service) get(c echo.Context) error {
+	ctx, info := requestContext(c)
+	v, err := s.repo.GetVM(ctx, info.Workspace.Id, c.Param("name"))
+	if err != nil {
+		return apiError(err)
+	}
+
+	if v.DesiredState == types.VMStateDeleted {
+		return echo.NewHTTPError(http.StatusNotFound, "VM removed")
+	}
+
+	response := s.response(v)
+	response.Status, err = s.launchStatus(v)
+	if err != nil {
+		return apiError(err)
+	}
+
+	return c.JSON(http.StatusOK, response)
+}
+
+type createRequest struct {
+	Name      string            `json:"name"`
+	Spec      json.RawMessage   `json:"spec"`
+	Template  string            `json:"template,omitempty"`
+	Snapshot  string            `json:"snapshot,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	RequestID string            `json:"request_id,omitempty"`
+	Image     json.RawMessage   `json:"image,omitempty"`
+}
+
+func (s *Service) create(c echo.Context) error {
+	ctx, info := requestContext(c)
+	var req createRequest
+	if err := decode(c, &req); err != nil {
+		return err
+	}
+
+	if req.RequestID != "" {
+		parsed, err := uuid.Parse(req.RequestID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "request_id must be a UUID")
+		}
+
+		req.RequestID = parsed.String()
+	}
+
+	if err := validateMetadata(req.Metadata); err != nil {
+		return apiError(err)
+	}
+
+	if req.Name != "" && !validName.MatchString(req.Name) {
+		return echo.NewHTTPError(http.StatusBadRequest, "name must begin with a letter and contain at most 24 lowercase letters, digits or hyphens")
+	}
+
+	if req.Template != "" && req.Snapshot != "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "choose a template or snapshot")
+	}
+
+	seed, kind := req.Template, "template"
+	if req.Snapshot != "" {
+		seed, kind = req.Snapshot, "snapshot"
+	}
+
+	if seed != "" {
+		a, err := s.repo.GetVMArtifact(ctx, info.Workspace.Id, kind, seed)
+		if errors.Is(err, sql.ErrNoRows) {
+			return echo.NewHTTPError(http.StatusNotFound, kind+" not found")
+		}
+		if err != nil {
+			return apiError(err)
+		}
+
+		base, _ := json.Marshal(a.Spec)
+		var fields, overrides map[string]json.RawMessage
+		if err := json.Unmarshal(base, &fields); err != nil {
+			return apiError(err)
+		}
+
+		if len(req.Spec) > 0 {
+			if err := json.Unmarshal(req.Spec, &overrides); err != nil {
+				return apiError(err)
+			}
+		}
+
+		for key, value := range overrides {
+			fields[key] = value
+		}
+
+		fields["source_snapshot_id"], _ = json.Marshal(a.RootSnapshotID)
+		req.Spec, _ = json.Marshal(fields)
+	}
+
+	var spec types.VMSpec
+	d := json.NewDecoder(strings.NewReader(string(req.Spec)))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&spec); err != nil {
+		return apiError(err)
+	}
+
+	if spec.SourceSnapshotID != "" && seed == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "use a VM template or fork to initialize a root disk")
+	}
+
+	var image *pb.VerifyImageBuildRequest
+	if len(req.Image) > 0 {
+		if seed != "" || spec.ImageID != "" || spec.SourceSnapshotID != "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "choose image, image_id or a template")
+		}
+		image = &pb.VerifyImageBuildRequest{}
+		if err := protojson.Unmarshal(req.Image, image); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid image specification")
+		}
+		if image.ForceRebuild || image.Gpu != "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "VM image lookup cannot rebuild or use GPUs")
+		}
+		// Validate the remaining spec before resolving the image. Resolution
+		// happens under the creation lock, after recovering an idempotent retry.
+		spec.ImageID = "pending-image-lookup"
+	}
+
+	v, err := s.createVM(ctx, info, types.VMCreateOptions{
+		Name:      req.Name,
+		Spec:      spec,
+		Metadata:  req.Metadata,
+		RequestID: req.RequestID,
+		Image:     image,
+	})
+	if err != nil {
+		return apiError(err)
+	}
+
+	return s.launchResponse(c, http.StatusCreated, v)
+}
+
+func (s *Service) createVM(ctx context.Context, info *auth.AuthInfo, opts types.VMCreateOptions) (*types.VM, error) {
+	name, spec := opts.Name, opts.Spec
+	if err := s.configureKioskTransport(&spec); err != nil {
+		return nil, err
+	}
+	if err := validate(&spec); err != nil {
+		return nil, err
+	}
+	if len(spec.Secrets) > 0 {
+		secrets, err := s.backend.GetSecretsByName(ctx, info.Workspace, spec.Secrets)
+		if err != nil {
+			return nil, err
+		}
+		if len(secrets) != len(spec.Secrets) {
+			return nil, fmt.Errorf("one or more VM secrets do not exist")
+		}
+		if err := common.ValidateSandboxSecrets(secrets, spec.AllowList); err != nil {
+			return nil, err
+		}
+	}
+
+	if spec.Pool == "" && spec.GPU == "" {
+		spec.Pool = s.config.DefaultPool
+	}
+
+	now := time.Now().UTC()
+	id := vmID(info.Workspace.Id, opts.RequestID)
+	if name == "" {
+		name = defaultVMName(id)
+	}
+
+	var imageSpec []byte
+	if opts.Image != nil {
+		imageSpec, _ = (proto.MarshalOptions{Deterministic: true}).Marshal(opts.Image)
+	}
+	creation, _ := json.Marshal(struct {
+		Name     string
+		Spec     types.VMSpec
+		Metadata map[string]string
+		Image    []byte `json:",omitempty"`
+	}{name, spec, opts.Metadata, imageSpec})
+	digest := fmt.Sprintf("%x", sha256.Sum256(creation))
+	v := &types.VM{
+		ID:                  id,
+		Name:                name,
+		Handle:              name + "-" + randomHexID(),
+		WorkspaceID:         info.Workspace.Id,
+		WorkspaceExternalID: info.Workspace.ExternalId,
+		TokenID:             info.Token.ExternalId,
+		TrafficAccessToken:  randomHexID(),
+		Spec:                spec,
+		Metadata:            opts.Metadata,
+		CreationDigest:      digest,
+		DesiredState:        types.VMStateRunning,
+		Status:              types.VMStateStarting,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+		LastActiveAt:        now,
+	}
+
+	unlock, err := s.repo.LockVM(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	defer unlock()
+	if opts.RequestID != "" {
+		existing, err := s.repo.GetVM(ctx, info.Workspace.Id, id)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+
+		if err == nil {
+			// A removed request cannot be replayed, even if defaults have changed
+			// since creation. Onboarding uses Gone to prepare a fresh request.
+			if existing.DesiredState == types.VMStateDeleted {
+				return nil, echo.NewHTTPError(http.StatusGone, "the VM for this request_id was removed")
+			}
+
+			if existing.CreationDigest != digest {
+				return nil, echo.NewHTTPError(http.StatusConflict, "request_id was already used with different VM settings")
+			}
+
+			return existing, nil
+		}
+	}
+
+	if opts.Image != nil {
+		if s.images == nil {
+			return nil, echo.NewHTTPError(http.StatusPreconditionRequired, "VM image needs to be built")
+		}
+		verified, err := s.images.VerifyImageBuild(ctx, opts.Image)
+		if err != nil {
+			return nil, err
+		}
+		if verified == nil || !verified.Valid || !verified.Exists || verified.ImageId == "" {
+			return nil, echo.NewHTTPError(http.StatusPreconditionRequired, "VM image needs to be built")
+		}
+		v.Spec.ImageID = verified.ImageId
+	}
+
+	// Hold the lifecycle lock before publishing the row to the reconciler.
+	if err := s.repo.CreateVM(ctx, v); err != nil {
+		return nil, err
+	}
+
+	if err := s.start(ctx, info, v); err != nil {
+		s.failed(ctx, v, err)
+		return v, nil
+	}
+
+	return v, nil
+}
+
+type actionRequest struct {
+	Name         string `json:"name,omitempty"`
+	NoSnapshot   bool   `json:"no_snapshot,omitempty"`
+	Port         uint32 `json:"port,omitempty"`
+	SSHPublicKey string `json:"ssh_public_key,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Protected    *bool  `json:"protected,omitempty"`
+	TTL          int64  `json:"ttl,omitempty"`
+	Cold         bool   `json:"cold,omitempty"`
+}
+
+func (s *Service) action(c echo.Context) error {
+	ctx, info := requestContext(c)
+	var req actionRequest
+	if err := decode(c, &req); err != nil {
+		return err
+	}
+
+	// Browser credentials and activity updates do not change lifecycle state.
+	// Activity has its own column, so snapshots must not block lease renewals.
+	if c.Param("action") == "access-session" || c.Param("action") == "touch" {
+		v, err := s.repo.GetVM(ctx, info.Workspace.Id, c.Param("name"))
+		if err != nil {
+			return apiError(err)
+		}
+		if v.DesiredState == types.VMStateDeleted {
+			return echo.NewHTTPError(http.StatusNotFound, "VM removed")
+		}
+		if c.Param("action") == "access-session" {
+			return s.createAccessSession(c, v, req.Port, req.TTL)
+		}
+		if lease := c.QueryParam("lease"); lease != "" {
+			if _, err := uuid.Parse(lease); err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid activity lease")
+			}
+			if c.QueryParam("release") == "1" {
+				if s.stateRepo != nil {
+					err = s.stateRepo.ReleaseActivity(ctx, v.ID, lease)
+				}
+			} else {
+				err = s.renewActivity(ctx, v.ID, lease)
+			}
+			if err != nil {
+				return apiError(err)
+			}
+		}
+		if err := s.repo.TouchVM(ctx, v.ID); err != nil {
+			return apiError(err)
+		}
+		return s.launchResponse(c, http.StatusOK, v)
+	}
+	// An already-running VM needs no lifecycle mutation. In particular, an
+	// automatic snapshot must not prevent the same caller from reconnecting.
+	if !req.Cold && (c.Param("action") == "start" || c.Param("action") == "resume" || c.Param("action") == "wake") {
+		v, err := s.repo.GetVM(ctx, info.Workspace.Id, c.Param("name"))
+		if err != nil {
+			return apiError(err)
+		}
+		if v.DesiredState == types.VMStateRunning && v.Status == types.VMStateRunning && v.Error == "" &&
+			v.TokenID == info.Token.ExternalId && v.MemoryCheckpointID == "" {
+			state, err := s.runtimeState(v)
+			if err != nil {
+				return apiError(err)
+			}
+			if state != nil && state.Status == types.ContainerStatusRunning {
+				if err := s.repo.TouchVM(ctx, v.ID); err != nil {
+					return apiError(err)
+				}
+				return s.launchResponse(c, http.StatusOK, v)
+			}
+		}
+	}
+
+	v, unlock, err := s.lockedVM(ctx, info.Workspace.Id, c.Param("name"))
+	if err != nil {
+		return apiError(err)
+	}
+
+	defer func() {
+		if unlock != nil {
+			unlock()
+		}
+	}()
+	if v.DesiredState == types.VMStateDeleted {
+		return echo.NewHTTPError(http.StatusNotFound, "VM removed")
+	}
+
+	switch c.Param("action") {
+	case "start", "resume":
+		if req.Cold {
+			// Finish terminal checkpoint finalization before abandoning RAM.
+			if v.DesiredState == types.VMStatePaused && v.MemoryCheckpointID != "" {
+				if err := s.stop(ctx, v, false); err != nil {
+					return apiError(err)
+				}
+			}
+
+			v.MemoryCheckpointID, v.MemoryDiskSnapshots = "", nil
+			if v.DesiredState == types.VMStatePaused {
+				v.DesiredState = types.VMStateStopped
+			}
+		}
+
+		err = s.activate(ctx, info, v)
+	case "pause":
+		// The worker owns a terminal checkpoint once pause is accepted. Keep
+		// its RAM/disk pairing durable even if the HTTP caller disconnects.
+		operationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+		defer cancel()
+		ctx = operationCtx
+		err = s.pause(ctx, v)
+	case "wake":
+		if !v.Spec.AutoResume && v.DesiredState != types.VMStateRunning {
+			return echo.NewHTTPError(http.StatusConflict, "VM is stopped; call start() or enable auto_resume")
+		}
+
+		err = s.activate(ctx, info, v)
+	case "stop":
+		v.MemoryCheckpointID, v.MemoryDiskSnapshots = "", nil
+		v.DesiredState = types.VMStateStopped
+		if !req.NoSnapshot && v.StopSnapshotID == "" && v.ContainerID != "" {
+			v.StopSnapshotID = uuid.NewString()
+		}
+
+		if err := s.repo.SaveVM(ctx, v); err != nil {
+			return apiError(err)
+		}
+
+		err = s.stop(ctx, v, !req.NoSnapshot)
+	case "snapshot", "template":
+		kind := c.Param("action")
+		a, err := s.capture(ctx, v, kind, req.Name, req.Description)
+		if err != nil {
+			return apiError(err)
+		}
+
+		return c.JSON(http.StatusCreated, artifactResponse(*a))
+	case "fork":
+		if req.Name != "" && !validName.MatchString(req.Name) {
+			return echo.NewHTTPError(http.StatusBadRequest, "valid fork name required")
+		}
+
+		if err := s.snapshotRoot(ctx, v); err != nil {
+			return apiError(err)
+		}
+
+		spec := v.Spec
+		spec.SourceSnapshotID = v.RootSnapshotID
+		spec.SSHPublicKey = req.SSHPublicKey
+		child, err := s.createVM(ctx, info, types.VMCreateOptions{Name: req.Name, Spec: spec})
+		if err != nil {
+			return apiError(err)
+		}
+
+		return c.JSON(http.StatusCreated, s.response(child))
+	case "expose", "unexpose", "bind":
+		if err := s.configurePort(ctx, v, c.Param("action"), req.Port, req.Protected); err != nil {
+			return apiError(err)
+		}
+	case "rotate-access-token":
+		v.TrafficAccessToken = randomHexID()
+		if err := s.repo.SaveVM(ctx, v); err != nil {
+			return apiError(err)
+		}
+
+		fallthrough
+	case "access-token":
+		return c.JSON(http.StatusOK, map[string]string{"token": v.TrafficAccessToken})
+	default:
+		return echo.NewHTTPError(http.StatusNotFound, "unknown VM action")
+	}
+
+	if err != nil {
+		s.failed(ctx, v, err)
+		return apiError(err)
+	}
+
+	// The operation is persisted; readiness must not hold the lifecycle lock.
+	unlock()
+	unlock = nil
+	return s.launchResponse(c, http.StatusOK, v)
+}
+
+func (s *Service) remove(c echo.Context) error {
+	ctx, info := requestContext(c)
+	v, unlock, err := s.lockedVM(ctx, info.Workspace.Id, c.Param("name"))
+	if err != nil {
+		return apiError(err)
+	}
+
+	defer unlock()
+	v.DesiredState = types.VMStateDeleted
+	v.MemoryCheckpointID, v.MemoryDiskSnapshots = "", nil
+	if err := s.repo.SaveVM(ctx, v); err != nil {
+		return apiError(err)
+	}
+
+	if err := s.stopOrDelete(ctx, v); err != nil {
+		return apiError(err)
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (s *Service) artifacts(c echo.Context) error {
+	ctx, info := requestContext(c)
+	kind := c.Param("kind")
+	if kind != "snapshot" && kind != "template" {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid artifact kind")
+	}
+
+	var filter types.VMArtifactFilter
+	if name := c.QueryParam("vm"); name != "" {
+		v, err := s.repo.GetVM(ctx, info.Workspace.Id, name)
+		if err != nil {
+			return apiError(err)
+		}
+
+		filter.VMID = v.ID
+	}
+
+	if c.QueryParams().Has("limit") {
+		return s.artifactPage(c, kind, filter)
+	}
+
+	a, err := s.repo.ListVMArtifacts(ctx, info.Workspace.Id, kind)
+	if err != nil {
+		return apiError(err)
+	}
+
+	result := []types.VMArtifact{}
+	for _, item := range a {
+		if filter.VMID == "" || item.VMID == filter.VMID {
+			result = append(result, artifactResponse(item))
+		}
+	}
+
+	return c.JSON(http.StatusOK, result)
+}
+
+type artifactPage struct {
+	Data  []types.VMArtifact `json:"data"`
+	Total int                `json:"total"`
+}
+
+func (s *Service) artifactPage(c echo.Context, kind string, filter types.VMArtifactFilter) error {
+	ctx, info := requestContext(c)
+	var err error
+	if filter.Limit, filter.Offset, err = pageParams(c); err != nil {
+		return err
+	}
+
+	a, total, err := s.repo.ListVMArtifactPage(ctx, info.Workspace.Id, kind, filter)
+	if err != nil {
+		return apiError(err)
+	}
+
+	for i := range a {
+		a[i] = artifactResponse(a[i])
+	}
+
+	return c.JSON(http.StatusOK, artifactPage{Data: a, Total: total})
+}
+
+func (s *Service) removeArtifact(c echo.Context) error {
+	ctx, info := requestContext(c)
+	if c.Param("kind") != "template" && c.Param("kind") != "snapshot" {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid artifact kind")
+	}
+
+	if err := s.repo.DeleteVMArtifact(ctx, info.Workspace.Id, c.Param("kind"), c.Param("artifact")); err != nil {
+		return apiError(err)
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}

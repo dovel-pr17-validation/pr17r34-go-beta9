@@ -1,0 +1,54 @@
+---
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: beta9
+image: docker.io/rancher/k3s:v1.31.5-k3s1
+servers: 1
+
+ports:
+- port: 1993:1993
+  nodeFilters:
+  - loadbalancer
+- port: 1994:1994
+  nodeFilters:
+  - loadbalancer
+- port: 9000:9000
+  nodeFilters:
+  - loadbalancer
+- port: 8008:8008
+  nodeFilters:
+  - loadbalancer
+- port: 9900:9900
+  nodeFilters:
+  - loadbalancer
+
+volumes:
+- volume: $PWD/manifests/k3d:k3s-manifests-custom
+  nodeFilters:
+  - server:0
+- volume: $HOME/.beta9-k3d/storage:k3s-storage
+  nodeFilters:
+  - servers:*
+# Worker cache on a real filesystem. On the node's overlayfs root buildah
+# cannot use the overlay driver and falls back to vfs, where every layer is a
+# full rootfs copy (~15s per commit on a 650 MiB image, 16 GiB for 30 layers).
+- volume: beta9-worker-cache:/var/lib/beta9/cache
+  nodeFilters:
+  - servers:*
+
+registries:
+  create:
+    name: registry.localhost
+    host: "0.0.0.0"
+    hostPort: "5001"
+    volumes:
+    - $HOME/.beta9-k3d/registry:/var/lib/registry
+
+options:
+  k3d:
+    wait: true
+    timeout: "60s"
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

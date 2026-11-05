@@ -1,0 +1,1095 @@
+package disk
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/stretchr/testify/require"
+)
+
+// fakeQMP is a scriptable QMP server on a unix socket.
+type fakeQMP struct {
+	listener   net.Listener
+	writtenB   atomic.Int64
+	failPivots atomic.Bool
+	nodes      atomic.Value // []string
+	pivots     atomic.Int64
+
+	mu          sync.Mutex
+	images      map[string][]string // node -> backing chain filenames, head first
+	failCommits bool
+	failDeletes bool
+	failDismiss bool
+	commitPolls int // query-jobs polls a commit job reports running before it concludes
+	commits     []fakeCommit
+	job         *fakeJob
+	cancels     int    // job-cancel calls
+	writable    string // node reported read-write
+}
+
+type fakeCommit struct{ device, top, base string }
+
+type fakeJob struct {
+	id       string
+	err      string
+	running  int
+	progress int
+}
+
+func newFakeQMP(t *testing.T, socketPath string) *fakeQMP {
+	t.Helper()
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &fakeQMP{listener: listener, images: map[string][]string{}}
+	server.nodes.Store([]string{})
+	go server.serve()
+	t.Cleanup(func() { listener.Close() })
+	return server
+}
+
+func (f *fakeQMP) setImages(images map[string][]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.images = images
+}
+
+func (f *fakeQMP) serve() {
+	for {
+		conn, err := f.listener.Accept()
+		if err != nil {
+			return
+		}
+		go f.handle(conn)
+	}
+}
+
+func (f *fakeQMP) handle(conn net.Conn) {
+	defer conn.Close()
+	fmt.Fprintf(conn, `{"QMP":{"version":{}}}`)
+	dec := json.NewDecoder(conn)
+	enc := json.NewEncoder(conn)
+	for {
+		var request struct {
+			ID        json.RawMessage `json:"id"`
+			Execute   string          `json:"execute"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := dec.Decode(&request); err != nil {
+			return
+		}
+		reply := func(key string, value any) {
+			_ = enc.Encode(map[string]any{"id": request.ID, key: value})
+		}
+		switch request.Execute {
+		case types.QMPCommandCapabilities, types.QMPCommandQuit, types.QMPCommandBlockdevAdd:
+			reply("return", struct{}{})
+		case types.QMPCommandBlockdevDel:
+			var args struct {
+				NodeName string `json:"node-name"`
+			}
+			_ = json.Unmarshal(request.Arguments, &args)
+			f.mu.Lock()
+			failed := f.failDeletes
+			if !failed {
+				delete(f.images, args.NodeName)
+				nodes := slices.Clone(f.nodes.Load().([]string))
+				f.nodes.Store(slices.DeleteFunc(nodes, func(name string) bool { return name == args.NodeName }))
+			}
+			f.mu.Unlock()
+			if failed {
+				reply("error", qmpError{Class: "GenericError", Desc: "injected node deletion failure"})
+			} else {
+				reply("return", struct{}{})
+			}
+		case types.QMPCommandQueryBlockstats:
+			reply("return", []any{map[string]any{"node-name": "file-fmt-0", "stats": map[string]any{"wr_highest_offset": f.writtenB.Load()}}})
+		case types.QMPCommandQueryNamedBlockNodes:
+			// Nodes without an image fixture stand for committed pivots.
+			f.mu.Lock()
+			nodes := f.nodes.Load().([]string)
+			entries := make([]map[string]any, 0, len(nodes))
+			for _, node := range nodes {
+				entry := map[string]any{"node-name": node, "file": "", "backing_file_depth": 1, "drv": "qcow2", "ro": node != f.writable}
+				chain := f.images[node]
+				if len(chain) > 0 {
+					entry["backing_file_depth"] = len(chain) - 1
+				}
+				var image map[string]any
+				for i := len(chain) - 1; i >= 0; i-- {
+					next := map[string]any{"filename": chain[i]}
+					if image != nil {
+						next["backing-image"] = image
+					}
+					image = next
+				}
+				if image != nil {
+					entry["image"] = image
+				}
+				entries = append(entries, entry)
+			}
+			f.mu.Unlock()
+			reply("return", entries)
+		case types.QMPCommandBlockCommit:
+			var args struct {
+				JobID  string `json:"job-id"`
+				Device string `json:"device"`
+				Top    string `json:"top"`
+				Base   string `json:"base"`
+			}
+			_ = json.Unmarshal(request.Arguments, &args)
+			f.mu.Lock()
+			f.commits = append(f.commits, fakeCommit{device: args.Device, top: args.Top, base: args.Base})
+			f.job = &fakeJob{id: args.JobID, running: f.commitPolls}
+			if f.failCommits {
+				f.job.err = "injected commit failure"
+			} else {
+				// Merge: drop every filename from top down to (but excluding)
+				// base from each node's chain.
+				for node, chain := range f.images {
+					// A monitor-owned top keeps its own backing links after
+					// the active head bypasses it, until blockdev-del.
+					if len(chain) > 0 && chain[0] == args.Top {
+						continue
+					}
+					merged := make([]string, 0, len(chain))
+					drop := false
+					for _, filename := range chain {
+						if filename == args.Base {
+							drop = false
+						}
+						if filename == args.Top {
+							drop = true
+						}
+						if !drop {
+							merged = append(merged, filename)
+						}
+					}
+					f.images[node] = merged
+				}
+			}
+			f.mu.Unlock()
+			reply("return", struct{}{})
+		case types.QMPCommandQueryJobs:
+			f.mu.Lock()
+			var job *fakeJob
+			if f.job != nil {
+				copied := *f.job
+				job = &copied
+				if f.job.running > 0 {
+					f.job.running--
+					f.job.progress++
+				}
+			}
+			f.mu.Unlock()
+			switch {
+			case job == nil:
+				reply("return", []any{})
+			case job.running > 0:
+				reply("return", []any{map[string]any{"id": job.id, "type": "commit", "status": "running", "current-progress": job.progress + 1}})
+			case job.err != "":
+				reply("return", []any{map[string]any{"id": job.id, "type": "commit", "status": "concluded", "error": job.err}})
+			default:
+				reply("return", []any{map[string]any{"id": job.id, "type": "commit", "status": "concluded"}})
+			}
+		case types.QMPCommandJobCancel:
+			f.mu.Lock()
+			f.cancels++
+			if f.job != nil {
+				f.job.running, f.job.err = 0, "Operation canceled"
+			}
+			f.mu.Unlock()
+			reply("return", struct{}{})
+		case types.QMPCommandJobDismiss:
+			f.mu.Lock()
+			failed := f.failDismiss
+			if !failed {
+				f.job = nil
+			}
+			f.mu.Unlock()
+			if failed {
+				reply("error", qmpError{Class: "GenericError", Desc: "injected dismissal failure"})
+			} else {
+				reply("return", struct{}{})
+			}
+		case types.QMPCommandTransaction:
+			f.mu.Lock()
+			busy := f.job != nil
+			f.mu.Unlock()
+			if busy {
+				reply("error", qmpError{Class: "GenericError", Desc: "block device is in use by block job"})
+				continue
+			}
+			if f.failPivots.Load() {
+				reply("error", qmpError{Class: "GenericError", Desc: "injected pivot failure"})
+				continue
+			}
+			f.pivots.Add(1)
+			reply("return", struct{}{})
+		default:
+			reply("error", qmpError{Class: "CommandNotFound", Desc: request.Execute})
+		}
+	}
+}
+
+// fakeRunner satisfies qemu-img/fsfreeze/mount calls without external tools:
+// "create" materializes the target file, everything else succeeds.
+func fakeRunner(_ context.Context, name string, args ...string) ([]byte, error) {
+	if strings.Contains(name, "qemu-img") && len(args) > 0 && args[0] == "create" {
+		return nil, os.WriteFile(args[len(args)-2], []byte("qcow2-stub"), 0o600)
+	}
+	if strings.Contains(name, "qemu-img") && len(args) > 0 && args[0] == "convert" {
+		return nil, os.WriteFile(args[len(args)-1], []byte("qcow2-stub"), 0o600)
+	}
+	return nil, nil
+}
+
+func newTestVolume(t *testing.T) (*Volume, *fakeQMP) {
+	t.Helper()
+	dir := t.TempDir()
+	layersDir := filepath.Join(dir, layersSubdir)
+	if err := os.MkdirAll(layersDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	headPath := filepath.Join(layersDir, "head-000000.qcow2")
+	if err := os.WriteFile(headPath, []byte("qcow2-stub"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Unix socket paths are limited to ~104 bytes on macOS; t.TempDir names
+	// can exceed that, so the socket lives in its own short-lived directory.
+	socketDir, err := os.MkdirTemp("", "qmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(socketDir) })
+	qmpSocket := filepath.Join(socketDir, "qmp.sock")
+	server := newFakeQMP(t, qmpSocket)
+	server.nodes.Store([]string{"fmt-0"})
+
+	manager := NewManager(Config{Root: filepath.Join(dir, "root"), Runner: fakeRunner})
+	state := &volumeState{
+		Key:              "test",
+		VirtualSizeBytes: 1 << 30,
+		Mountpoint:       filepath.Join(dir, "mnt"),
+		Attached:         true,
+		Formatted:        true,
+		HeadPath:         headPath,
+		QMPSocket:        qmpSocket,
+	}
+	volume := &Volume{manager: manager, dir: dir, state: state, fmtNode: "fmt-0", freshHead: true}
+	if err := saveVolumeState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	return volume, server
+}
+
+func TestSealSkipsUnchangedVolume(t *testing.T) {
+	volume, server := newTestVolume(t)
+	server.writtenB.Store(0)
+
+	sealed, skipped, err := volume.Seal(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !skipped || sealed != nil {
+		t.Fatalf("expected skip, got sealed=%v skipped=%v", sealed, skipped)
+	}
+	if server.pivots.Load() != 0 {
+		t.Fatal("skip must not pivot")
+	}
+}
+
+func TestSealPivotsAndPublishes(t *testing.T) {
+	volume, server := newTestVolume(t)
+	server.writtenB.Store(4096)
+	originalHead := volume.state.HeadPath
+
+	sealed, skipped, err := volume.Seal(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped || len(sealed) != 1 {
+		t.Fatalf("expected one sealed layer, got %v skipped=%v", sealed, skipped)
+	}
+	if sealed[0].Path != originalHead {
+		t.Fatalf("sealed path %s, expected old head %s", sealed[0].Path, originalHead)
+	}
+	if volume.state.HeadPath == originalHead {
+		t.Fatal("head was not replaced")
+	}
+	if volume.fmtNode != "fmt-1" {
+		t.Fatalf("fmt node is %s", volume.fmtNode)
+	}
+
+	// A forced second seal without publishing stacks a second pending layer.
+	sealed, _, err = volume.Seal(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sealed) != 2 {
+		t.Fatalf("expected both pending layers, got %d", len(sealed))
+	}
+
+	// Publishing must go oldest first.
+	if err := volume.MarkPublished(sealed[1].Path, "snap-b"); err == nil {
+		t.Fatal("publishing the newer layer first must fail")
+	}
+	if err := volume.MarkPublished(sealed[0].Path, "snap-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := volume.MarkPublished(sealed[1].Path, "snap-b"); err != nil {
+		t.Fatal(err)
+	}
+	if len(volume.state.Pending) != 0 || len(volume.state.Chain) != 2 {
+		t.Fatalf("unexpected state after publish: %+v", volume.state)
+	}
+
+	// State survives reload.
+	reloaded, err := loadVolumeState(volume.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Chain) != 2 || reloaded.Chain[0].SnapshotID != "snap-a" {
+		t.Fatalf("reloaded state mismatch: %+v", reloaded)
+	}
+}
+
+// newTestVolumeWithJournal returns a test volume journaled to store, with a
+// written block, so a seal has a layer to cut.
+func newTestVolumeWithJournal(t *testing.T, store *memoryJournalStore) (*Volume, *fakeQMP, *Journal) {
+	t.Helper()
+	volume, server := newTestVolume(t)
+	server.writtenB.Store(4096)
+	journal, err := OpenJournal(context.Background(), store, "disk", "owner", "", 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { journal.Close() })
+	volume.journal = journal
+	return volume, server, journal
+}
+
+// A volume whose journal failed must not seal: its head can hold writes whose
+// flush failed, and a published layer would offer them as a restore point.
+func TestSealRefusesFailedJournal(t *testing.T) {
+	volume, server, journal := newTestVolumeWithJournal(t, newMemoryJournalStore())
+	journal.Fail(errors.New("block device request failed"))
+
+	if _, _, err := volume.Seal(context.Background(), true); err == nil {
+		t.Fatal("a volume with a failed journal must not seal")
+	}
+	if server.pivots.Load() != 0 || len(volume.state.Pending) != 0 {
+		t.Fatalf("a refused seal must leave the volume untouched: pivots=%d pending=%d", server.pivots.Load(), len(volume.state.Pending))
+	}
+}
+
+// A journal can fail between a layer's upload and its checkpoint; the caller
+// must be able to tell that the published snapshot never became the disk's.
+func TestMarkPublishedReportsMissedCheckpoint(t *testing.T) {
+	volume, _, journal := newTestVolumeWithJournal(t, newMemoryJournalStore())
+	sealed, _, err := volume.Seal(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.Fail(errors.New("disk ownership lost"))
+
+	if err := volume.MarkPublished(sealed[0].Path, "snap-a"); !errors.Is(err, ErrNotCheckpointed) {
+		t.Fatalf("a refused checkpoint must report ErrNotCheckpointed, got %v", err)
+	}
+	if len(volume.state.Chain) != 0 || len(volume.state.Pending) != 1 {
+		t.Fatalf("an unrecorded layer must stay pending: chain=%d pending=%d", len(volume.state.Chain), len(volume.state.Pending))
+	}
+}
+
+// A journal recovered at its limit holds the first write after recovery until
+// a checkpoint makes room. Without one the write fails the journal, a failed
+// journal never seals, and the backlog survives for the next attachment to
+// checkpoint.
+func TestJournalAtItsLimitWaitsForACheckpoint(t *testing.T) {
+	ctx := context.Background()
+	write := journalRecord(t, 0, "wal")
+
+	t.Run("never checkpointed", func(t *testing.T) {
+		shorten(t, &journalRoomWait, 20*time.Millisecond)
+		store := newMemoryJournalStore()
+		seedJournalBacklog(t, store, "disk", journalMaxBytes)
+		volume, _, journal := newTestVolumeWithJournal(t, store)
+		journal.Recovered()
+		if err := journal.WaitForRoom(len(write)); err == nil {
+			t.Fatal("a write no checkpoint makes room for must fail the journal")
+		}
+		if _, _, err := volume.Seal(ctx, true); err == nil {
+			t.Fatal("a failed journal must not seal")
+		}
+		journal.Close()
+
+		next, err := OpenJournal(ctx, store, "disk", "next-owner", "", 1<<30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer next.Close()
+		if !next.NeedsCheckpoint() {
+			t.Fatal("the backlog must outlive the refused write")
+		}
+	})
+
+	t.Run("checkpointing first", func(t *testing.T) {
+		store := newMemoryJournalStore()
+		seedJournalBacklog(t, store, "disk", journalMaxBytes)
+		volume, _, journal := newTestVolumeWithJournal(t, store)
+		sealed, _, err := volume.Seal(ctx, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := volume.MarkPublished(sealed[0].Path, "snap-1"); err != nil {
+			t.Fatal(err)
+		}
+		if journal.NeedsCheckpoint() {
+			t.Fatal("the checkpoint must empty the backlog")
+		}
+		if err := journal.Commit(ctx, write); err != nil {
+			t.Fatalf("a write after the checkpoint must commit: %v", err)
+		}
+	})
+}
+
+// The bypass that lets a seal flush past a full journal covers the freeze and
+// the thaw, which the seal waits for, and ends with the thaw: writes after
+// it, even while an uncertain pivot is checked, wait for room like any other.
+func TestSealEndsTheJournalBypassWithTheThaw(t *testing.T) {
+	volume, _, journal := newTestVolumeWithJournal(t, newMemoryJournalStore())
+	flushing := func() bool {
+		journal.mu.Lock()
+		defer journal.mu.Unlock()
+		return journal.flushing
+	}
+	volume.state.Export = string(ExportVhostUser)
+	volume.state.Mountpoint = ""
+	var duringFreeze, duringThaw bool
+	volume.freeze = func(ctx context.Context) (func(), error) {
+		duringFreeze = flushing()
+		return func() { duringThaw = flushing() }, nil
+	}
+
+	if _, _, err := volume.Seal(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if !duringFreeze || !duringThaw || flushing() {
+		t.Fatalf("the bypass must cover the freeze and the thaw and end with them: freeze=%v thaw=%v after=%v", duringFreeze, duringThaw, flushing())
+	}
+}
+
+// Writes a seal holds are being published; only newer ones make a volume
+// backlogged.
+func TestBackloggedCountsWritesSinceTheNewestSeal(t *testing.T) {
+	store := newMemoryJournalStore()
+	seedJournalBacklog(t, store, "disk", journalCheckpointBytes)
+	volume, _, journal := newTestVolumeWithJournal(t, store)
+	if !volume.Backlogged() {
+		t.Fatal("a checkpoint's worth of unsealed writes must count")
+	}
+	if _, _, err := volume.Seal(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if volume.Backlogged() || !journal.NeedsCheckpoint() {
+		t.Fatal("sealed writes must not count, though the journal holds them until they are published")
+	}
+}
+
+// newThawingVolume returns a journaled volume on store whose filesystem thaw
+// commits records through the journal the way the NBD export does, as an ext4
+// thaw commits its superblock.
+func newThawingVolume(t *testing.T, store *memoryJournalStore, records []byte) (*Volume, *Journal) {
+	t.Helper()
+	volume, _, journal := newTestVolumeWithJournal(t, store)
+	volume.manager = NewManager(Config{Root: volume.manager.root, Runner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "fsfreeze" && args[0] == "--unfreeze" {
+			if err := journal.WaitForRoom(len(records)); err != nil {
+				return nil, err
+			}
+			return nil, journal.Commit(ctx, records)
+		}
+		return fakeRunner(ctx, name, args...)
+	}})
+	return volume, journal
+}
+
+// superblockRewrite is the journal record of an ext4 thaw: the 4 KiB block
+// holding the superblock.
+func superblockRewrite(t *testing.T) []byte {
+	return journalRecord(t, 0, strings.Repeat("s", 4096))
+}
+
+// Thawing ext4 rewrites its superblock, so every seal leaves a commit in the
+// journal. Counted as a change, it gave idle databases an empty generation on
+// every checkpoint interval, forever.
+func TestChangedIgnoresTheThawsSuperblockRewrite(t *testing.T) {
+	ctx := context.Background()
+	volume, journal := newThawingVolume(t, newMemoryJournalStore(), superblockRewrite(t))
+	if err := journal.Commit(ctx, journalRecord(t, 0, "wal")); err != nil {
+		t.Fatal(err)
+	}
+	if !volume.Changed() {
+		t.Fatal("an unsealed write is a change")
+	}
+
+	sealed, _, err := volume.Seal(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !volume.Changed() {
+		t.Fatal("a sealed layer awaiting publication is a change")
+	}
+	if err := volume.MarkPublished(sealed[0].Path, "snap-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, pending := journal.State(); pending == 0 {
+		t.Fatal("the thaw's rewrite must stay journaled")
+	}
+	if volume.Changed() {
+		t.Fatal("the thaw's rewrite alone is not a change")
+	}
+
+	if err := journal.Commit(ctx, journalRecord(t, 0, "wal")); err != nil {
+		t.Fatal(err)
+	}
+	if !volume.Changed() {
+		t.Fatal("a write after the thaw is a change")
+	}
+}
+
+// Without FUA the thaw's rewrite would reach the journal in the same commit as
+// the writes after it, and those must not go unpublished.
+func TestChangedCountsAThawCommitCarryingWrites(t *testing.T) {
+	ctx := context.Background()
+	volume, _ := newThawingVolume(t, newMemoryJournalStore(), append(superblockRewrite(t), journalRecord(t, 8192, "wal")...))
+	sealed, _, err := volume.Seal(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := volume.MarkPublished(sealed[0].Path, "snap-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !volume.Changed() {
+		t.Fatal("a thaw commit carrying other writes is a change")
+	}
+}
+
+// The thaw rewrites the superblock before writers resume, and the seal waits
+// for the thaw. Held for room in a full journal, that write waited on the
+// checkpoint it was part of until the journal failed, and the disk with it.
+func TestSealThawsThroughAFullJournal(t *testing.T) {
+	shorten(t, &journalRoomWait, 200*time.Millisecond)
+	store := newMemoryJournalStore()
+	seedJournalBacklog(t, store, "disk", journalMaxBytes)
+	volume, journal := newThawingVolume(t, store, superblockRewrite(t))
+	journal.Recovered()
+
+	if _, _, err := volume.Seal(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Check(); err != nil {
+		t.Fatalf("the thaw must not wait for the room its seal makes: %v", err)
+	}
+	if _, sequence, _ := journal.State(); volume.thawed != sequence {
+		t.Fatal("the thaw's superblock rewrite must reach the journal")
+	}
+}
+
+// Compaction follows a publish, so a chain at the cap needs one before the
+// caller can seal again; the caller has to be able to tell.
+func TestSealAtTheChainDepthCapReportsIt(t *testing.T) {
+	volume, server := newTestVolume(t)
+	server.writtenB.Store(4096)
+	volume.manager.maxChainDepth = volume.Depth()
+
+	if _, _, err := volume.Seal(context.Background(), true); !errors.Is(err, ErrMaxChainDepth) {
+		t.Fatalf("a seal at the cap must report ErrMaxChainDepth, got %v", err)
+	}
+	if server.pivots.Load() != 0 {
+		t.Fatal("a refused seal must not pivot")
+	}
+}
+
+// A retried checkpoint publishes what its failed attempts sealed instead of
+// cutting another layer on every retry.
+func TestUnpublishedLeavesTheHeadAlone(t *testing.T) {
+	volume, server := newTestVolume(t)
+	server.writtenB.Store(4096)
+	if layers, err := volume.Unpublished(context.Background()); err != nil || len(layers) != 0 {
+		t.Fatalf("nothing is sealed yet, got %v", layers)
+	}
+	sealed, _, err := volume.Seal(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	layers, err := volume.Unpublished(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layers) != 1 || layers[0] != sealed[0] {
+		t.Fatalf("expected the sealed layer %v, got %v", sealed, layers)
+	}
+	if server.pivots.Load() != 1 || len(volume.state.Pending) != 1 {
+		t.Fatalf("Unpublished must not seal: pivots=%d pending=%d", server.pivots.Load(), len(volume.state.Pending))
+	}
+}
+
+func TestSealRollsBackFailedPivot(t *testing.T) {
+	volume, server := newTestVolume(t)
+	server.writtenB.Store(4096)
+	server.failPivots.Store(true)
+	originalHead := volume.state.HeadPath
+
+	_, _, err := volume.Seal(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected pivot failure")
+	}
+	if volume.state.HeadPath != originalHead {
+		t.Fatal("head must be restored after a failed pivot")
+	}
+	if len(volume.state.Pending) != 0 {
+		t.Fatal("pending must be empty after rollback")
+	}
+	if volume.state.PivotCount != 0 || volume.fmtNode != "fmt-0" {
+		t.Fatalf("pivot bookkeeping leaked: count=%d node=%s", volume.state.PivotCount, volume.fmtNode)
+	}
+}
+
+func TestSealTreatsCommittedLostReplyAsSuccess(t *testing.T) {
+	volume, server := newTestVolume(t)
+	server.writtenB.Store(4096)
+	server.failPivots.Store(true)
+	// The daemon reports the new node exists, so the "failure" was a lost
+	// reply and the pivot must be treated as committed.
+	server.nodes.Store([]string{"fmt-0", "fmt-1"})
+
+	sealed, _, err := volume.Seal(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sealed) != 1 || volume.fmtNode != "fmt-1" {
+		t.Fatalf("committed pivot not recognized: sealed=%v node=%s", sealed, volume.fmtNode)
+	}
+}
+
+func TestReusableState(t *testing.T) {
+	dir := t.TempDir()
+	touch := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	head := touch("head.qcow2")
+	layerA := touch("a.qcow2")
+
+	published := &volumeState{
+		Chain:    []stateLayer{{SnapshotID: "snap-a", Path: layerA}},
+		HeadPath: head,
+	}
+
+	cases := []struct {
+		name  string
+		state *volumeState
+		spec  AttachSpec
+		want  bool
+	}{
+		{"no local state", nil, AttachSpec{}, false},
+		{"read-only never reuses", published, AttachSpec{ReadOnly: true, Chain: []ChainLayer{{SnapshotID: "snap-a"}}}, false},
+		{"local has requested latest", published, AttachSpec{Chain: []ChainLayer{{SnapshotID: "snap-a"}}}, true},
+		{"remote is ahead", published, AttachSpec{Chain: []ChainLayer{{SnapshotID: "snap-a"}, {SnapshotID: "snap-b"}}}, false},
+		{"remote empty but local published", published, AttachSpec{}, false},
+		{"never published local head", &volumeState{HeadPath: head}, AttachSpec{}, true},
+		{"missing layer file", &volumeState{Chain: []stateLayer{{SnapshotID: "snap-a", Path: filepath.Join(dir, "gone.qcow2")}}, HeadPath: head}, AttachSpec{Chain: []ChainLayer{{SnapshotID: "snap-a"}}}, false},
+	}
+	for _, tc := range cases {
+		if got := reusableState(tc.state, tc.spec); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// newCompactVolume returns a volume with three published layers and a live
+// graph reporting the full chain under the head.
+func newCompactVolume(t *testing.T) (*Volume, *fakeQMP, []string) {
+	t.Helper()
+	volume, server := newTestVolume(t)
+	layersDir := filepath.Join(volume.dir, layersSubdir)
+	paths := make([]string, 3)
+	for i, name := range []string{"a", "b", "c"} {
+		paths[i] = filepath.Join(layersDir, name+".qcow2")
+		if err := os.WriteFile(paths[i], []byte("qcow2-stub"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	volume.state.Chain = []stateLayer{
+		{SnapshotID: "snap-a", Path: paths[0]},
+		{SnapshotID: "snap-b", Path: paths[1]},
+		{SnapshotID: "snap-c", Path: paths[2]},
+	}
+	if err := saveVolumeState(volume.dir, volume.state); err != nil {
+		t.Fatal(err)
+	}
+	server.nodes.Store([]string{"fmt-0", "fmt-1", "fmt-2", "file-fmt-2"})
+	server.setImages(map[string][]string{
+		"fmt-0":      {volume.state.HeadPath, paths[2], paths[1], paths[0]},
+		"fmt-1":      {paths[1], paths[0]},
+		"fmt-2":      {paths[2], paths[1], paths[0]},
+		"file-fmt-2": {paths[2]},
+	})
+	return volume, server, paths
+}
+
+func TestCompactMergesPublishedChainIntoBase(t *testing.T) {
+	volume, server, paths := newCompactVolume(t)
+
+	if err := volume.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	server.mu.Lock()
+	commits := append([]fakeCommit{}, server.commits...)
+	server.mu.Unlock()
+	if len(commits) != 1 || commits[0] != (fakeCommit{device: "fmt-0", top: paths[2], base: paths[0]}) {
+		t.Fatalf("unexpected commit calls: %+v", commits)
+	}
+
+	// The base file carries the newest generation's ID; merged files are gone.
+	want := stateLayer{SnapshotID: "snap-c", Path: paths[0]}
+	if len(volume.state.Chain) != 1 || volume.state.Chain[0] != want {
+		t.Fatalf("chain not collapsed: %+v", volume.state.Chain)
+	}
+	if volume.Depth() != 2 {
+		t.Fatalf("depth is %d, expected base + head", volume.Depth())
+	}
+	reloaded, err := loadVolumeState(volume.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Chain) != 1 || reloaded.Chain[0] != want {
+		t.Fatalf("collapsed chain not persisted: %+v", reloaded.Chain)
+	}
+	for _, path := range paths[1:] {
+		if fileExists(path) {
+			t.Fatalf("merged layer %s must be deleted", path)
+		}
+	}
+	if !fileExists(paths[0]) {
+		t.Fatal("base layer must survive compaction")
+	}
+	if nodes := server.nodes.Load().([]string); len(nodes) != 1 || nodes[0] != volume.fmtNode {
+		t.Fatalf("compacted nodes remain open: %v", nodes)
+	}
+}
+
+// A live commit uploads nothing, so its job's progress is what tells a
+// caller's watchdog that a long merge is still working.
+func TestCompactReportsCommitProgress(t *testing.T) {
+	volume, server, _ := newCompactVolume(t)
+	server.mu.Lock()
+	server.commitPolls = 3
+	server.mu.Unlock()
+
+	var reports atomic.Int64
+	if err := volume.Compact(WithProgress(context.Background(), func() { reports.Add(1) })); err != nil {
+		t.Fatal(err)
+	}
+	if reports.Load() != 3 {
+		t.Fatalf("each advance of the commit job must report progress once, got %d reports", reports.Load())
+	}
+}
+
+func TestCompactSkipsPendingAndShallowChains(t *testing.T) {
+	volume, server, _ := newCompactVolume(t)
+	volume.state.Pending = []stateLayer{{Path: "pending.qcow2"}}
+	if err := volume.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	volume.state.Pending = nil
+	volume.state.Chain = volume.state.Chain[:1]
+	if err := volume.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if len(server.commits) != 0 {
+		t.Fatalf("no commit must be issued: %+v", server.commits)
+	}
+}
+
+// A crash between a completed commit and the state save leaves the live graph
+// already merged; the next Compact must adopt that result instead of running
+// a job whose top is no longer in the chain.
+func TestCompactAdoptsAlreadyMergedChain(t *testing.T) {
+	volume, server, paths := newCompactVolume(t)
+	server.setImages(map[string][]string{
+		"fmt-0": {volume.state.HeadPath, paths[0]},
+	})
+
+	if err := volume.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	server.mu.Lock()
+	commitCount := len(server.commits)
+	server.mu.Unlock()
+	if commitCount != 0 {
+		t.Fatal("adopting a merged chain must not issue a commit")
+	}
+	want := stateLayer{SnapshotID: "snap-c", Path: paths[0]}
+	if len(volume.state.Chain) != 1 || volume.state.Chain[0] != want {
+		t.Fatalf("chain not collapsed: %+v", volume.state.Chain)
+	}
+}
+
+func TestCompactSurfacesCommitFailure(t *testing.T) {
+	volume, server, paths := newCompactVolume(t)
+	server.mu.Lock()
+	server.failCommits = true
+	server.mu.Unlock()
+
+	if err := volume.Compact(context.Background()); err == nil {
+		t.Fatal("expected commit failure")
+	}
+	if len(volume.state.Chain) != 3 {
+		t.Fatalf("chain must be unchanged after a failed commit: %+v", volume.state.Chain)
+	}
+	for _, path := range paths {
+		if !fileExists(path) {
+			t.Fatalf("layer %s must survive a failed commit", path)
+		}
+	}
+}
+
+func TestCompactKeepsFilesAndRetriesWhenNodeCleanupFails(t *testing.T) {
+	volume, server, paths := newCompactVolume(t)
+	server.mu.Lock()
+	server.failDeletes = true
+	server.mu.Unlock()
+	if err := volume.Compact(context.Background()); err == nil {
+		t.Fatal("expected node cleanup failure")
+	}
+	if len(volume.state.Chain) != 3 {
+		t.Fatal("cleanup failure must retain the recovery record")
+	}
+	for _, path := range paths {
+		if !fileExists(path) {
+			t.Fatalf("cleanup failure must retain layer %s", path)
+		}
+	}
+	server.mu.Lock()
+	server.failDeletes = false
+	server.mu.Unlock()
+	if err := volume.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(volume.state.Chain) != 1 {
+		t.Fatal("retry must finish the already-committed merge")
+	}
+	if nodes := server.nodes.Load().([]string); len(nodes) != 1 || nodes[0] != volume.fmtNode {
+		t.Fatalf("retry left compacted nodes open: %v", nodes)
+	}
+}
+
+func TestRecoverCleansUpCrashedVolume(t *testing.T) {
+	root := t.TempDir()
+	sysBlock, dev := t.TempDir(), t.TempDir()
+	writeTestNBDDevice(t, sysBlock, "nbd0", "43:0")
+	manager := NewManager(Config{
+		Root:         root,
+		SysBlockPath: sysBlock,
+		DevPath:      dev,
+		Runner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			switch name {
+			case "mknod":
+				return nil, os.WriteFile(args[2], nil, 0o600)
+			case "stat":
+				return []byte("6180:2b:0\n"), nil
+			default:
+				return fakeRunner(ctx, name, args...)
+			}
+		},
+	})
+
+	dir := manager.volumeDir("crashed")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := &volumeState{
+		Key:      "crashed",
+		Attached: true,
+		QSDPid:   1 << 30, // certainly not a live qemu-storage-daemon
+		HeadPath: headLayerPath(filepath.Join(dir, layersSubdir), 0),
+	}
+	if err := saveVolumeState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := loadVolumeState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Attached {
+		t.Fatal("crashed volume must be marked detached")
+	}
+	if _, ok := manager.Volume("crashed"); ok {
+		t.Fatal("crashed volume must not be adopted")
+	}
+}
+
+func TestDetachAllCleansEveryOwnedVolume(t *testing.T) {
+	manager := NewManager(Config{Root: t.TempDir(), Runner: fakeRunner})
+	for _, key := range []string{"disk-a", "disk-b"} {
+		dir := manager.volumeDir(key)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		state := &volumeState{Key: key, Attached: true}
+		if err := saveVolumeState(dir, state); err != nil {
+			t.Fatal(err)
+		}
+		manager.volumes[key] = &Volume{manager: manager, dir: dir, state: state}
+	}
+
+	if err := manager.DetachAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.volumes) != 0 {
+		t.Fatalf("owned volumes after detach = %d, want 0", len(manager.volumes))
+	}
+}
+
+func TestCancelledCompactCanBeSealedOrCompactedAgain(t *testing.T) {
+	for _, seal := range []bool{true, false} {
+		t.Run(fmt.Sprint("seal=", seal), func(t *testing.T) {
+			volume, server, _ := newCompactVolume(t)
+			server.mu.Lock()
+			server.commitPolls = 3
+			server.mu.Unlock()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if err := volume.Compact(WithProgress(ctx, cancel)); !errors.Is(err, context.Canceled) {
+				t.Fatalf("expected interrupted commit: %v", err)
+			}
+			if seal {
+				if _, _, err := volume.Seal(context.Background(), true); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := volume.Compact(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			server.mu.Lock()
+			defer server.mu.Unlock()
+			if server.job != nil || len(server.commits) != 1 {
+				t.Fatalf("must finish the original job, not submit another: job=%+v commits=%v", server.job, server.commits)
+			}
+		})
+	}
+}
+
+func TestCompactRetainsRecoveryStateUntilJobDismissed(t *testing.T) {
+	volume, server, paths := newCompactVolume(t)
+	server.mu.Lock()
+	server.failDismiss = true
+	server.mu.Unlock()
+	if err := volume.Compact(context.Background()); err == nil {
+		t.Fatal("expected dismissal failure")
+	}
+	if len(volume.state.Chain) != 3 {
+		t.Fatal("must retain recovery state")
+	}
+	for _, path := range paths {
+		if !fileExists(path) {
+			t.Fatalf("missing recovery layer %s", path)
+		}
+	}
+	server.mu.Lock()
+	server.failDismiss = false
+	server.mu.Unlock()
+	if err := volume.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.job != nil || len(server.commits) != 1 {
+		t.Fatal("must reconcile the original commit")
+	}
+}
+
+// Merge folds the layers above first into a base the daemon holds read-only,
+// since reopening it so flushes the commit's writes. A retry adopts the
+// commit that a refused merge already ran.
+func TestMergeCommitsTheLayersAboveFirstIntoAReadOnlyBase(t *testing.T) {
+	volume, server, paths := newCompactVolume(t)
+	server.mu.Lock()
+	server.writable = "fmt-1"
+	server.mu.Unlock()
+	_, err := volume.Merge(context.Background(), 1)
+	require.ErrorContains(t, err, "writable")
+	require.Len(t, volume.state.Chain, 3)
+
+	server.mu.Lock()
+	server.writable = ""
+	server.mu.Unlock()
+	merged, err := volume.Merge(context.Background(), 1)
+	require.NoError(t, err)
+	require.Equal(t, PublishedLayer{SnapshotID: "snap-c", Path: paths[1]}, merged)
+	require.Equal(t, []stateLayer{{SnapshotID: "snap-a", Path: paths[0]}, {SnapshotID: "snap-c", Path: paths[1]}}, volume.state.Chain)
+	require.NoFileExists(t, paths[2])
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	require.Equal(t, []fakeCommit{{device: "fmt-0", top: paths[2], base: paths[1]}}, server.commits)
+}
+
+// Unlike Compact's, a merge's commit has no caller to finish it later, so
+// cancelling the merge cancels the commit.
+func TestCancelledMergeCancelsItsCommit(t *testing.T) {
+	volume, server, _ := newCompactVolume(t)
+	server.mu.Lock()
+	server.commitPolls = 3
+	server.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := volume.Merge(WithProgress(ctx, cancel), 1)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, volume.state.Chain, 3)
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	require.Equal(t, 1, server.cancels)
+	require.Nil(t, server.job, "the cancelled job must be dismissed")
+}
+
+// Attaching a generation a merge republished, as a memory checkpoint paired
+// with it does, still reuses the local chain.
+func TestRepublishedGenerationsStayReusable(t *testing.T) {
+	volume, _, _ := newCompactVolume(t)
+	require.NoError(t, volume.Republished(map[string]string{"snap-c": "new-c"}))
+	require.NoError(t, volume.Republished(map[string]string{"new-c": "newer-c"}))
+	state, err := loadVolumeState(volume.dir)
+	require.NoError(t, err)
+	for _, id := range []string{"snap-c", "new-c", "newer-c"} {
+		require.True(t, reusableState(state, AttachSpec{Chain: []ChainLayer{{SnapshotID: id}}}), id)
+	}
+}

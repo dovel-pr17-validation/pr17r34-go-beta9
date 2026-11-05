@@ -1,0 +1,2080 @@
+package worker
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	common "github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/runtime"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/beam-cloud/beta9/pkg/worker/egress"
+	pb "github.com/beam-cloud/beta9/proto"
+	goproc "github.com/beam-cloud/goproc/pkg"
+	"github.com/google/shlex"
+	"github.com/google/uuid"
+	"github.com/opencontainers/runtime-spec/specs-go"
+)
+
+const (
+	gRPCMaxRecvMsgSize                  = 1024 * 1024 * 16
+	gRPCMaxSendMsgSize                  = 1024 * 1024 * 16
+	sandboxProcessManagerClientRetry    = 25 * time.Millisecond
+	sandboxProcessManagerClientTimeout  = 10 * time.Second
+	sandboxProcessManagerReadyTimeout   = 10 * time.Second
+	sandboxProcessManagerReadyPollDelay = 25 * time.Millisecond
+	sandboxExecInlineWaitTimeout        = 750 * time.Millisecond
+	sandboxExecInlineWaitPollDelay      = 20 * time.Millisecond
+)
+
+// ContainerRuntimeServer is a runtime-agnostic container server that works with any OCI runtime
+type processLogEventRepository interface {
+	PushContainerLogEventQueued(entry types.EventContainerLogSchema) error
+}
+
+type ContainerRuntimeServer struct {
+	baseConfigSpec specs.Spec
+	pb.UnimplementedContainerServiceServer
+	containerInstances      *common.SafeMap[*ContainerInstance]
+	completedLogs           sync.Map // container ID -> *common.LogBuffer
+	terminalCheckpoints     sync.Map // container ID -> *terminalCheckpointResult
+	killedSandboxProcesses  sync.Map
+	containerRepoClient     pb.ContainerRepositoryServiceClient
+	containerNetworkManager ContainerNetwork
+	imageClient             *ImageClient
+	runtime                 runtime.Runtime // The worker's configured runtime (from pool config)
+	eventRepo               processLogEventRepository
+	workerID                string
+	port                    int
+	podAddr                 string
+	backendRoute            backendRouteFunc
+	createCheckpoint        createCheckpointFunc
+	snapshotDisks           snapshotDisksFunc
+	grpcServer              *grpc.Server
+	mu                      sync.Mutex
+	exposePortMu            sync.Mutex
+}
+
+type (
+	backendRouteFunc     func(request *types.ContainerRequest, kind string, port int32, localTarget string) *pb.BackendRoute
+	createCheckpointFunc func(ctx context.Context, opts *CreateCheckpointOpts) error
+	snapshotDisksFunc    func(ctx context.Context, request *types.ContainerRequest) ([]*types.DiskSnapshot, error)
+)
+
+type ContainerRuntimeServerOpts struct {
+	PodAddr                 string
+	Runtime                 runtime.Runtime // The runtime configured for this worker pool
+	ContainerInstances      *common.SafeMap[*ContainerInstance]
+	ImageClient             *ImageClient
+	ContainerRepoClient     pb.ContainerRepositoryServiceClient
+	ContainerNetworkManager ContainerNetwork
+	EventRepo               repository.EventRepository
+	WorkerID                string
+	BackendRoute            backendRouteFunc
+	CreateCheckpoint        createCheckpointFunc
+	SnapshotDisks           snapshotDisksFunc
+}
+
+// NewContainerRuntimeServer creates a new runtime-agnostic container server
+func NewContainerRuntimeServer(opts *ContainerRuntimeServerOpts) (*ContainerRuntimeServer, error) {
+	var baseConfigSpec specs.Spec
+
+	// Get the appropriate base config for the runtime
+	baseConfig := runtime.GetBaseConfig(opts.Runtime.Name())
+	specTemplate := strings.TrimSpace(baseConfig)
+	err := json.Unmarshal([]byte(specTemplate), &baseConfigSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ContainerRuntimeServer{
+		podAddr:                 opts.PodAddr,
+		runtime:                 opts.Runtime,
+		baseConfigSpec:          baseConfigSpec,
+		containerInstances:      opts.ContainerInstances,
+		imageClient:             opts.ImageClient,
+		containerRepoClient:     opts.ContainerRepoClient,
+		containerNetworkManager: opts.ContainerNetworkManager,
+		eventRepo:               opts.EventRepo,
+		workerID:                opts.WorkerID,
+		backendRoute:            opts.BackendRoute,
+		createCheckpoint:        opts.CreateCheckpoint,
+		snapshotDisks:           opts.SnapshotDisks,
+	}, nil
+}
+
+func (s *ContainerRuntimeServer) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.grpcServer != nil {
+		return errors.New("server already started")
+	}
+
+	listener, err := listenForContainerRuntimeServer(s.containerNetworkManager)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to listen")
+		return fmt.Errorf("failed to listen: %w", err)
+	}
+
+	s.port = listener.Addr().(*net.TCPAddr).Port
+	log.Info().Int("port", s.port).Msg("container runtime server started")
+
+	s.grpcServer = grpc.NewServer(
+		grpc.UnaryInterceptor(s.replaySandboxRequest),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    20 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
+		grpc.MaxRecvMsgSize(gRPCMaxRecvMsgSize),
+		grpc.MaxSendMsgSize(gRPCMaxSendMsgSize),
+	)
+
+	pb.RegisterContainerServiceServer(s.grpcServer, s)
+
+	go func() {
+		err := s.grpcServer.Serve(listener)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to start grpc server")
+			os.Exit(1)
+		}
+	}()
+
+	return nil
+}
+
+type hostPortConflictChecker interface {
+	HostPortConflict(port int) (bool, error)
+}
+
+func listenForContainerRuntimeServer(networkManager ContainerNetwork) (net.Listener, error) {
+	checker, _ := networkManager.(hostPortConflictChecker)
+	for attempts := 0; attempts < 100; attempts++ {
+		listener, err := net.Listen("tcp", ":0")
+		if err != nil {
+			return nil, err
+		}
+		if checker == nil {
+			return listener, nil
+		}
+
+		port := listener.Addr().(*net.TCPAddr).Port
+		conflict, err := checker.HostPortConflict(port)
+		if err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
+		if !conflict {
+			return listener, nil
+		}
+		_ = listener.Close()
+	}
+	return nil, errors.New("failed to bind container runtime server outside existing host forwarding rules")
+}
+
+func (s *ContainerRuntimeServer) Stop() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.grpcServer != nil {
+		s.grpcServer.GracefulStop()
+		s.grpcServer = nil
+	}
+	return nil
+}
+
+// getRuntime returns the worker's configured runtime
+func (s *ContainerRuntimeServer) getRuntime() runtime.Runtime {
+	return s.runtime
+}
+
+// ContainerKill kills and removes a container using the worker's configured runtime
+func (s *ContainerRuntimeServer) ContainerKill(ctx context.Context, in *pb.ContainerKillRequest) (*pb.ContainerKillResponse, error) {
+	rt := s.getRuntime()
+
+	// Send SIGTERM first
+	_ = rt.Kill(ctx, in.ContainerId, syscall.SIGTERM, &runtime.KillOpts{All: true})
+
+	// Force delete
+	err := rt.Delete(ctx, in.ContainerId, &runtime.DeleteOpts{Force: true})
+
+	return &pb.ContainerKillResponse{
+		Ok: err == nil,
+	}, nil
+}
+
+// ContainerExec executes a command inside a running container
+func (s *ContainerRuntimeServer) ContainerExec(ctx context.Context, in *pb.ContainerExecRequest) (*pb.ContainerExecResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerExecResponse{Ok: false}, nil
+	}
+
+	instanceSpec := instance.Spec.Process
+	process := *s.baseConfigSpec.Process
+	process.Args = []string{"sh", "-c", in.Cmd}
+	process.Cwd = instanceSpec.Cwd
+	process.Env = slices.Concat(instanceSpec.Env, in.Env)
+
+	if instance.Request.IsBuildRequest() {
+		// For build containers, use background context to prevent cancellation issues
+		ctx = context.Background()
+		process.Env = append(process.Env, instance.Request.BuildOptions.BuildSecrets...)
+	}
+
+	// Use the worker's configured runtime for exec
+	rt := s.getRuntime()
+	err := rt.Exec(ctx, in.ContainerId, process, &runtime.ExecOpts{
+		OutputWriter: instance.OutputWriter,
+	})
+
+	return &pb.ContainerExecResponse{
+		Ok: err == nil,
+	}, nil
+}
+
+// ContainerStatus returns the status of a container
+func (s *ContainerRuntimeServer) ContainerStatus(ctx context.Context, in *pb.ContainerStatusRequest) (*pb.ContainerStatusResponse, error) {
+	rt := s.getRuntime()
+
+	state, err := rt.State(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerStatusResponse{Running: false}, nil
+	}
+
+	return &pb.ContainerStatusResponse{
+		Running: state.Status == types.RuncContainerStatusRunning,
+	}, nil
+}
+
+// ContainerStreamLogs streams container logs
+func (s *ContainerRuntimeServer) ContainerStreamLogs(req *pb.ContainerStreamLogsRequest, stream pb.ContainerService_ContainerStreamLogsServer) error {
+	instance, exists := s.containerInstances.Get(req.ContainerId)
+	var logs *common.LogBuffer
+	if exists {
+		logs = instance.LogBuffer
+	} else if completed, ok := s.completedLogs.Load(req.ContainerId); ok {
+		logs = completed.(*common.LogBuffer)
+	}
+	if logs == nil {
+		return errors.New("container not found")
+	}
+	if err := stream.SendHeader(nil); err != nil {
+		return err
+	}
+
+	buffer := make([]byte, 4096)
+	logEntry := &pb.ContainerLogEntry{}
+	offsets := metadata.ValueFromIncomingContext(stream.Context(), common.LogOffsetHeader)
+	var offset int64
+	if len(offsets) > 0 {
+		var err error
+		offset, err = strconv.ParseInt(offsets[0], 10, 64)
+		if err != nil || offset < 0 {
+			return status.Error(codes.InvalidArgument, "invalid log offset")
+		}
+	}
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			return errors.New("context cancelled")
+		default:
+		}
+
+		var n int
+		var err error
+		if len(offsets) > 0 {
+			n, err = logs.ReadAt(buffer, offset)
+		} else {
+			n, err = logs.Read(buffer)
+		}
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if n > 0 {
+			logEntry.Msg = string(buffer[:n])
+			offset += int64(n)
+			if err := stream.Send(logEntry); err != nil {
+				return err
+			}
+			continue
+		}
+
+		time.Sleep(time.Duration(100) * time.Millisecond)
+	}
+
+	return nil
+}
+
+func (s *ContainerRuntimeServer) retainCompletedLogs(containerID string, logs *common.LogBuffer) {
+	if _, loaded := s.completedLogs.LoadOrStore(containerID, logs); loaded {
+		return
+	}
+	time.AfterFunc(common.CompletedContainerLogRetention, func() {
+		s.completedLogs.Delete(containerID)
+		logs.Dispose()
+	})
+}
+
+// ContainerCheckpoint creates a checkpoint of a running container
+func (s *ContainerRuntimeServer) ContainerCheckpoint(ctx context.Context, in *pb.ContainerCheckpointRequest) (*pb.ContainerCheckpointResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if in.TerminateAfterCheckpoint {
+		if saved, ok := s.terminalCheckpoints.Load(in.ContainerId); ok {
+			return saved.(*terminalCheckpointResult).wait(ctx)
+		}
+	}
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		if in.TerminateAfterCheckpoint {
+			if saved, ok := s.terminalCheckpoints.Load(in.ContainerId); ok {
+				return saved.(*terminalCheckpointResult).wait(ctx)
+			}
+		}
+		return &pb.ContainerCheckpointResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	// Check if runtime supports checkpointing
+	rt := instance.Runtime
+	if rt == nil {
+		return &pb.ContainerCheckpointResponse{Ok: false, ErrorMsg: "Container runtime not found"}, nil
+	}
+	filesystemFallback := in.TerminateAfterCheckpoint && requestForcesResourceLimits(instance.Request)
+	if !rt.Capabilities().CheckpointRestore && !filesystemFallback {
+		return &pb.ContainerCheckpointResponse{
+			Ok:       false,
+			ErrorMsg: fmt.Sprintf("Runtime %s does not support checkpoint/restore", rt.Name()),
+		}, nil
+	}
+
+	if !in.TerminateAfterCheckpoint {
+		return s.captureContainerCheckpoint(ctx, in.ContainerId, instance, false), nil
+	}
+	result := &terminalCheckpointResult{done: make(chan struct{})}
+	saved, loaded := s.terminalCheckpoints.LoadOrStore(in.ContainerId, result)
+	if loaded {
+		return saved.(*terminalCheckpointResult).wait(ctx)
+	}
+	containerID := in.ContainerId
+	operationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultCheckpointOperationTTL)
+	go func() {
+		// A terminal checkpoint outlives the connection and container instance
+		// that requested it. Keep its exact RAM/disk pairing for reconnects.
+		defer cancel()
+		result.response = s.captureContainerCheckpoint(operationCtx, containerID, instance, true)
+		close(result.done)
+		time.AfterFunc(defaultCheckpointOperationTTL, func() {
+			s.terminalCheckpoints.CompareAndDelete(containerID, result)
+		})
+	}()
+	return result.wait(ctx)
+}
+
+type terminalCheckpointResult struct {
+	done     chan struct{}
+	response *pb.ContainerCheckpointResponse
+}
+
+func (r *terminalCheckpointResult) wait(ctx context.Context) (*pb.ContainerCheckpointResponse, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-r.done:
+		return proto.Clone(r.response).(*pb.ContainerCheckpointResponse), nil
+	}
+}
+
+func (s *ContainerRuntimeServer) captureContainerCheckpoint(ctx context.Context, containerID string, instance *ContainerInstance, terminal bool) *pb.ContainerCheckpointResponse {
+	checkpointId := uuid.New().String()
+	checkpointOpts := &CreateCheckpointOpts{
+		Request:                  instance.Request,
+		CheckpointId:             checkpointId,
+		ContainerIp:              instance.ContainerIp,
+		TerminateAfterCheckpoint: terminal,
+	}
+	err := s.createCheckpoint(ctx, checkpointOpts)
+	if err != nil {
+		log.Error().Str("container_id", containerID).Msgf("failed to create checkpoint: %v", err)
+		return &pb.ContainerCheckpointResponse{Ok: false, ErrorMsg: err.Error()}
+	}
+
+	checkpointRuntime := checkpointOpts.CheckpointRuntime
+	if checkpointRuntime == "" {
+		checkpointRuntime = instance.Runtime.Name()
+	}
+	return &pb.ContainerCheckpointResponse{
+		Ok:            true,
+		CheckpointId:  checkpointId,
+		Runtime:       checkpointRuntime,
+		DiskSnapshots: containerDiskSnapshotsToProto(checkpointOpts.DiskSnapshots),
+	}
+}
+
+func containerDiskSnapshotsToProto(snapshots []*types.DiskSnapshot) []*pb.ContainerDiskSnapshot {
+	protos := make([]*pb.ContainerDiskSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot == nil {
+			continue
+		}
+		protos = append(protos, &pb.ContainerDiskSnapshot{
+			SnapshotId: snapshot.ExternalId,
+			DiskName:   snapshot.DiskName,
+			Generation: snapshot.Generation,
+		})
+	}
+	return protos
+}
+
+// ContainerSnapshotDisks snapshots a running container's durable disks.
+func (s *ContainerRuntimeServer) ContainerSnapshotDisks(ctx context.Context, in *pb.ContainerSnapshotDisksRequest) (*pb.ContainerSnapshotDisksResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSnapshotDisksResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+	if s.snapshotDisks == nil {
+		return &pb.ContainerSnapshotDisksResponse{Ok: false, ErrorMsg: "Durable disks are not available on this worker"}, nil
+	}
+
+	snapshots, err := s.snapshotDisks(ctx, instance.Request)
+	response := &pb.ContainerSnapshotDisksResponse{Ok: err == nil, Snapshots: containerDiskSnapshotsToProto(snapshots)}
+	if err != nil {
+		// Return snapshots created before another mount failed.
+		log.Error().Err(err).Str("container_id", in.ContainerId).Msg("failed to snapshot durable disks")
+		response.ErrorMsg = err.Error()
+	}
+	return response, nil
+}
+
+// ContainerArchive archives a container's filesystem
+func (s *ContainerRuntimeServer) ContainerArchive(req *pb.ContainerArchiveRequest, stream pb.ContainerService_ContainerArchiveServer) error {
+	ctx := stream.Context()
+
+	instance, exists := s.containerInstances.Get(req.ContainerId)
+	if !exists {
+		return stream.Send(&pb.ContainerArchiveResponse{Done: true, Success: false, ErrorMsg: "Container not found"})
+	}
+
+	// Check container state using the worker's runtime
+	rt := s.getRuntime()
+	state, err := rt.State(ctx, req.ContainerId)
+	if err != nil {
+		return stream.Send(&pb.ContainerArchiveResponse{Done: true, Success: false, ErrorMsg: "Container not found"})
+	}
+
+	if state.Status != types.RuncContainerStatusRunning {
+		return stream.Send(&pb.ContainerArchiveResponse{Done: true, Success: false, ErrorMsg: "Container not running"})
+	}
+
+	// A v1 base has no OCI image to stack a layer on; its snapshot archives the
+	// merged root, which carries the runtime spec inside the filesystem.
+	_, layered := s.imageClient.GetSourceImageRef(instance.Request.ImageId)
+	if !layered {
+		if err := s.writeArchiveSpecs(ctx, instance); err != nil {
+			return stream.Send(&pb.ContainerArchiveResponse{Done: true, Success: false, ErrorMsg: err.Error()})
+		}
+	}
+
+	progressChan := make(chan int)
+	doneChan := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		lastProgress := -1
+		keepaliveTicker := time.NewTicker(10 * time.Second)
+		defer keepaliveTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case progress, ok := <-progressChan:
+				if !ok {
+					return
+				}
+				if progress > lastProgress && progress != lastProgress {
+					lastProgress = progress
+					log.Info().Int("progress", progress).Msg("image upload progress")
+					err := stream.Send(&pb.ContainerArchiveResponse{Done: false, Success: false, Progress: int32(progress), ErrorMsg: ""})
+					if err != nil {
+						return
+					}
+				}
+			case <-keepaliveTicker.C:
+				// Send a keepalive message to prevent connection timeout during long operations
+				err := stream.Send(&pb.ContainerArchiveResponse{Done: false, Success: false, Progress: 0, ErrorMsg: ""})
+				if err != nil {
+					log.Warn().Err(err).Msg("failed to send keepalive message")
+					return
+				}
+			case <-doneChan:
+				return
+			}
+		}
+	}()
+
+	defer func() {
+		close(progressChan)
+		wg.Wait()
+	}()
+
+	if layered {
+		var upperDir string
+		var cleanup func()
+		if upperDir, cleanup, err = containerUpperDir(ctx, instance); err == nil {
+			defer cleanup()
+			err = s.imageClient.ArchiveLayer(ctx, instance.Request, upperDir, req.ImageId, progressChan)
+		}
+	} else {
+		var rootDir string
+		var cleanup func()
+		if rootDir, cleanup, err = containerRootDir(ctx, instance); err == nil {
+			defer cleanup()
+			// An exported guest root is read after the specs were written into
+			// the host merged root; carry them over so the archive has them.
+			if rootDir != instance.Overlay.TopLayerPath() {
+				for _, name := range []string{initialSpecBaseName, specBaseName} {
+					if err = copyFile(filepath.Join(instance.Overlay.TopLayerPath(), name), filepath.Join(rootDir, name)); err != nil {
+						break
+					}
+				}
+			}
+			if err == nil {
+				err = s.imageClient.Archive(ctx, NewPathInfo(rootDir), req.ImageId, progressChan, instance.Request)
+			}
+		}
+	}
+	if err != nil {
+		log.Error().Err(err).Str("container_id", req.ContainerId).Str("image_id", req.ImageId).Msg("filesystem snapshot failed")
+	}
+	err = stream.Send(&pb.ContainerArchiveResponse{Done: true, Success: err == nil})
+
+	close(doneChan)
+	return err
+}
+
+// writeArchiveSpecs places the runtime specs a v1 image archive is read with
+// into the merged root before it is archived.
+func (s *ContainerRuntimeServer) writeArchiveSpecs(ctx context.Context, instance *ContainerInstance) error {
+	// If it's not a build request, use initial_config.json from the base image bundle
+	initialConfigPath := filepath.Join(instance.BundlePath, specBaseName)
+	if !instance.Request.IsBuildRequest() {
+		initialConfigPath = filepath.Join(instance.BundlePath, initialSpecBaseName)
+	}
+
+	destInitial := filepath.Join(instance.Overlay.TopLayerPath(), initialSpecBaseName)
+	if _, statErr := os.Stat(initialConfigPath); statErr == nil {
+		if err := copyFile(initialConfigPath, destInitial); err != nil {
+			return err
+		}
+	} else if err := s.writeInitialSpecFromImage(ctx, instance, destInitial); err != nil {
+		return err
+	}
+
+	if err := s.addRequestEnvToInitialSpec(instance); err != nil {
+		return err
+	}
+
+	tempConfig := s.baseConfigSpec
+	tempConfig.Hooks.Prestart = nil
+	tempConfig.Process.Terminal = false
+	tempConfig.Process.Args = []string{"tail", "-f", "/dev/null"}
+	tempConfig.Root.Readonly = false
+
+	return writeSpecFile(filepath.Join(instance.Overlay.TopLayerPath(), specBaseName), tempConfig)
+}
+
+// writeSpecFile serializes an OCI spec the way every spec on disk is written:
+// indented JSON, world-readable. path is in the container's own tree.
+func writeSpecFile(path string, spec specs.Spec) error {
+	b, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		return err
+	}
+	f, err := createFileNoFollow(path, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// writeInitialSpecFromImage builds an initial_config.json using the base runc config
+// plus full configuration (env, workdir, user, cmd, entrypoint) from v2 CLIP metadata if available.
+// V1 images always have a config.json so this is only called for v2 images.
+// The base spec is designed to be the fallback when CLIP metadata is not available.
+func (s *ContainerRuntimeServer) writeInitialSpecFromImage(ctx context.Context, instance *ContainerInstance, destPath string) error {
+	// Start from the base config (this is the designed fallback for v1 images)
+	spec, err := cloneSpec(s.baseConfigSpec)
+	if err != nil {
+		return err
+	}
+
+	// Try to get CLIP metadata from archive (v2 images only)
+	clipMeta, ok := s.imageClient.GetCLIPImageMetadata(instance.Request.ImageId)
+	if ok {
+		log.Info().Str("image_id", instance.Request.ImageId).Msg("using v2 image metadata from clip archive for initial spec")
+
+		// CLIP metadata has a flat structure with all fields at the top level
+		if len(clipMeta.Env) > 0 {
+			spec.Process.Env = append(spec.Process.Env, clipMeta.Env...)
+		}
+		if clipMeta.WorkingDir != "" {
+			spec.Process.Cwd = clipMeta.WorkingDir
+		}
+		if clipMeta.User != "" {
+			spec.Process.User.Username = clipMeta.User
+		}
+		// Set default args from Cmd if Entrypoint is not set, or combine them
+		if len(clipMeta.Entrypoint) > 0 {
+			spec.Process.Args = append(clipMeta.Entrypoint, clipMeta.Cmd...)
+		} else if len(clipMeta.Cmd) > 0 {
+			spec.Process.Args = clipMeta.Cmd
+		}
+	}
+	// If no CLIP metadata, use base spec as-is (designed for v1 images)
+	if spec.Process.Cwd == "" {
+		spec.Process.Cwd = "/"
+	}
+
+	return writeSpecFile(destPath, spec)
+}
+
+func cloneSpec(spec specs.Spec) (specs.Spec, error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return specs.Spec{}, err
+	}
+
+	var cloned specs.Spec
+	if err := json.Unmarshal(b, &cloned); err != nil {
+		return specs.Spec{}, err
+	}
+	return cloned, nil
+}
+
+func (s *ContainerRuntimeServer) addRequestEnvToInitialSpec(instance *ContainerInstance) error {
+	if len(instance.Request.Env) == 0 {
+		return nil
+	}
+
+	specPath := filepath.Join(instance.Overlay.TopLayerPath(), initialSpecBaseName)
+
+	bytes, err := readFileNoFollow(specPath)
+	if err != nil {
+		return err
+	}
+
+	var spec specs.Spec
+	if err = json.Unmarshal(bytes, &spec); err != nil {
+		return err
+	}
+
+	spec.Process.Env = append(instance.Request.Env, spec.Process.Env...)
+
+	return writeSpecFile(specPath, spec)
+}
+
+// ContainerSyncWorkspace syncs workspace files
+func (s *ContainerRuntimeServer) ContainerSyncWorkspace(ctx context.Context, in *pb.SyncContainerWorkspaceRequest) (*pb.SyncContainerWorkspaceResponse, error) {
+	_, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.SyncContainerWorkspaceResponse{Ok: false}, nil
+	}
+
+	// Paths are relative to the workspace; Root fails any that resolve outside it.
+	root, err := os.OpenRoot(types.TempContainerWorkspace(in.ContainerId))
+	if err != nil {
+		return &pb.SyncContainerWorkspaceResponse{Ok: false}, nil
+	}
+	defer root.Close()
+	destPath := strings.TrimPrefix(in.Path, "/")
+	destNewPath := strings.TrimPrefix(in.NewPath, "/")
+
+	switch in.Op {
+	case pb.SyncContainerWorkspaceOperation_DELETE:
+		err = root.RemoveAll(destPath)
+	case pb.SyncContainerWorkspaceOperation_WRITE:
+		if in.IsDir {
+			err = root.MkdirAll(destPath, 0755)
+		} else if err = root.MkdirAll(filepath.Dir(destPath), 0755); err == nil {
+			err = root.WriteFile(destPath, in.Data, 0644)
+		}
+	case pb.SyncContainerWorkspaceOperation_MOVED:
+		if err = root.MkdirAll(filepath.Dir(destNewPath), 0755); err == nil {
+			err = root.Rename(destPath, destNewPath)
+		}
+	}
+
+	return &pb.SyncContainerWorkspaceResponse{Ok: err == nil}, nil
+}
+
+// waitForContainer waits for a container to be running
+func (s *ContainerRuntimeServer) waitForContainer(ctx context.Context, containerId string) error {
+	rt := s.getRuntime()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		instance, exists := s.containerInstances.Get(containerId)
+		if !exists {
+			return errors.New("container not found")
+		}
+
+		if instance.Spec == nil {
+			if err := waitForContainerRetry(ctx); err != nil {
+				return err
+			}
+			continue
+		}
+
+		state, err := rt.State(ctx, containerId)
+		if err != nil {
+			if err := waitForContainerRetry(ctx); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if state.Pid != 0 && state.Status == types.RuncContainerStatusRunning {
+			break
+		}
+
+		if err := waitForContainerRetry(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func waitForContainerRetry(ctx context.Context) error {
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// Sandbox methods follow (these are runtime-agnostic and work with the sandbox process manager)
+
+func (s *ContainerRuntimeServer) ContainerSandboxExec(ctx context.Context, in *pb.ContainerSandboxExecRequest) (*pb.ContainerSandboxExecResponse, error) {
+	parsedCmd, err := shlex.Split(in.Cmd)
+	if err != nil {
+		return &pb.ContainerSandboxExecResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxExecResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	instance, err = s.waitForSandboxProcessManager(ctx, in.ContainerId, instance)
+	if err != nil {
+		return &pb.ContainerSandboxExecResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	if instance.Spec == nil || instance.Spec.Process == nil {
+		return &pb.ContainerSandboxExecResponse{Ok: false, ErrorMsg: "Container spec not ready"}, nil
+	}
+
+	if len(in.SecretBindings) > 0 {
+		if instance.Request == nil || s.containerNetworkManager == nil {
+			return &pb.ContainerSandboxExecResponse{Ok: false, ErrorMsg: "container network policy is unavailable"}, nil
+		}
+		instance.egressMu.Lock()
+		request := instance.Request.Clone()
+		byName := map[string]types.SecretBinding{}
+		for _, binding := range request.SecretBindings {
+			byName[binding.SecretName] = binding
+		}
+		for _, binding := range types.SecretBindingsFromProto(in.SecretBindings) {
+			for _, host := range binding.Hosts {
+				if len(request.AllowList) > 0 && !common.HostPatternCovered(host, request.AllowList) {
+					instance.egressMu.Unlock()
+					return &pb.ContainerSandboxExecResponse{Ok: false, ErrorMsg: "secret host is not allowed by egress"}, nil
+				}
+			}
+			byName[binding.SecretName] = binding
+		}
+		request.SecretBindings = nil
+		for _, binding := range byName {
+			request.SecretBindings = append(request.SecretBindings, binding)
+		}
+		err := s.containerNetworkManager.UpdateNetworkPermissions(in.ContainerId, request)
+		if err == nil {
+			instance.Request.SecretBindings = request.SecretBindings
+		}
+		instance.egressMu.Unlock()
+		if err != nil {
+			return &pb.ContainerSandboxExecResponse{Ok: false, ErrorMsg: err.Error()}, nil
+		}
+	}
+	env := append([]string{}, instance.Spec.Process.Env...)
+	formattedEnv := []string{}
+	for key, value := range in.Env {
+		formattedEnv = append(formattedEnv, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	env = append(env, formattedEnv...)
+	if len(in.SecretBindings) > 0 {
+		env = upsertEnvVars(env, egress.TrustEnvironment())
+	}
+
+	log.Info().Str("container_id", in.ContainerId).Str("cmd", in.Cmd).Msg("running sandbox command")
+	return s.handleSandboxExec(ctx, in, instance, env, parsedCmd, in.Cwd)
+}
+
+func (s *ContainerRuntimeServer) handleSandboxExec(ctx context.Context, in *pb.ContainerSandboxExecRequest, instance *ContainerInstance, env, cmd []string, cwd string) (*pb.ContainerSandboxExecResponse, error) {
+	resp, err := s.execSandboxProcess(ctx, in.ContainerId, instance, cmd, cwd, env, in.Wait)
+	if err != nil {
+		log.Warn().
+			Str("container_id", in.ContainerId).
+			Str("container_ip", instance.ContainerIp).
+			Str("cmd", in.Cmd).
+			Str("grpc_code", status.Code(err).String()).
+			Err(err).
+			Msg("sandbox process manager exec failed")
+		return &pb.ContainerSandboxExecResponse{Ok: false, Pid: -1, ErrorMsg: err.Error()}, nil
+	}
+
+	if !instance.processManagerReady() {
+		instance.signalProcessManagerReadiness(true)
+		s.containerInstances.Update(in.ContainerId, instance)
+	}
+
+	return resp, nil
+}
+
+func (s *ContainerRuntimeServer) execSandboxProcess(ctx context.Context, containerId string, instance *ContainerInstance, cmd []string, cwd string, env []string, wait bool) (*pb.ContainerSandboxExecResponse, error) {
+	client, err := s.newSandboxProcessManagerClient(ctx, containerId, instance)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Cleanup()
+
+	pid, err := client.Exec(cmd, cwd, env, false)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &pb.ContainerSandboxExecResponse{Ok: true, Pid: int32(pid), ExitCode: -1}
+	if !wait {
+		return resp, nil
+	}
+
+	exitCode, done, err := s.waitForSandboxProcessInline(ctx, client, containerId, int32(pid))
+	if err != nil {
+		return nil, err
+	}
+	if !done {
+		return resp, nil
+	}
+
+	stdout, err := client.Stdout(pid)
+	if err != nil {
+		return nil, err
+	}
+	stderr, err := client.Stderr(pid)
+	if err != nil {
+		return nil, err
+	}
+
+	resp.Done = true
+	resp.ExitCode = int32(exitCode)
+	resp.Stdout = stdout
+	resp.Stderr = stderr
+	return resp, nil
+}
+
+func (s *ContainerRuntimeServer) waitForSandboxProcessInline(ctx context.Context, client *goproc.GoProcClient, containerId string, pid int32) (int, bool, error) {
+	deadline := time.Now().Add(sandboxExecInlineWaitTimeout)
+	for {
+		exitCode, err := client.Status(int(pid))
+		if err != nil {
+			return -1, false, err
+		}
+		if exitCode >= 0 {
+			s.clearSandboxProcessExited(containerId, pid)
+			return exitCode, true, nil
+		}
+		if s.sandboxProcessMarkedExited(containerId, pid) {
+			return sandboxMissingProcessExitCode, true, nil
+		}
+		if time.Now().Add(sandboxExecInlineWaitPollDelay).After(deadline) {
+			return -1, false, nil
+		}
+
+		timer := time.NewTimer(sandboxExecInlineWaitPollDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return -1, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *ContainerRuntimeServer) newSandboxProcessManagerClient(ctx context.Context, containerId string, instance *ContainerInstance) (*goproc.GoProcClient, error) {
+	var lastErr error
+	loggedRetry := false
+	deadline := time.Now().Add(sandboxProcessManagerClientTimeout)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, sandboxProcessManagerClientError(err, lastErr)
+		}
+		if time.Now().After(deadline) {
+			return nil, sandboxProcessManagerClientTimeoutError(lastErr)
+		}
+
+		instance = s.refreshContainerInstance(containerId, instance)
+		client, err := newProcessManagerClient(ctx, instance)
+		if err == nil {
+			return client, nil
+		}
+
+		lastErr = err
+		retryable := isProcessManagerDialFailure(err)
+		if !retryable {
+			return nil, err
+		}
+		if !loggedRetry {
+			log.Debug().
+				Str("container_id", containerId).
+				Str("container_ip", instance.ContainerIp).
+				Err(err).
+				Msg("waiting for sandbox process manager client after dial failure")
+			loggedRetry = true
+		}
+
+		timer := time.NewTimer(sandboxProcessManagerClientRetry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, sandboxProcessManagerClientError(ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
+func sandboxProcessManagerClientError(ctxErr, lastErr error) error {
+	if errors.Is(ctxErr, context.Canceled) {
+		return errors.New("Request cancelled")
+	}
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return sandboxProcessManagerClientTimeoutError(lastErr)
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return ctxErr
+}
+
+func sandboxProcessManagerClientTimeoutError(lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf("sandbox process manager client not ready within timeout: %w", lastErr)
+	}
+	return errors.New("sandbox process manager client not ready within timeout")
+}
+
+func isProcessManagerDialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == codes.DeadlineExceeded {
+		return true
+	}
+	if status.Code(err) != codes.Unavailable {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error while dialing") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "transport is closing")
+}
+
+func (s *ContainerRuntimeServer) waitForSandboxProcessManager(ctx context.Context, containerId string, instance *ContainerInstance) (*ContainerInstance, error) {
+	ctx, cancel := context.WithTimeout(ctx, sandboxProcessManagerReadyTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(sandboxProcessManagerReadyPollDelay)
+	defer ticker.Stop()
+
+	for {
+		instance = s.refreshContainerInstance(containerId, instance)
+		if instance.processManagerReady() {
+			return instance, nil
+		}
+
+		select {
+		case <-instance.processManagerReadyChannel():
+			instance = s.refreshContainerInstance(containerId, instance)
+			if instance.processManagerReady() {
+				return instance, nil
+			}
+			if err := instance.startupError(); err != nil {
+				return instance, fmt.Errorf("sandbox startup failed: %w", err)
+			}
+			return instance, errors.New("Process manager failed to become ready")
+		case <-ticker.C:
+		case <-ctx.Done():
+			return instance, sandboxProcessManagerWaitError(ctx.Err())
+		}
+	}
+}
+
+func sandboxProcessManagerWaitError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("Process manager not ready within timeout")
+	}
+	if errors.Is(err, context.Canceled) {
+		return errors.New("Request cancelled")
+	}
+	return err
+}
+
+func (s *ContainerRuntimeServer) refreshContainerInstance(containerId string, fallback *ContainerInstance) *ContainerInstance {
+	if fresh, exists := s.containerInstances.Get(containerId); exists {
+		return fresh
+	}
+	return fallback
+}
+
+func sandboxProcessMarkKey(containerId string, pid int32) string {
+	return fmt.Sprintf("%s:%d", containerId, pid)
+}
+
+func (s *ContainerRuntimeServer) markSandboxProcessExited(containerId string, pid int32) {
+	s.killedSandboxProcesses.Store(sandboxProcessMarkKey(containerId, pid), time.Now())
+}
+
+func (s *ContainerRuntimeServer) clearSandboxProcessExited(containerId string, pid int32) {
+	s.killedSandboxProcesses.Delete(sandboxProcessMarkKey(containerId, pid))
+}
+
+func (s *ContainerRuntimeServer) sandboxProcessMarkedExited(containerId string, pid int32) bool {
+	key := sandboxProcessMarkKey(containerId, pid)
+	value, ok := s.killedSandboxProcesses.Load(key)
+	if !ok {
+		return false
+	}
+
+	markedAt, ok := value.(time.Time)
+	if !ok || time.Since(markedAt) > 10*time.Minute {
+		s.killedSandboxProcesses.Delete(key)
+		return false
+	}
+
+	return true
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxStatus(ctx context.Context, in *pb.ContainerSandboxStatusRequest) (*pb.ContainerSandboxStatusResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxStatusResponse{
+			Ok:       false,
+			ErrorMsg: "Container not found",
+		}, nil
+	}
+
+	if in.Pid == 0 {
+		if in.WaitForReady {
+			var err error
+			instance, err = s.waitForSandboxProcessManager(ctx, in.ContainerId, instance)
+			if err != nil {
+				return &pb.ContainerSandboxStatusResponse{Ok: false, ErrorMsg: err.Error()}, nil
+			}
+		}
+		if instance.processManagerReady() {
+			return &pb.ContainerSandboxStatusResponse{
+				Ok:       true,
+				Status:   string(types.SandboxStatusRunning),
+				ExitCode: -1,
+			}, nil
+		}
+
+		if ready := instance.processManagerReadyChannel(); ready != nil {
+			select {
+			case <-ready:
+				if instance.processManagerReady() {
+					return &pb.ContainerSandboxStatusResponse{
+						Ok:       true,
+						Status:   string(types.SandboxStatusRunning),
+						ExitCode: -1,
+					}, nil
+				}
+				return &pb.ContainerSandboxStatusResponse{
+					Ok:       false,
+					ErrorMsg: "Sandbox process manager failed to become ready",
+				}, nil
+			default:
+			}
+		}
+
+		return &pb.ContainerSandboxStatusResponse{
+			Ok:       true,
+			Status:   string(types.SandboxStatusPending),
+			ExitCode: -1,
+		}, nil
+	}
+
+	if !instance.processManagerReady() {
+		return &pb.ContainerSandboxStatusResponse{
+			Ok:       false,
+			ErrorMsg: "Sandbox process manager is not ready",
+		}, nil
+	}
+
+	client, err := s.newSandboxProcessManagerClient(ctx, in.ContainerId, instance)
+	if err != nil {
+		return &pb.ContainerSandboxStatusResponse{
+			Ok:       false,
+			ErrorMsg: err.Error(),
+		}, nil
+	}
+	defer client.Cleanup()
+
+	exitCode, err := client.Status(int(in.Pid))
+	if err != nil {
+		return &pb.ContainerSandboxStatusResponse{
+			Ok:       false,
+			ErrorMsg: err.Error(),
+		}, nil
+	}
+	if exitCode >= 0 {
+		s.clearSandboxProcessExited(in.ContainerId, in.Pid)
+	} else if s.sandboxProcessMarkedExited(in.ContainerId, in.Pid) {
+		exitCode = sandboxMissingProcessExitCode
+	}
+
+	sandboxStatus := types.SandboxStatusRunning
+	if exitCode >= 0 {
+		sandboxStatus = types.SandboxStatusExited
+	}
+
+	return &pb.ContainerSandboxStatusResponse{
+		Ok:       true,
+		Status:   string(sandboxStatus),
+		ExitCode: int32(exitCode),
+	}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxStdout(ctx context.Context, in *pb.ContainerSandboxStdoutRequest) (*pb.ContainerSandboxStdoutResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxStdoutResponse{
+			Ok:       false,
+			ErrorMsg: "Container not found",
+		}, nil
+	}
+
+	if !instance.processManagerReady() {
+		return &pb.ContainerSandboxStdoutResponse{
+			Ok:       false,
+			ErrorMsg: "Sandbox process manager is not ready",
+		}, nil
+	}
+
+	client, err := s.newSandboxProcessManagerClient(ctx, in.ContainerId, instance)
+	if err != nil {
+		return &pb.ContainerSandboxStdoutResponse{
+			Ok:       false,
+			ErrorMsg: err.Error(),
+		}, nil
+	}
+	defer client.Cleanup()
+
+	stdout, err := client.Stdout(int(in.Pid))
+	if err != nil {
+		return &pb.ContainerSandboxStdoutResponse{
+			Ok:       false,
+			ErrorMsg: err.Error(),
+		}, nil
+	}
+
+	return &pb.ContainerSandboxStdoutResponse{
+		Ok:     true,
+		Stdout: stdout,
+	}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxStderr(ctx context.Context, in *pb.ContainerSandboxStderrRequest) (*pb.ContainerSandboxStderrResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxStderrResponse{
+			Ok:       false,
+			ErrorMsg: "Container not found",
+		}, nil
+	}
+
+	if !instance.processManagerReady() {
+		return &pb.ContainerSandboxStderrResponse{
+			Ok:       false,
+			ErrorMsg: "Sandbox process manager is not ready",
+		}, nil
+	}
+
+	client, err := s.newSandboxProcessManagerClient(ctx, in.ContainerId, instance)
+	if err != nil {
+		return &pb.ContainerSandboxStderrResponse{
+			Ok:       false,
+			ErrorMsg: err.Error(),
+		}, nil
+	}
+	defer client.Cleanup()
+
+	stderr, err := client.Stderr(int(in.Pid))
+	if err != nil {
+		return &pb.ContainerSandboxStderrResponse{
+			Ok:       false,
+			ErrorMsg: err.Error(),
+		}, nil
+	}
+
+	return &pb.ContainerSandboxStderrResponse{
+		Ok:     true,
+		Stderr: stderr,
+	}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxKill(ctx context.Context, in *pb.ContainerSandboxKillRequest) (*pb.ContainerSandboxKillResponse, error) {
+	log.Info().Str("container_id", in.ContainerId).Int32("pid", in.Pid).Msg("killing sandbox process")
+
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxKillResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	if !instance.processManagerReady() {
+		return &pb.ContainerSandboxKillResponse{Ok: false, ErrorMsg: "Sandbox process manager is not ready"}, nil
+	}
+
+	client, err := s.newSandboxProcessManagerClient(ctx, in.ContainerId, instance)
+	if err != nil {
+		return &pb.ContainerSandboxKillResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	defer client.Cleanup()
+
+	err = client.Kill(int(in.Pid))
+	if err != nil {
+		log.Error().Str("container_id", in.ContainerId).Int32("pid", in.Pid).Msgf("failed to kill sandbox process: %v", err)
+		return &pb.ContainerSandboxKillResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	missing, err := waitForSandboxProcessMissing(ctx, client, in.Pid, 3*time.Second)
+	if err != nil {
+		log.Debug().
+			Str("container_id", in.ContainerId).
+			Int32("pid", in.Pid).
+			Err(err).
+			Msg("failed to confirm killed sandbox process exit")
+	} else if missing {
+		s.markSandboxProcessExited(in.ContainerId, in.Pid)
+	}
+
+	return &pb.ContainerSandboxKillResponse{Ok: true}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxListExposedPorts(ctx context.Context, in *pb.ContainerSandboxListExposedPortsRequest) (*pb.ContainerSandboxListExposedPortsResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxListExposedPortsResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	excludedPorts := []int32{types.WorkerSandboxProcessManagerPort, types.WorkerShellPort, int32(containerInnerPort)}
+	ports := make([]int32, 0)
+	for _, port := range instance.Request.Ports {
+		if slices.Contains(excludedPorts, int32(port)) {
+			continue
+		}
+		ports = append(ports, int32(port))
+	}
+
+	if err := s.waitForContainer(ctx, in.ContainerId); err != nil {
+		return &pb.ContainerSandboxListExposedPortsResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.ContainerSandboxListExposedPortsResponse{Ok: true, ExposedPorts: ports}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxListProcesses(ctx context.Context, in *pb.ContainerSandboxListProcessesRequest) (*pb.ContainerSandboxListProcessesResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxListProcessesResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	if err := s.waitForContainer(ctx, in.ContainerId); err != nil {
+		return &pb.ContainerSandboxListProcessesResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	instance, err := s.waitForSandboxProcessManager(ctx, in.ContainerId, instance)
+	if err != nil {
+		return &pb.ContainerSandboxListProcessesResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	processes := make([]*pb.ProcessInfo, 0)
+	client, err := s.newSandboxProcessManagerClient(ctx, in.ContainerId, instance)
+	if err != nil {
+		return &pb.ContainerSandboxListProcessesResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	defer client.Cleanup()
+
+	ps, err := client.ListProcesses()
+	if err != nil {
+		return &pb.ContainerSandboxListProcessesResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	for _, process := range ps {
+		exitCode := int32(process.ExitCode)
+		running := process.Running
+		if exitCode >= 0 {
+			s.clearSandboxProcessExited(in.ContainerId, int32(process.Pid))
+		} else if running && s.sandboxProcessMarkedExited(in.ContainerId, int32(process.Pid)) {
+			running = false
+			exitCode = sandboxMissingProcessExitCode
+		}
+		pid := int32(process.Pid)
+		processes = append(processes, &pb.ProcessInfo{Pid: pid, ExitCode: exitCode, Cwd: process.Cwd, Cmd: process.Cmd, Env: process.Env, Running: running})
+	}
+
+	return &pb.ContainerSandboxListProcessesResponse{Ok: true, Processes: processes}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxUploadFile(ctx context.Context, in *pb.ContainerSandboxUploadFileRequest) (*pb.ContainerSandboxUploadFileResponse, error) {
+	if in.Offset < 0 {
+		return &pb.ContainerSandboxUploadFileResponse{ErrorMsg: "Offset must be nonnegative"}, nil
+	}
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxUploadFileResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxUploadFileResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestUploadFile(ctx, gfs, in, containerPath)
+	}
+
+	// For gVisor: write to external mount, then mv inside container to avoid caching issues
+	// External mounts are always shared (no caching) per gVisor docs
+	if instance.Runtime != nil && instance.Runtime.Name() == types.ContainerRuntimeGvisor.String() {
+		// The sandbox writes this directory too, so the temp file is created
+		// exclusively under a name it cannot have planted a symlink at.
+		tempFile := "upload_" + uuid.NewString()
+		tempHostPath := filepath.Join(types.WorkerContainerUploadsHostPath, in.ContainerId, tempFile)
+		file, err := os.OpenFile(tempHostPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, os.FileMode(in.Mode))
+		if err != nil {
+			return &pb.ContainerSandboxUploadFileResponse{ErrorMsg: err.Error()}, nil
+		}
+		defer os.Remove(tempHostPath) // gone already if the container moved it
+		_, err = file.Write(in.Data)
+		if err = errors.Join(err, file.Close()); err != nil {
+			return &pb.ContainerSandboxUploadFileResponse{ErrorMsg: err.Error()}, nil
+		}
+
+		tempContainerPath := filepath.Join(types.WorkerContainerUploadsMountPath, tempFile)
+		cmd := fmt.Sprintf("mkdir -p %s && mv %s %s && chmod %o %s",
+			common.ShellQuote(filepath.Dir(containerPath)),
+			common.ShellQuote(tempContainerPath),
+			common.ShellQuote(containerPath),
+			in.Mode,
+			common.ShellQuote(containerPath),
+		)
+		if in.Offset > 0 {
+			cmd = fmt.Sprintf("mkdir -p %s && dd if=%s of=%s bs=1M seek=%d oflag=seek_bytes conv=notrunc status=none && chmod %o %s && rm %s",
+				common.ShellQuote(filepath.Dir(containerPath)),
+				common.ShellQuote(tempContainerPath), common.ShellQuote(containerPath), in.Offset,
+				in.Mode, common.ShellQuote(containerPath), common.ShellQuote(tempContainerPath))
+		}
+
+		if resp, err := s.ContainerExec(ctx, &pb.ContainerExecRequest{
+			ContainerId: in.ContainerId,
+			Cmd:         cmd,
+			Env:         instance.Spec.Process.Env,
+		}); err != nil || !resp.Ok {
+			return &pb.ContainerSandboxUploadFileResponse{Ok: false, ErrorMsg: "Failed to write uploaded data"}, nil
+		}
+
+		return &pb.ContainerSandboxUploadFileResponse{Ok: true}, nil
+	}
+
+	// For runc: direct write to overlay
+	root, name, err := containerRoot(instance, containerPath, true)
+	if err != nil {
+		return &pb.ContainerSandboxUploadFileResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	if err := root.MkdirAll(filepath.Dir(name), 0755); err != nil {
+		return &pb.ContainerSandboxUploadFileResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to create directory for %s: %s", containerPath, err.Error())}, nil
+	}
+	flags := os.O_CREATE | os.O_WRONLY
+	if in.Offset == 0 {
+		flags |= os.O_TRUNC
+	}
+	file, err := root.OpenFile(name, flags, os.FileMode(in.Mode))
+	if err != nil {
+		return &pb.ContainerSandboxUploadFileResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer file.Close()
+	if _, err := file.WriteAt(in.Data, in.Offset); err != nil {
+		return &pb.ContainerSandboxUploadFileResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to write file to %s: %s", containerPath, err.Error())}, nil
+	}
+
+	return &pb.ContainerSandboxUploadFileResponse{Ok: true}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxCreateDirectory(ctx context.Context, in *pb.ContainerSandboxCreateDirectoryRequest) (*pb.ContainerSandboxCreateDirectoryResponse, error) {
+	if in.Mode == 0 {
+		in.Mode = 0755
+	}
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxCreateDirectoryResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	if err := s.waitForContainer(ctx, in.ContainerId); err != nil {
+		return &pb.ContainerSandboxCreateDirectoryResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestCreateDirectory(ctx, gfs, in, containerPath)
+	}
+	if handled, err := guestFilesystemMutation(ctx, instance, "mkdir", "-p", "-m", fmt.Sprintf("%o", in.Mode), "--", containerPath); handled {
+		if err != nil {
+			return &pb.ContainerSandboxCreateDirectoryResponse{ErrorMsg: err.Error()}, nil
+		}
+		return &pb.ContainerSandboxCreateDirectoryResponse{Ok: true}, nil
+	}
+
+	root, name, err := containerRoot(instance, containerPath, true)
+	if err != nil {
+		return &pb.ContainerSandboxCreateDirectoryResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	if err := root.MkdirAll(name, os.FileMode(in.Mode)); err != nil {
+		return &pb.ContainerSandboxCreateDirectoryResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to create directory %s: %s", containerPath, err.Error())}, nil
+	}
+
+	return &pb.ContainerSandboxCreateDirectoryResponse{Ok: true}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxDeleteDirectory(ctx context.Context, in *pb.ContainerSandboxDeleteDirectoryRequest) (*pb.ContainerSandboxDeleteDirectoryResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxDeleteDirectoryResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	if err := s.waitForContainer(ctx, in.ContainerId); err != nil {
+		return &pb.ContainerSandboxDeleteDirectoryResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestDeleteDirectory(ctx, gfs, in, containerPath)
+	}
+	if handled, err := guestFilesystemMutation(ctx, instance, "rm", "-rf", "--", containerPath); handled {
+		if err != nil {
+			return &pb.ContainerSandboxDeleteDirectoryResponse{ErrorMsg: err.Error()}, nil
+		}
+		return &pb.ContainerSandboxDeleteDirectoryResponse{Ok: true}, nil
+	}
+
+	root, name, err := containerRoot(instance, containerPath, true)
+	if err != nil {
+		return &pb.ContainerSandboxDeleteDirectoryResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	if err := root.RemoveAll(name); err != nil {
+		return &pb.ContainerSandboxDeleteDirectoryResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to delete directory %s: %s", containerPath, err.Error())}, nil
+	}
+
+	return &pb.ContainerSandboxDeleteDirectoryResponse{Ok: true}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxDownloadFile(ctx context.Context, in *pb.ContainerSandboxDownloadFileRequest) (*pb.ContainerSandboxDownloadFileResponse, error) {
+	if in.Offset < 0 || in.Length < 0 || in.Length > 4*1024*1024 {
+		return &pb.ContainerSandboxDownloadFileResponse{ErrorMsg: "Invalid download range (maximum chunk: 4 MiB)"}, nil
+	}
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxDownloadFileResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxDownloadFileResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestDownloadFile(ctx, gfs, in, containerPath)
+	}
+
+	root, name, err := containerRoot(instance, containerPath, false)
+	if err != nil {
+		return &pb.ContainerSandboxDownloadFileResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	file, err := root.Open(name)
+	if err != nil {
+		return &pb.ContainerSandboxDownloadFileResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to read file from %s: %s", containerPath, err.Error())}, nil
+	}
+	defer file.Close()
+	if _, err := file.Seek(in.Offset, io.SeekStart); err != nil {
+		return &pb.ContainerSandboxDownloadFileResponse{ErrorMsg: err.Error()}, nil
+	}
+	var reader io.Reader = file
+	if in.Length > 0 {
+		reader = io.LimitReader(file, int64(in.Length))
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return &pb.ContainerSandboxDownloadFileResponse{ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.ContainerSandboxDownloadFileResponse{Ok: true, Data: data}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxDeleteFile(ctx context.Context, in *pb.ContainerSandboxDeleteFileRequest) (*pb.ContainerSandboxDeleteFileResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxDeleteFileResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxDeleteFileResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestDeleteFile(ctx, gfs, in, containerPath)
+	}
+	if handled, err := guestFilesystemMutation(ctx, instance, "rm", "-rf", "--", containerPath); handled {
+		if err != nil {
+			return &pb.ContainerSandboxDeleteFileResponse{ErrorMsg: err.Error()}, nil
+		}
+		return &pb.ContainerSandboxDeleteFileResponse{Ok: true}, nil
+	}
+
+	root, name, err := containerRoot(instance, containerPath, true)
+	if err != nil {
+		return &pb.ContainerSandboxDeleteFileResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	err = root.RemoveAll(name)
+	if err != nil {
+		return &pb.ContainerSandboxDeleteFileResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to delete file %s: %s", containerPath, err.Error())}, nil
+	}
+
+	return &pb.ContainerSandboxDeleteFileResponse{Ok: true}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxStatFile(ctx context.Context, in *pb.ContainerSandboxStatFileRequest) (*pb.ContainerSandboxStatFileResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxStatFileResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxStatFileResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestStatFile(ctx, gfs, in, containerPath)
+	}
+
+	root, name, err := containerRoot(instance, containerPath, false)
+	if err != nil {
+		return &pb.ContainerSandboxStatFileResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	stat, err := root.Stat(name)
+	if err != nil {
+		return &pb.ContainerSandboxStatFileResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to stat file %s: %s", containerPath, err.Error())}, nil
+	}
+
+	return &pb.ContainerSandboxStatFileResponse{Ok: true, FileInfo: &pb.FileInfo{
+		Mode:        int32(stat.Mode()),
+		Size:        stat.Size(),
+		ModTime:     stat.ModTime().Unix(),
+		Permissions: uint32(stat.Mode()),
+		Owner:       strconv.Itoa(int(stat.Sys().(*syscall.Stat_t).Uid)),
+		Group:       strconv.Itoa(int(stat.Sys().(*syscall.Stat_t).Gid)),
+		IsDir:       stat.IsDir(),
+		Name:        stat.Name(),
+	}}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxListFiles(ctx context.Context, in *pb.ContainerSandboxListFilesRequest) (*pb.ContainerSandboxListFilesResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxListFilesResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxListFilesResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestListFiles(ctx, gfs, in, containerPath)
+	}
+
+	root, name, err := containerRoot(instance, containerPath, false)
+	if err != nil {
+		return &pb.ContainerSandboxListFilesResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	files, err := fs.ReadDir(root.FS(), name)
+	if err != nil {
+		return &pb.ContainerSandboxListFilesResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to list files in %s: %s", containerPath, err.Error())}, nil
+	}
+
+	responseFiles := make([]*pb.FileInfo, 0)
+	for _, file := range files {
+		stat, err := root.Lstat(filepath.Join(name, file.Name()))
+		if err != nil {
+			return &pb.ContainerSandboxListFilesResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to get file info for %s: %s", file.Name(), err.Error())}, nil
+		}
+
+		responseFiles = append(responseFiles, &pb.FileInfo{
+			Mode:        int32(stat.Mode()),
+			Size:        stat.Size(),
+			ModTime:     stat.ModTime().Unix(),
+			Permissions: uint32(stat.Mode()),
+			Owner:       strconv.Itoa(int(stat.Sys().(*syscall.Stat_t).Uid)),
+			Group:       strconv.Itoa(int(stat.Sys().(*syscall.Stat_t).Gid)),
+			IsDir:       stat.IsDir(),
+			Name:        file.Name(),
+		})
+	}
+
+	return &pb.ContainerSandboxListFilesResponse{Ok: true, Files: responseFiles}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxExposePort(ctx context.Context, in *pb.ContainerSandboxExposePortRequest) (*pb.ContainerSandboxExposePortResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	s.exposePortMu.Lock()
+	defer s.exposePortMu.Unlock()
+
+	getAddressMapResponse, err := handleGRPCResponse(s.containerRepoClient.GetContainerAddressMap(ctx, &pb.GetContainerAddressMapRequest{
+		ContainerId: in.ContainerId,
+	}))
+	if err != nil {
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	addressMap := writableContainerAddressMap(getAddressMapResponse.AddressMap)
+	port := int32(in.Port)
+	if existingTarget, exists := addressMap[port]; exists {
+		if route := s.backendRouteForContainerPort(instance, port, existingTarget); route != nil {
+			setAddressMapResponse, err := handleGRPCResponse(s.containerRepoClient.SetContainerAddressMap(ctx, &pb.SetContainerAddressMapRequest{
+				ContainerId: in.ContainerId,
+				AddressMap:  addressMap,
+				Routes:      []*pb.BackendRoute{route},
+			}))
+			if err != nil {
+				return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: err.Error()}, nil
+			}
+			if !setAddressMapResponse.Ok {
+				return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: setAddressMapResponse.ErrorMsg}, nil
+			}
+		}
+		recordSandboxExposedPort(s.containerInstances, in.ContainerId, instance, uint32(in.Port))
+		return &pb.ContainerSandboxExposePortResponse{Ok: true}, nil
+	}
+
+	if s.containerNetworkManager == nil {
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: "container network manager unavailable"}, nil
+	}
+
+	bindPorts, err := s.containerNetworkManager.ReservePorts(in.ContainerId, 1)
+	if err != nil {
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	defer s.containerNetworkManager.ReleasePortReservations(in.ContainerId)
+	bindPort := bindPorts[0]
+
+	binding := PortBinding{HostPort: bindPort, ContainerPort: int(in.Port)}
+	err = s.containerNetworkManager.ExposePort(in.ContainerId, binding.HostPort, binding.ContainerPort)
+	if err != nil {
+		log.Error().Str("container_id", in.ContainerId).Msgf("failed to expose container bind port: %v", err)
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	localTarget, err := s.containerPortAddress(in.ContainerId, binding)
+	if err != nil {
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	addressMap[port] = localTarget
+	routes := make([]*pb.BackendRoute, 0, 1)
+	if route := s.backendRouteForContainerPort(instance, port, localTarget); route != nil {
+		routes = append(routes, route)
+	}
+	setAddressMapResponse, err := handleGRPCResponse(s.containerRepoClient.SetContainerAddressMap(ctx, &pb.SetContainerAddressMapRequest{
+		ContainerId: in.ContainerId,
+		AddressMap:  addressMap,
+		Routes:      routes,
+	}))
+	if err != nil {
+		return &pb.ContainerSandboxExposePortResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	recordSandboxExposedPort(s.containerInstances, in.ContainerId, instance, uint32(in.Port))
+	instance.setContainerPortAddress(port, localTarget)
+
+	log.Info().Str("container_id", in.ContainerId).Msgf("exposed sandbox port %d to %s", in.Port, addressMap[port])
+
+	return &pb.ContainerSandboxExposePortResponse{Ok: setAddressMapResponse.Ok}, err
+}
+
+func (s *ContainerRuntimeServer) containerPortAddress(containerId string, binding PortBinding) (string, error) {
+	if s.containerNetworkManager == nil {
+		return "", fmt.Errorf("container network manager unavailable")
+	}
+	return s.containerNetworkManager.ContainerPortAddress(containerId, binding)
+}
+
+func (s *ContainerRuntimeServer) backendRouteForContainerPort(instance *ContainerInstance, port int32, localTarget string) *pb.BackendRoute {
+	if s.backendRoute == nil || instance == nil || instance.Request == nil || localTarget == "" {
+		return nil
+	}
+	if _, isRoute := types.ParseBackendRouteAddress(localTarget); isRoute {
+		return nil
+	}
+	return s.backendRoute(instance.Request, types.BackendRouteKindContainer, port, localTarget)
+}
+
+func writableContainerAddressMap(addressMap map[int32]string) map[int32]string {
+	cloned := cloneContainerAddressMap(addressMap)
+	if cloned == nil {
+		return map[int32]string{}
+	}
+
+	return cloned
+}
+
+func recordSandboxExposedPort(containerInstances *common.SafeMap[*ContainerInstance], containerId string, instance *ContainerInstance, port uint32) {
+	if instance == nil || instance.Request == nil || slices.Contains(instance.Request.Ports, port) {
+		return
+	}
+
+	instance.Request.Ports = append(instance.Request.Ports, port)
+	containerInstances.Update(containerId, instance)
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxUpdateNetworkPermissions(ctx context.Context, in *pb.ContainerSandboxUpdateNetworkPermissionsRequest) (*pb.ContainerSandboxUpdateNetworkPermissionsResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxUpdateNetworkPermissionsResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxUpdateNetworkPermissionsResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	instance.egressMu.Lock()
+	defer instance.egressMu.Unlock()
+	request := instance.Request.Clone()
+	if request == nil {
+		request = &types.ContainerRequest{}
+	}
+	request.BlockNetwork, request.AllowList = in.BlockNetwork, in.AllowList
+
+	if s.containerNetworkManager == nil {
+		return &pb.ContainerSandboxUpdateNetworkPermissionsResponse{Ok: false, ErrorMsg: "container network manager unavailable"}, nil
+	}
+
+	// Update network permissions via the network manager
+	err = s.containerNetworkManager.UpdateNetworkPermissions(in.ContainerId, request)
+	if err != nil {
+		log.Error().Str("container_id", in.ContainerId).Msgf("failed to update network permissions: %v", err)
+		return &pb.ContainerSandboxUpdateNetworkPermissionsResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	if instance.Request != nil {
+		instance.Request.BlockNetwork, instance.Request.AllowList = request.BlockNetwork, request.AllowList
+	}
+	log.Info().Str("container_id", in.ContainerId).Msgf("updated network permissions: block_network=%v, allow_list=%v", in.BlockNetwork, in.AllowList)
+
+	return &pb.ContainerSandboxUpdateNetworkPermissionsResponse{Ok: true}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxReplaceInFiles(ctx context.Context, in *pb.ContainerSandboxReplaceInFilesRequest) (*pb.ContainerSandboxReplaceInFilesResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxReplaceInFilesResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxReplaceInFilesResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestReplaceInFiles(ctx, gfs, in, containerPath)
+	}
+
+	root, name, err := containerRoot(instance, containerPath, true)
+	if err != nil {
+		return &pb.ContainerSandboxReplaceInFilesResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+	stagedFiles, err := stageFilesForReplacement(root, name, in.Pattern, in.NewString)
+	if err != nil {
+		return &pb.ContainerSandboxReplaceInFilesResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to replace in files at %s: %s", containerPath, err.Error())}, nil
+	}
+
+	for _, stagedFile := range stagedFiles {
+		err = root.WriteFile(stagedFile.Path, []byte(stagedFile.Content), 0644)
+		if err != nil {
+			return &pb.ContainerSandboxReplaceInFilesResponse{Ok: false, ErrorMsg: fmt.Sprintf("failed to write replaced file %s: %s", stagedFile.Path, err.Error())}, nil
+		}
+	}
+
+	return &pb.ContainerSandboxReplaceInFilesResponse{Ok: true}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxFindInFiles(ctx context.Context, in *pb.ContainerSandboxFindInFilesRequest) (*pb.ContainerSandboxFindInFilesResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxFindInFilesResponse{Ok: false, ErrorMsg: "Container not found"}, nil
+	}
+
+	err := s.waitForContainer(ctx, in.ContainerId)
+	if err != nil {
+		return &pb.ContainerSandboxFindInFilesResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	containerPath := in.ContainerPath
+	if !filepath.IsAbs(containerPath) {
+		containerPath = filepath.Join(instance.Spec.Process.Cwd, containerPath)
+	}
+	if gfs, ok := guestFS(instance); ok {
+		return s.guestFindInFiles(ctx, gfs, in, containerPath)
+	}
+
+	regex, err := regexp.Compile(in.Pattern)
+	if err != nil {
+		return &pb.ContainerSandboxFindInFilesResponse{ErrorMsg: err.Error()}, nil
+	}
+	root, name, err := containerRoot(instance, containerPath, false)
+	if err != nil {
+		return &pb.ContainerSandboxFindInFilesResponse{ErrorMsg: err.Error()}, nil
+	}
+	defer root.Close()
+
+	var results []*pb.FileSearchResult
+	err = walkContainerFiles(root, name, func(fileName string) error {
+		file, err := root.Open(fileName)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		matches, err := searchFile(file, regex)
+		if len(matches) > 0 {
+			rel, _ := filepath.Rel(name, fileName)
+			results = append(results, &pb.FileSearchResult{Path: filepath.Join(containerPath, rel), Matches: matches})
+		}
+		return err
+	})
+	if err != nil {
+		return &pb.ContainerSandboxFindInFilesResponse{ErrorMsg: fmt.Sprintf("failed to search for '%s' in %s: %s", in.Pattern, containerPath, err.Error())}, nil
+	}
+
+	return &pb.ContainerSandboxFindInFilesResponse{Ok: true, Results: results}, nil
+}
+
+// Helper types and functions
+
+// containerRoot opens the host directory that backs containerPath and returns
+// the path relative to it. Every later open goes through the returned Root,
+// so ".." and symlinks, including absolute ones like /var/run -> /run, resolve
+// inside the container's filesystem and never the worker's. Bind mounts win
+// over the rootfs, longest destination first, as they do in the container.
+func containerRoot(instance *ContainerInstance, containerPath string, write bool) (*os.Root, string, error) {
+	containerPath = filepath.Clean("/" + containerPath)
+	mount := specs.Mount{Source: instance.Spec.Root.Path, Destination: "/"}
+	for _, m := range instance.Spec.Mounts {
+		dest := filepath.Clean(m.Destination)
+		if len(dest) >= len(mount.Destination) && (containerPath == dest || strings.HasPrefix(containerPath, dest+"/")) {
+			mount = m
+			mount.Destination = dest
+		}
+	}
+	// proc, sysfs, tmpfs and the like have no host directory behind them.
+	if !filepath.IsAbs(mount.Source) {
+		return nil, "", fmt.Errorf("%s is not on a bind mount or the root filesystem", containerPath)
+	}
+	if write && slices.Contains(mount.Options, "ro") {
+		return nil, "", fmt.Errorf("%s is read-only", containerPath)
+	}
+	root, err := os.OpenRoot(mount.Source)
+	if err != nil {
+		return nil, "", err
+	}
+	name, _ := filepath.Rel(mount.Destination, containerPath)
+	return root, name, nil
+}
+
+// walkContainerFiles visits the regular files under base. Symlinks are not
+// followed; visit reopens each file through root at the point of use.
+func walkContainerFiles(root *os.Root, base string, visit func(string) error) error {
+	return fs.WalkDir(root.FS(), base, func(name string, entry fs.DirEntry, err error) error {
+		if err == nil && entry.Type().IsRegular() {
+			return visit(name)
+		}
+		return err
+	})
+}
+
+// A longer line is not text worth searching.
+const maxSearchLineBytes = 16 << 20
+
+// searchFile reports regex matches as 1-based line and column ranges. A file
+// with a NUL byte is binary and has no matches.
+func searchFile(r io.Reader, regex *regexp.Regexp) ([]*pb.FileSearchMatch, error) {
+	var matches []*pb.FileSearchMatch
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(nil, maxSearchLineBytes)
+	for line := int32(1); scanner.Scan(); line++ {
+		text := scanner.Bytes()
+		if bytes.IndexByte(text, 0) >= 0 {
+			return nil, nil
+		}
+		for _, loc := range regex.FindAllIndex(text, -1) {
+			matches = append(matches, &pb.FileSearchMatch{
+				Range: &pb.FileSearchRange{
+					Start: &pb.FileSearchPosition{Line: line, Column: int32(loc[0] + 1)},
+					End:   &pb.FileSearchPosition{Line: line, Column: int32(loc[1])},
+				},
+				Content: string(text[loc[0]:loc[1]]),
+			})
+		}
+	}
+	if err := scanner.Err(); err != nil && !errors.Is(err, bufio.ErrTooLong) {
+		return nil, err
+	}
+	return matches, nil
+}
+
+type StagedFile struct {
+	Path    string
+	Content string
+}
+
+func stageFilesForReplacement(root *os.Root, basePath string, stringToReplace string, stringToReplaceWith string) ([]StagedFile, error) {
+	stagedFiles := []StagedFile{}
+	regex, err := regexp.Compile(stringToReplace)
+	if err != nil {
+		return nil, err
+	}
+	err = walkContainerFiles(root, basePath, func(name string) error {
+		content, err := root.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		if regex.Match(content) {
+			stagedFiles = append(stagedFiles, StagedFile{
+				Path:    name,
+				Content: string(regex.ReplaceAll(content, []byte(stringToReplaceWith))),
+			})
+		}
+		return nil
+	})
+	return stagedFiles, err
+}

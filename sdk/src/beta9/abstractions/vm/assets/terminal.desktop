@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Exec=xterm
+Icon=/opt/beam-vm/terminal.svg
+Path=/workspace
+Terminal=false

@@ -1,0 +1,680 @@
+package function
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/rs/zerolog/log"
+
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/network"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/scheduler"
+	"github.com/beam-cloud/beta9/pkg/task"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+type FunctionService interface {
+	pb.FunctionServiceServer
+	FunctionInvoke(in *pb.FunctionInvokeRequest, stream pb.FunctionService_FunctionInvokeServer) error
+	FunctionGetArgs(ctx context.Context, in *pb.FunctionGetArgsRequest) (*pb.FunctionGetArgsResponse, error)
+	FunctionSetResult(ctx context.Context, in *pb.FunctionSetResultRequest) (*pb.FunctionSetResultResponse, error)
+}
+
+const (
+	DefaultFunctionTaskTTL uint32 = 3600 * 12 // 12 hours
+
+	functionRoutePrefix             string        = "/function"
+	scheduleRoutePrefix             string        = "/schedule"
+	defaultFunctionContainerCpu     int64         = 100
+	defaultFunctionContainerMemory  int64         = 128
+	functionArgsExpirationTimeout   time.Duration = 600 * time.Second
+	functionResultExpirationTimeout time.Duration = 600 * time.Second
+)
+
+type ContainerFunctionService struct {
+	pb.UnimplementedFunctionServiceServer
+	ctx              context.Context
+	taskDispatcher   *task.Dispatcher
+	backendRepo      repository.BackendRepository
+	workspaceRepo    repository.WorkspaceRepository
+	taskRepo         repository.TaskRepository
+	containerRepo    repository.ContainerRepository
+	eventRepo        repository.EventRepository
+	usageMetricsRepo repository.UsageMetricsRepository
+	scheduler        *scheduler.Scheduler
+	tailscale        *network.Tailscale
+	config           types.AppConfig
+	keyEventManager  *common.KeyEventManager
+	rdb              *common.RedisClient
+	routeGroup       *echo.Group
+}
+
+type FunctionServiceOpts struct {
+	Config           types.AppConfig
+	RedisClient      *common.RedisClient
+	BackendRepo      repository.BackendRepository
+	WorkspaceRepo    repository.WorkspaceRepository
+	TaskRepo         repository.TaskRepository
+	ContainerRepo    repository.ContainerRepository
+	Scheduler        *scheduler.Scheduler
+	Tailscale        *network.Tailscale
+	RouteGroup       *echo.Group
+	TaskDispatcher   *task.Dispatcher
+	EventRepo        repository.EventRepository
+	UsageMetricsRepo repository.UsageMetricsRepository
+}
+
+func NewContainerFunctionService(ctx context.Context,
+	opts FunctionServiceOpts,
+) (FunctionService, error) {
+	keyEventManager := common.NewKeyEventManager(opts.RedisClient)
+
+	fs := &ContainerFunctionService{
+		ctx:              ctx,
+		config:           opts.Config,
+		backendRepo:      opts.BackendRepo,
+		workspaceRepo:    opts.WorkspaceRepo,
+		taskRepo:         opts.TaskRepo,
+		containerRepo:    opts.ContainerRepo,
+		scheduler:        opts.Scheduler,
+		tailscale:        opts.Tailscale,
+		rdb:              opts.RedisClient,
+		keyEventManager:  keyEventManager,
+		taskDispatcher:   opts.TaskDispatcher,
+		routeGroup:       opts.RouteGroup,
+		eventRepo:        opts.EventRepo,
+		usageMetricsRepo: opts.UsageMetricsRepo,
+	}
+	// Register task dispatcher
+	fs.taskDispatcher.Register(string(types.ExecutorFunction), fs.functionTaskFactory)
+
+	// Register HTTP routes
+	authMiddleware := auth.AuthMiddleware(fs.backendRepo, fs.workspaceRepo)
+	registerFunctionRoutes(fs.routeGroup.Group(functionRoutePrefix, authMiddleware), fs)
+	registerFunctionRoutes(fs.routeGroup.Group(scheduleRoutePrefix, authMiddleware), fs)
+
+	go fs.listenForScheduledJobs()
+	go abstractions.ListenForTaskSchedulingFailures(ctx, fs.rdb, fs.backendRepo, fs.taskDispatcher)
+
+	return fs, nil
+}
+
+func (fs *ContainerFunctionService) FunctionInvoke(in *pb.FunctionInvokeRequest, stream pb.FunctionService_FunctionInvokeServer) error {
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	if ids := md.Get("x-beta9-task-id"); len(ids) > 0 && ids[0] != "" {
+		return fs.resumeInvocation(in.StubId, ids[0], stream)
+	}
+	authInfo, _ := auth.AuthInfoFromContext(stream.Context())
+	ctx := stream.Context()
+
+	task, err := fs.invoke(ctx, authInfo, in.StubId, &types.TaskPayload{
+		Args: []interface{}{in.Args},
+	})
+	if err != nil {
+		return err
+	}
+	// Publish the task identity before waiting for its container to start.
+	if err := stream.Send(&pb.FunctionInvokeResponse{TaskId: task.Metadata().TaskId, ContainerId: task.Metadata().ContainerId}); err != nil {
+		return err
+	}
+
+	return fs.stream(ctx, stream, authInfo, task)
+}
+
+// Reattach to an accepted invocation without scheduling another container.
+func (fs *ContainerFunctionService) resumeInvocation(stubID, taskID string, stream pb.FunctionService_FunctionInvokeServer) error {
+	authInfo, _ := auth.AuthInfoFromContext(stream.Context())
+	current, err := fs.backendRepo.GetTaskWithRelated(stream.Context(), taskID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return status.Error(codes.NotFound, "invocation not found")
+	}
+	if current.Workspace.ExternalId != authInfo.Workspace.ExternalId || current.Stub.ExternalId != stubID {
+		return status.Error(codes.PermissionDenied, "invocation does not belong to this function")
+	}
+	task := &FunctionTask{fs: fs, containerId: current.ContainerId, msg: &types.TaskMessage{
+		TaskId: taskID, StubId: stubID, WorkspaceName: authInfo.Workspace.Name,
+	}}
+	if current.Status.IsCompleted() {
+		count, err := fs.rdb.Exists(stream.Context(), common.RedisKeys.SchedulerWorkerAddress(current.ContainerId)).Result()
+		if err != nil {
+			return err
+		}
+		if count > 0 {
+			err := fs.stream(stream.Context(), stream, authInfo, task)
+			// The completed log buffer lives on the worker, so it's gone with a
+			// worker that can't be reached, and older workers have none. Only
+			// those fall back to the result; transport failures retry.
+			var rpcErr interface{ GRPCStatus() *status.Status }
+			oldWorker := errors.As(err, &rpcErr) && rpcErr.GRPCStatus().Code() == codes.Unknown && rpcErr.GRPCStatus().Message() == "container not found"
+			if !oldWorker && !errors.Is(err, abstractions.ErrWorkerUnreachable) {
+				return err
+			}
+		}
+		result, err := fs.rdb.Get(stream.Context(), Keys.FunctionResult(authInfo.Workspace.Name, taskID)).Bytes()
+		if err != nil && current.Status == types.TaskStatusComplete {
+			return status.Error(codes.Unavailable, "function result is not yet available")
+		}
+		exitCode, err := fs.containerRepo.GetContainerExitCode(current.ContainerId)
+		if err != nil {
+			exitCode = 1
+			if current.Status == types.TaskStatusComplete {
+				exitCode = 0
+			}
+		}
+		return stream.Send(&pb.FunctionInvokeResponse{TaskId: taskID, Done: true, ExitCode: int32(exitCode), Result: result})
+	}
+	if err := stream.Send(&pb.FunctionInvokeResponse{TaskId: taskID, ContainerId: current.ContainerId}); err != nil {
+		return err
+	}
+	return fs.stream(stream.Context(), stream, authInfo, task)
+}
+
+func (fs *ContainerFunctionService) invoke(ctx context.Context, authInfo *auth.AuthInfo, stubId string, payload *types.TaskPayload) (types.TaskInterface, error) {
+	stub, err := fs.backendRepo.GetStubByExternalId(ctx, stubId)
+	if err != nil {
+		return nil, err
+	}
+	if stub == nil {
+		return nil, status.Error(codes.NotFound, "Function not found")
+	}
+
+	stubConfig := types.StubConfigV1{}
+	err = json.Unmarshal([]byte(stub.Config), &stubConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	policy := stubConfig.TaskPolicy
+	if policy.TTL == 0 {
+		// This is required for backward compatibility since older functions do not have a TTL set which defaults to 0
+		policy.TTL = DefaultFunctionTaskTTL
+	}
+	policy.Expires = time.Now().Add(time.Duration(policy.TTL) * time.Second)
+
+	task, err := fs.taskDispatcher.SendAndExecute(ctx, string(types.ExecutorFunction), &auth.AuthInfo{
+		Workspace: &stub.Workspace,
+	}, stubId, payload, policy, authInfo, stubConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	go fs.eventRepo.PushRunStubEvent(authInfo.Workspace.ExternalId, &stub.Stub, authInfo.Actor)
+	return task, err
+}
+
+func (fs *ContainerFunctionService) functionTaskFactory(ctx context.Context, msg types.TaskMessage) (types.TaskInterface, error) {
+	return &FunctionTask{
+		msg: &msg,
+		fs:  fs,
+	}, nil
+}
+
+func (fs *ContainerFunctionService) stream(ctx context.Context, stream pb.FunctionService_FunctionInvokeServer, authInfo *auth.AuthInfo, task types.TaskInterface) error {
+	// Cursor metadata is optional: deployed SDKs retain the legacy log reader.
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if offsets := md.Get(common.LogOffsetHeader); len(offsets) > 0 {
+			if _, err := strconv.ParseUint(offsets[0], 10, 63); err != nil {
+				return status.Error(codes.InvalidArgument, "invalid log offset")
+			}
+		}
+	}
+	taskId := task.Metadata().TaskId
+	containerId := task.Metadata().ContainerId
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if containers := md.Get(invocationContainerHeader); len(containers) > 0 && containers[0] != "" && containers[0] != containerId {
+			md = md.Copy()
+			md.Set(common.LogOffsetHeader, "0")
+			ctx = metadata.NewIncomingContext(ctx, md)
+		}
+	}
+
+	sendCallback := func(o common.OutputMsg) error {
+		return stream.Send(&pb.FunctionInvokeResponse{TaskId: taskId, Output: o.Msg})
+	}
+
+	exitCallback := func(exitCode int32) error {
+		current, err := fs.backendRepo.GetTask(stream.Context(), taskId)
+		if err != nil {
+			return err
+		}
+		if !current.Status.IsCompleted() || current.ContainerId != containerId {
+			return status.Error(codes.Unavailable, "function attempt ended; waiting for task recovery")
+		}
+		resultLoadStart := time.Now()
+		result, _ := fs.rdb.Get(stream.Context(), Keys.FunctionResult(authInfo.Workspace.Name, taskId)).Bytes()
+		if fs.eventRepo != nil {
+			fs.eventRepo.PushFunctionResultLoaded(authInfo.Workspace.ExternalId, task, exitCode, len(result))
+		}
+		if err := stream.Send(&pb.FunctionInvokeResponse{TaskId: taskId, Done: true, Result: result, ExitCode: exitCode}); err != nil {
+			return err
+		}
+		if fs.eventRepo != nil {
+			fs.eventRepo.PushFunctionResultDelivery(authInfo.Workspace.ExternalId, task, resultLoadStart, exitCode, len(result))
+			fs.eventRepo.PushFunctionResultSent(authInfo.Workspace.ExternalId, task, exitCode, len(result))
+		}
+		return nil
+	}
+
+	containerStream, err := abstractions.NewContainerStream(abstractions.ContainerStreamOpts{
+		SendCallback:    sendCallback,
+		ExitCallback:    exitCallback,
+		ContainerRepo:   fs.containerRepo,
+		Config:          fs.config,
+		Tailscale:       fs.tailscale,
+		KeyEventManager: fs.keyEventManager,
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(fs.ctx, cancel)
+	defer stop()
+	err = containerStream.Stream(ctx, authInfo, containerId)
+	if fs.ctx.Err() != nil {
+		return status.Error(codes.Unavailable, "gateway is restarting")
+	}
+	if err != nil && ctx.Err() == nil {
+		current, lookupErr := fs.backendRepo.GetTask(ctx, taskId)
+		if lookupErr == nil && (!current.Status.IsCompleted() || current.ContainerId != containerId) {
+			return status.Error(codes.Unavailable, "function attempt is recovering")
+		}
+	}
+	return err
+}
+
+func (fs *ContainerFunctionService) FunctionGetArgs(ctx context.Context, in *pb.FunctionGetArgsRequest) (*pb.FunctionGetArgsResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+	now := time.Now()
+	phaseMetrics := task.NewPhaseMetrics(fs.rdb)
+	phaseLabels := phaseMetrics.Labels(ctx, authInfo.Workspace.Name, in.TaskId, map[string]string{
+		"workspace_id": authInfo.Workspace.ExternalId,
+	})
+
+	value, err := fs.rdb.Get(ctx, Keys.FunctionArgs(authInfo.Workspace.Name, in.TaskId)).Bytes()
+	if err != nil {
+		phaseLabels["success"] = "false"
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_get_args", task.FunctionPhaseStartTask, now, phaseLabels)
+		return &pb.FunctionGetArgsResponse{Ok: false, Args: nil}, nil
+	}
+
+	err = fs.rdb.SetEx(ctx, Keys.FunctionHeartbeat(authInfo.Workspace.Name, in.TaskId), 1, types.TaskHeartbeatTTL).Err()
+	if err != nil {
+		phaseLabels["success"] = "false"
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_get_args", task.FunctionPhaseStartTask, now, phaseLabels)
+		return &pb.FunctionGetArgsResponse{Ok: false, Args: nil}, nil
+	}
+
+	phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_get_args", task.FunctionPhaseStartTask, now, phaseLabels)
+	if err := phaseMetrics.Mark(ctx, authInfo.Workspace.Name, in.TaskId, task.FunctionPhaseGetArgs, now); err != nil {
+		log.Debug().Err(err).Str("task_id", in.TaskId).Msg("failed to mark function get_args phase")
+	}
+	if fs.eventRepo != nil {
+		if taskWithRelated, err := fs.backendRepo.GetTaskWithRelated(ctx, in.TaskId); err == nil && taskWithRelated != nil {
+			fs.eventRepo.PushFunctionGetArgs(ctx, fs.rdb, taskWithRelated, now, len(value))
+		}
+	}
+
+	return &pb.FunctionGetArgsResponse{
+		Ok:   true,
+		Args: value,
+	}, nil
+}
+
+const invocationContainerHeader = "x-beta9-container-id"
+
+var storeFunctionResultScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])
+return 1
+`)
+
+func (fs *ContainerFunctionService) FunctionSetResult(ctx context.Context, in *pb.FunctionSetResultRequest) (*pb.FunctionSetResultResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+	current, err := fs.backendRepo.GetTaskWithRelated(ctx, in.TaskId)
+	if err != nil {
+		return nil, task.CompletionError(err)
+	}
+	if current == nil {
+		return nil, status.Error(codes.NotFound, "task no longer exists")
+	}
+	if current.Workspace.ExternalId != authInfo.Workspace.ExternalId {
+		return nil, status.Error(codes.PermissionDenied, "task does not belong to this workspace")
+	}
+	if in.ContainerId != "" && current.ContainerId != in.ContainerId {
+		return nil, status.Error(codes.FailedPrecondition, "container does not own a running task")
+	}
+	if current.Status == types.TaskStatusCancelled {
+		return nil, status.Error(codes.Canceled, "task was cancelled")
+	}
+	if current.Status != types.TaskStatusRunning {
+		return nil, status.Error(codes.FailedPrecondition, "container does not own a running task")
+	}
+	now := time.Now()
+	phaseMetrics := task.NewPhaseMetrics(fs.rdb)
+	phaseLabels := phaseMetrics.Labels(ctx, authInfo.Workspace.Name, in.TaskId, map[string]string{
+		"workspace_id": authInfo.Workspace.ExternalId,
+	})
+
+	stored, err := storeFunctionResultScript.Run(ctx, fs.rdb, []string{
+		common.RedisKeys.TaskClaim(authInfo.Workspace.Name, current.Stub.ExternalId, in.TaskId),
+		Keys.FunctionResult(authInfo.Workspace.Name, in.TaskId),
+	}, current.ContainerId, in.Result, functionResultExpirationTimeout.Milliseconds()).Int()
+	if err != nil {
+		phaseLabels["success"] = "false"
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "get_args_to_set_result", task.FunctionPhaseGetArgs, now, phaseLabels)
+		phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_set_result", task.FunctionPhaseStartTask, now, phaseLabels)
+		return nil, task.CompletionError(err)
+	}
+	if stored == 0 {
+		return nil, status.Error(codes.FailedPrecondition, "container no longer owns task")
+	}
+
+	phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "get_args_to_set_result", task.FunctionPhaseGetArgs, now, phaseLabels)
+	phaseMetrics.RecordSince(ctx, authInfo.Workspace.Name, in.TaskId, "start_task_to_set_result", task.FunctionPhaseStartTask, now, phaseLabels)
+	if err := phaseMetrics.Mark(ctx, authInfo.Workspace.Name, in.TaskId, task.FunctionPhaseSetResult, now); err != nil {
+		log.Debug().Err(err).Str("task_id", in.TaskId).Msg("failed to mark function set_result phase")
+	}
+	if fs.eventRepo != nil {
+		if taskWithRelated, err := fs.backendRepo.GetTaskWithRelated(ctx, in.TaskId); err == nil && taskWithRelated != nil {
+			fs.eventRepo.PushFunctionSetResult(ctx, fs.rdb, taskWithRelated, now, len(in.Result))
+		}
+	}
+
+	return &pb.FunctionSetResultResponse{
+		Ok: true,
+	}, nil
+}
+
+func (fs *ContainerFunctionService) FunctionMonitor(req *pb.FunctionMonitorRequest, stream pb.FunctionService_FunctionMonitorServer) error {
+	authInfo, _ := auth.AuthInfoFromContext(stream.Context())
+
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+
+	task, err := fs.backendRepo.GetTaskWithRelated(ctx, req.TaskId)
+	if err != nil {
+		return err
+	}
+
+	var stubConfig types.StubConfigV1 = types.StubConfigV1{}
+	err = json.Unmarshal([]byte(task.Stub.Config), &stubConfig)
+	if err != nil {
+		return err
+	}
+
+	timeout := int64(stubConfig.TaskPolicy.Timeout)
+	timeoutCallback := func() error {
+		task.Status = types.TaskStatusTimeout
+
+		_, err = fs.backendRepo.UpdateTask(
+			stream.Context(),
+			task.ExternalId,
+			task.Task,
+		)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// Listen for task cancellation events
+	channelKey := common.RedisKeys.TaskCancel(authInfo.Workspace.Name, req.StubId, req.TaskId)
+	cancelFlag := make(chan bool, 1)
+	timeoutFlag := make(chan bool, 1)
+
+	var timeoutChan <-chan time.Time
+	taskStartTimeSeconds := task.StartedAt.Time.Unix()
+	currentTimeSeconds := time.Now().Unix()
+	timeoutTimeSeconds := taskStartTimeSeconds + timeout
+	leftoverTimeoutSeconds := timeoutTimeSeconds - currentTimeSeconds
+
+	if timeout <= 0 {
+		timeoutChan = make(<-chan time.Time) // Indicates that the task does not have a timeout
+	} else if leftoverTimeoutSeconds <= 0 {
+		err := timeoutCallback()
+		if err != nil {
+			log.Error().Err(err).Msg("error timing out task")
+			return err
+		}
+
+		timeoutFlag <- true
+		timeoutChan = make(<-chan time.Time)
+	} else {
+		timeoutChan = time.After(time.Duration(leftoverTimeoutSeconds) * time.Second)
+	}
+
+	go func() {
+	retry:
+		for {
+			messages, errs := fs.rdb.Subscribe(ctx, channelKey)
+
+			for {
+				select {
+				case <-timeoutChan:
+					err := timeoutCallback()
+					if err != nil {
+						log.Error().Err(err).Msg("task timeout err")
+					}
+					timeoutFlag <- true
+					return
+
+				case msg := <-messages:
+					if msg != nil && task != nil && msg.Payload == task.ExternalId {
+						cancelFlag <- true
+						return
+					}
+
+				case <-fs.ctx.Done():
+					return
+
+				case <-ctx.Done():
+					return
+
+				case err := <-errs:
+					if err != nil {
+						log.Error().Err(err).Msg("monitor task subscription err")
+						break retry
+					}
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-fs.ctx.Done():
+			return nil
+
+		case <-stream.Context().Done():
+			return nil
+
+		case <-cancelFlag:
+			err := fs.taskDispatcher.Complete(ctx, authInfo.Workspace.Name, req.StubId, task.ExternalId)
+			if err != nil {
+				return err
+			}
+
+			stream.Send(&pb.FunctionMonitorResponse{Ok: true, Cancelled: true, Complete: false, TimedOut: false})
+			return nil
+
+		case <-timeoutFlag:
+			err := fs.taskDispatcher.Complete(ctx, authInfo.Workspace.Name, req.StubId, task.ExternalId)
+			if err != nil {
+				return err
+			}
+
+			stream.Send(&pb.FunctionMonitorResponse{Ok: true, Cancelled: false, Complete: false, TimedOut: true})
+			return nil
+
+		default:
+			if task.Status == types.TaskStatusCancelled {
+				stream.Send(&pb.FunctionMonitorResponse{Ok: true, Cancelled: true, Complete: false, TimedOut: false})
+				return nil
+			}
+
+			err := fs.rdb.SetEx(ctx, Keys.FunctionHeartbeat(authInfo.Workspace.Name, task.ExternalId), 1, types.TaskHeartbeatTTL).Err()
+			if err != nil {
+				return err
+			}
+
+			claimed, err := fs.taskRepo.IsClaimed(ctx, authInfo.Workspace.Name, req.StubId, task.ExternalId)
+			if err != nil {
+				return err
+			}
+
+			if !claimed {
+				current, err := fs.backendRepo.GetTask(ctx, task.ExternalId)
+				if err != nil {
+					return err
+				}
+				if current.Status.IsCompleted() {
+					return stream.Send(&pb.FunctionMonitorResponse{
+						Ok: true, Cancelled: current.Status == types.TaskStatusCancelled,
+						TimedOut: current.Status == types.TaskStatusTimeout,
+						Complete: current.Status != types.TaskStatusCancelled && current.Status != types.TaskStatusTimeout,
+					})
+				}
+			}
+
+			if err := stream.Send(&pb.FunctionMonitorResponse{Ok: true}); err != nil {
+				return err
+			}
+			time.Sleep(types.TaskHeartbeatInterval)
+		}
+	}
+}
+
+func (fs *ContainerFunctionService) genContainerId(taskId, stubType string) string {
+	return functionContainerID(taskId, stubType, uuid.New())
+}
+
+func functionContainerID(taskID, stubType string, attempt uuid.UUID) string {
+	return fmt.Sprintf("%s-%s-%s", stubType, taskID, attempt.String()[:8])
+}
+
+func (fs *ContainerFunctionService) FunctionSchedule(ctx context.Context, req *pb.FunctionScheduleRequest) (*pb.FunctionScheduleResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+
+	stub, err := fs.backendRepo.GetStubByExternalId(ctx, req.StubId)
+	if err != nil {
+		return &pb.FunctionScheduleResponse{Ok: false, ErrMsg: "Unable to get stub"}, nil
+	}
+
+	currentDeployment, err := fs.backendRepo.GetDeploymentByExternalId(ctx, authInfo.Workspace.Id, req.DeploymentId)
+	if err != nil {
+		return &pb.FunctionScheduleResponse{Ok: false, ErrMsg: "Unable to find associated deployment"}, nil
+	}
+
+	if err := fs.backendRepo.DeletePreviousScheduledJob(ctx, &currentDeployment.Deployment); err != nil {
+		return &pb.FunctionScheduleResponse{Ok: false, ErrMsg: "Unable to delete previous scheduled job"}, nil
+	}
+
+	job, err := fs.backendRepo.CreateScheduledJob(ctx, &types.ScheduledJob{
+		JobName:      fmt.Sprintf("%v-%v", currentDeployment.Name, stub.ExternalId),
+		Schedule:     req.When,
+		DeploymentId: currentDeployment.Id,
+		StubId:       stub.Id,
+		Payload: types.ScheduledJobPayload{
+			StubId:        stub.ExternalId,
+			WorkspaceName: authInfo.Workspace.Name,
+		},
+	})
+	if err != nil {
+		return &pb.FunctionScheduleResponse{Ok: false, ErrMsg: err.Error()}, nil
+	}
+
+	return &pb.FunctionScheduleResponse{
+		Ok:             true,
+		ScheduledJobId: job.ExternalId,
+	}, nil
+}
+
+func (fs *ContainerFunctionService) listenForScheduledJobs() {
+	log.Info().Str("channel", repository.ScheduledJobsChannel).Msg("listening for scheduled jobs")
+	for {
+		select {
+		case <-fs.ctx.Done():
+			return
+		default:
+			messages, err := fs.backendRepo.ListenToChannel(fs.ctx, repository.ScheduledJobsChannel)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to listen to scheduled job channel")
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			lock := common.NewRedisLock(fs.rdb)
+			for message := range messages {
+				var payload types.ScheduledJobPayload
+				if err := json.Unmarshal([]byte(message), &payload); err != nil {
+					log.Error().Err(err).Msg("failed to unmarshal scheduled job payload")
+					continue
+				}
+
+				if err := lock.Acquire(fs.ctx, Keys.FunctionScheduledJobLock(payload.StubId), common.RedisLockOptions{TtlS: 10, Retries: 0}); err != nil {
+					continue
+				}
+
+				authInfo := &auth.AuthInfo{Workspace: &types.Workspace{Name: payload.WorkspaceName}}
+				if _, err = fs.invoke(fs.ctx, authInfo, payload.StubId, &payload.TaskPayload); err != nil {
+					log.Error().Err(err).Msg("failed to invoke scheduled job")
+				}
+
+				lock.Release(Keys.FunctionScheduledJobLock(payload.StubId))
+			}
+		}
+	}
+}
+
+// Redis keys
+var (
+	functionPrefix            string = "function"
+	functionArgs              string = "function:%s:%s:args"
+	functionResult            string = "function:%s:%s:result"
+	functionHeartbeat         string = "function:%s:%s:heartbeat"
+	functionScheduledJobsLock string = "function:scheduled_jobs_lock:%s"
+)
+
+var Keys = &keys{}
+
+type keys struct{}
+
+func (k *keys) FunctionPrefix() string {
+	return functionPrefix
+}
+
+func (k *keys) FunctionArgs(workspaceName, taskId string) string {
+	return fmt.Sprintf(functionArgs, workspaceName, taskId)
+}
+
+func (k *keys) FunctionResult(workspaceName, taskId string) string {
+	return fmt.Sprintf(functionResult, workspaceName, taskId)
+}
+
+func (k *keys) FunctionHeartbeat(workspaceName, taskId string) string {
+	return fmt.Sprintf(functionHeartbeat, workspaceName, taskId)
+}
+
+func (k *keys) FunctionScheduledJobLock(stubId string) string {
+	return fmt.Sprintf(functionScheduledJobsLock, stubId)
+}

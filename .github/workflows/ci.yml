@@ -1,0 +1,149 @@
+name: Test
+
+on: [push]
+
+
+jobs:
+  lint_and_test_python_sdk:
+    defaults:
+      run:
+        working-directory: sdk
+
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 4
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Load cached venv
+        id: cached-dependencies
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/uv.lock') }}
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Code formatting
+        run: uv run ruff format .
+
+      - name: Code linting
+        run: uv run ruff check .
+
+      - name: Run tests
+        env: 
+          CI: true
+        run: make tests
+
+  lint_and_test_go_pkg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: "1.25.0"
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run Tests
+        run: |
+          make test-pkg
+          go test -v ./cmd/vminit
+          sudo apt-get update && sudo apt-get install -y tini
+          go test -c -o /tmp/worker-init.test ./cmd/worker
+          sudo /tmp/worker-init.test -test.v
+  
+  verify_microvm_image_pin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Worker and GPU guest Dockerfiles pin matching microvm artifacts
+        run: |
+          want="ARG MICROVM_IMAGE=public.ecr.aws/n4e0e1y0/beta9-microvm:$(hack/microvm-image-tag.sh)"
+          for f in docker/Dockerfile.worker docker/Dockerfile.worker-overlay; do
+            grep -qxF "$want" "$f" || { echo "$f must contain: $want"; exit 1; }
+          done
+          want="ARG KERNEL_DEVEL=public.ecr.aws/n4e0e1y0/beta9-microvm:$(hack/microvm-image-tag.sh)-kernel-devel"
+          grep -qxF "$want" docker/Dockerfile.vm-gpu || { echo "docker/Dockerfile.vm-gpu must contain: $want"; exit 1; }
+
+      - name: SDK default GPU image matches its kernel and guest inputs
+        run: |
+          export GPU_GUEST_IMAGE="public.ecr.aws/n4e0e1y0/beta9-microvm:$(hack/microvm-image-tag.sh nvidia)"
+          python3 - <<'PY'
+          import ast
+          import os
+          from pathlib import Path
+
+          module = ast.parse(Path("sdk/src/beta9/abstractions/vm/__init__.py").read_text())
+          value = next(ast.literal_eval(node.value) for node in module.body
+                       if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+                       and target.id == "DEFAULT_VM_GPU_BASE_IMAGE" for target in node.targets))
+          assert value == os.environ["GPU_GUEST_IMAGE"], f"Update DEFAULT_VM_GPU_BASE_IMAGE to {os.environ['GPU_GUEST_IMAGE']}"
+          PY
+
+  verify_protobufs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: "1.25.0"
+      
+      - name: Install Protoc
+        run: |
+          protoc_dir="$RUNNER_TEMP/protoc-25.1"
+          archive="$RUNNER_TEMP/protoc-25.1-linux-x86_64.zip"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip
+          echo "ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50  $archive" | sha256sum --check
+          unzip -q "$archive" -d "$protoc_dir"
+          echo "$protoc_dir/bin" >> "$GITHUB_PATH"
+          echo "PROTOC_INCLUDE_PATH=$protoc_dir/include" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11.9"
+      
+      - name: Install Protobuf Compilers
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.31.0
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+          go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@v2.27.1
+          go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@v2.27.1
+          go install github.com/beam-cloud/go2proto@091f2e319b32a829052fdc8f02bbb6561c4f0504
+        
+      - name: Install Python GRPC Package
+        run: |
+          python3 -m pip install -U "betterproto-beta9[compiler]==2.0.1" "grpcio==1.69.0" "black==24.8.0" "isort==5.13.2"
+
+      - name: Verify Protobuf Codegen
+        env:
+          GO_PATH: ~/go
+        run: |
+          test "$(protoc --version)" = "libprotoc 25.1"
+          make verify-protocol

@@ -1,0 +1,1433 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/common"
+	betaruntime "github.com/beam-cloud/beta9/pkg/runtime"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	clipCommon "github.com/beam-cloud/clip/pkg/common"
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+type firstPortConflictNetwork struct {
+	*fakeContainerNetworkController
+	checks int
+}
+
+func (n *firstPortConflictNetwork) HostPortConflict(int) (bool, error) {
+	n.checks++
+	return n.checks == 1, nil
+}
+
+func TestContainerRuntimeListenerSkipsForwardedPort(t *testing.T) {
+	network := &firstPortConflictNetwork{fakeContainerNetworkController: &fakeContainerNetworkController{}}
+	listener, err := listenForContainerRuntimeServer(network)
+	require.NoError(t, err)
+	require.NotNil(t, listener)
+	require.GreaterOrEqual(t, network.checks, 2)
+	require.NoError(t, listener.Close())
+}
+
+type logAttachmentStream struct {
+	pb.ContainerService_ContainerStreamLogsServer
+	attached bool
+	ctx      context.Context
+	output   strings.Builder
+}
+
+type execCapturingRuntime struct {
+	mockRuntime
+	processes []specs.Process
+	output    string
+	err       error
+}
+
+type guestMutationRuntime struct{ execCapturingRuntime }
+
+func (*guestMutationRuntime) Name() string { return types.ContainerRuntimeGvisor.String() }
+
+func TestGvisorFilesystemMutationsRunThroughGuest(t *testing.T) {
+	rt := &guestMutationRuntime{}
+	instance := &ContainerInstance{Id: "sandbox-test", Runtime: rt, Spec: &specs.Spec{Process: &specs.Process{Cwd: "/workspace", User: specs.User{UID: 1000}}}}
+	handled, err := guestFilesystemMutation(context.Background(), instance, "rm", "-rf", "--", "/tmp/a b;echo injected")
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, []string{types.WorkerSandboxFilesystemContainerPath, "rm", "-rf", "--", "/tmp/a b;echo injected"}, rt.processes[0].Args)
+	require.Equal(t, "/workspace", rt.processes[0].Cwd)
+	require.Zero(t, rt.processes[0].User.UID)
+	for _, path := range []string{"/", "/tmp/.."} {
+		handled, err = guestFilesystemMutation(context.Background(), instance, "rm", "-rf", "--", path)
+		require.True(t, handled)
+		require.ErrorContains(t, err, "refusing to remove container root")
+	}
+	require.Len(t, rt.processes, 1)
+	instance.Runtime = NewMockRuntime(types.ContainerRuntimeRunc.String(), betaruntime.Capabilities{})
+	handled, err = guestFilesystemMutation(context.Background(), instance, "mkdir", "-p", "/tmp/test")
+	require.NoError(t, err)
+	require.False(t, handled)
+
+	instance.Runtime = rt
+	rt.err = errors.New("exit status 1")
+	rt.output = "mkdir: Not a directory\n"
+	_, err = guestFilesystemMutation(context.Background(), instance, "mkdir", "-p", "/tmp/test")
+	require.ErrorIs(t, err, rt.err)
+	require.ErrorContains(t, err, "mkdir: Not a directory")
+}
+
+func (r *execCapturingRuntime) Exec(_ context.Context, _ string, process specs.Process, opts *betaruntime.ExecOpts) error {
+	r.processes = append(r.processes, process)
+	if r.output != "" && opts != nil && opts.OutputWriter != nil {
+		fmt.Fprint(opts.OutputWriter, r.output)
+	}
+	return r.err
+}
+
+func (s *logAttachmentStream) SendHeader(metadata.MD) error {
+	s.attached = true
+	return nil
+}
+
+func (s *logAttachmentStream) Context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+func (s *logAttachmentStream) Send(entry *pb.ContainerLogEntry) error {
+	_, err := s.output.WriteString(entry.Msg)
+	return err
+}
+
+func TestContainerStreamLogsAcknowledgesAttachment(t *testing.T) {
+	logBuffer := common.NewLogBuffer()
+	logBuffer.Close()
+	server := &ContainerRuntimeServer{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	server.containerInstances.Set("container-id", &ContainerInstance{LogBuffer: logBuffer})
+	stream := &logAttachmentStream{}
+
+	require.NoError(t, server.ContainerStreamLogs(&pb.ContainerStreamLogsRequest{ContainerId: "container-id"}, stream))
+	require.True(t, stream.attached)
+}
+
+func TestContainerSnapshotDisksReportsWhatItCaptured(t *testing.T) {
+	request := &types.ContainerRequest{ContainerId: "container-id"}
+	var snapshotted *types.ContainerRequest
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		snapshotDisks: func(_ context.Context, request *types.ContainerRequest) ([]*types.DiskSnapshot, error) {
+			snapshotted = request
+			return []*types.DiskSnapshot{{ExternalId: "snapshot-1", DiskName: "home", Generation: 7}}, nil
+		},
+	}
+	server.containerInstances.Set("container-id", &ContainerInstance{Request: request})
+
+	response, err := server.ContainerSnapshotDisks(context.Background(), &pb.ContainerSnapshotDisksRequest{ContainerId: "container-id"})
+
+	require.NoError(t, err)
+	require.True(t, response.Ok)
+	require.Same(t, request, snapshotted)
+	require.Len(t, response.Snapshots, 1)
+	require.Equal(t, "snapshot-1", response.Snapshots[0].SnapshotId)
+	require.Equal(t, "home", response.Snapshots[0].DiskName)
+	require.Equal(t, int64(7), response.Snapshots[0].Generation)
+}
+
+func TestContainerCheckpointForwardsTerminalIntent(t *testing.T) {
+	request := &types.ContainerRequest{ContainerId: "container-id"}
+	var got []bool
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		createCheckpoint: func(_ context.Context, opts *CreateCheckpointOpts) error {
+			got = append(got, opts.TerminateAfterCheckpoint)
+			if opts.TerminateAfterCheckpoint {
+				opts.CheckpointRuntime = types.CheckpointRuntimeFilesystem
+			}
+			return nil
+		},
+	}
+	server.containerInstances.Set(request.ContainerId, &ContainerInstance{
+		Id:      request.ContainerId,
+		Request: request,
+		Runtime: NewMockRuntime(types.ContainerRuntimeRunc.String(), betaruntime.Capabilities{CheckpointRestore: true}),
+	})
+
+	var runtimes []string
+	for _, terminate := range []bool{false, true} {
+		response, err := server.ContainerCheckpoint(context.Background(), &pb.ContainerCheckpointRequest{
+			ContainerId:              request.ContainerId,
+			TerminateAfterCheckpoint: terminate,
+		})
+		require.NoError(t, err)
+		require.True(t, response.Ok)
+		runtimes = append(runtimes, response.Runtime)
+	}
+	require.Equal(t, []bool{false, true}, got)
+	require.Equal(t, []string{types.ContainerRuntimeRunc.String(), types.CheckpointRuntimeFilesystem}, runtimes)
+}
+
+func TestContainerCheckpointAllowsForcedTerminalFilesystemCapture(t *testing.T) {
+	request := &types.ContainerRequest{
+		ContainerId: "container-id",
+		Stub: types.StubWithRelated{Stub: types.Stub{
+			Config: `{"_beta9_force_resource_limits":true}`,
+		}},
+	}
+	createCalls := 0
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		createCheckpoint: func(_ context.Context, opts *CreateCheckpointOpts) error {
+			createCalls++
+			opts.CheckpointRuntime = types.CheckpointRuntimeFilesystem
+			return nil
+		},
+	}
+	server.containerInstances.Set(request.ContainerId, &ContainerInstance{
+		Id:      request.ContainerId,
+		Request: request,
+		Runtime: NewMockRuntime("other", betaruntime.Capabilities{}),
+	})
+
+	nonterminal, err := server.ContainerCheckpoint(context.Background(), &pb.ContainerCheckpointRequest{ContainerId: request.ContainerId})
+	require.NoError(t, err)
+	require.False(t, nonterminal.Ok)
+	require.Zero(t, createCalls)
+
+	terminal, err := server.ContainerCheckpoint(context.Background(), &pb.ContainerCheckpointRequest{
+		ContainerId:              request.ContainerId,
+		TerminateAfterCheckpoint: true,
+	})
+	require.NoError(t, err)
+	require.True(t, terminal.Ok)
+	require.Equal(t, types.CheckpointRuntimeFilesystem, terminal.Runtime)
+	require.Equal(t, 1, createCalls)
+}
+
+func TestContainerCheckpointReturnsNoIDWhenPersistenceFails(t *testing.T) {
+	request := &types.ContainerRequest{ContainerId: "container-id"}
+	var calls atomic.Int32
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		createCheckpoint: func(context.Context, *CreateCheckpointOpts) error {
+			calls.Add(1)
+			return errors.New("checkpoint persistence failed")
+		},
+	}
+	server.containerInstances.Set(request.ContainerId, &ContainerInstance{
+		Id: request.ContainerId, Request: request,
+		Runtime: NewMockRuntime(types.ContainerRuntimeRunc.String(), betaruntime.Capabilities{CheckpointRestore: true}),
+	})
+	for _, call := range []struct {
+		terminal bool
+		captures int32
+	}{{true, 1}, {true, 1}, {false, 2}, {false, 3}} {
+		response, err := server.ContainerCheckpoint(context.Background(), &pb.ContainerCheckpointRequest{
+			ContainerId: request.ContainerId, TerminateAfterCheckpoint: call.terminal,
+		})
+		require.NoError(t, err)
+		require.False(t, response.Ok)
+		require.Empty(t, response.CheckpointId)
+		require.Equal(t, "checkpoint persistence failed", response.ErrorMsg)
+		require.Equal(t, call.captures, calls.Load(), "only terminal calls may replay their failed result")
+	}
+}
+
+func TestTerminalCheckpointJoinsAcrossLostResponseAndContainerRemoval(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := &ContainerRuntimeServer{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	request := &types.ContainerRequest{ContainerId: "terminal-transport"}
+	server.containerInstances.Set(request.ContainerId, &ContainerInstance{Request: request,
+		Runtime: NewMockRuntime(types.ContainerRuntimeMicroVM.String(), betaruntime.Capabilities{CheckpointRestore: true})})
+	var calls atomic.Int32
+	started, finish := make(chan string, 1), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(finish) })
+	t.Cleanup(unblock)
+	server.createCheckpoint = func(ctx context.Context, opts *CreateCheckpointOpts) error {
+		calls.Add(1)
+		started <- opts.CheckpointId
+		<-finish
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		opts.DiskSnapshots = []*types.DiskSnapshot{{ExternalId: "exact-root", DiskName: "root"}, {ExternalId: "exact-extra", DiskName: "extra"}}
+		server.containerInstances.Delete(request.ContainerId)
+		return nil
+	}
+	rpcContexts := make(chan context.Context, 200)
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		rpcContexts <- ctx
+		return handler(ctx, req)
+	}))
+	pb.RegisterContainerServiceServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(listener) }()
+	t.Cleanup(grpcServer.Stop)
+	var offline atomic.Bool
+	connections := make(chan net.Conn, 16)
+	client, err := common.NewContainerClientWithDialer(context.Background(), "route://worker", func(ctx context.Context, _ string) (net.Conn, error) {
+		for offline.Load() {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", listener.Addr().String())
+		if err == nil {
+			connections <- conn
+		}
+		return conn, err
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	responses, failures := make(chan *pb.ContainerCheckpointResponse, 100), make(chan error, 100)
+	call := func() {
+		response, err := client.Checkpoint(ctx, request.ContainerId, common.ContainerCheckpointOptions{TerminateAfterCheckpoint: true})
+		responses <- response
+		failures <- err
+	}
+	go call()
+	var originalID string
+	select {
+	case originalID = <-started:
+	case err := <-failures:
+		t.Fatalf("checkpoint was not accepted: %v", err)
+	}
+	acceptedRPC := <-rpcContexts
+	for range 99 {
+		go call()
+	}
+	for range 99 {
+		select {
+		case <-rpcContexts:
+		case <-ctx.Done():
+			t.Fatal("not all100 callers reached the accepted operation")
+		}
+	}
+	offline.Store(true)
+	require.NoError(t, (<-connections).Close())
+	select {
+	case <-acceptedRPC.Done():
+	case <-ctx.Done():
+		t.Fatal("dropped transport did not cancel the original RPC")
+	}
+	unblock()
+	select {
+	case err := <-failures:
+		t.Fatalf("checkpoint failed during a temporary outage: %v", err)
+	case <-time.After(3 * time.Second):
+	}
+	offline.Store(false)
+	for range 100 {
+		require.NoError(t, <-failures)
+		response := <-responses
+		require.True(t, response.Ok)
+		require.Equal(t, originalID, response.CheckpointId)
+		require.Equal(t, "exact-root", response.DiskSnapshots[0].SnapshotId)
+		require.Equal(t, "exact-extra", response.DiskSnapshots[1].SnapshotId)
+	}
+	require.Equal(t, int32(1), calls.Load())
+	response, err := server.ContainerCheckpoint(ctx, &pb.ContainerCheckpointRequest{ContainerId: "new-runtime", TerminateAfterCheckpoint: true})
+	require.NoError(t, err)
+	require.False(t, response.Ok, "another runtime identity must not replay a terminal result")
+}
+
+func TestContainerSnapshotDisksPropagatesRequestContext(t *testing.T) {
+	request := &types.ContainerRequest{ContainerId: "container-id"}
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		snapshotDisks: func(ctx context.Context, _ *types.ContainerRequest) ([]*types.DiskSnapshot, error) {
+			return nil, ctx.Err()
+		},
+	}
+	server.containerInstances.Set("container-id", &ContainerInstance{Request: request})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	response, err := server.ContainerSnapshotDisks(ctx, &pb.ContainerSnapshotDisksRequest{ContainerId: "container-id"})
+
+	require.NoError(t, err)
+	require.False(t, response.Ok)
+	require.Contains(t, response.ErrorMsg, context.Canceled.Error())
+}
+
+func TestContainerSnapshotDisksReportsPartialSuccess(t *testing.T) {
+	request := &types.ContainerRequest{ContainerId: "container-id"}
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		snapshotDisks: func(_ context.Context, _ *types.ContainerRequest) ([]*types.DiskSnapshot, error) {
+			return []*types.DiskSnapshot{
+				nil,
+				{ExternalId: "captured-before-failure", DiskName: "first", Generation: 9},
+			}, errors.New("second disk failed")
+		},
+	}
+	server.containerInstances.Set("container-id", &ContainerInstance{Request: request})
+
+	response, err := server.ContainerSnapshotDisks(context.Background(), &pb.ContainerSnapshotDisksRequest{ContainerId: "container-id"})
+
+	require.NoError(t, err)
+	require.False(t, response.Ok)
+	require.Equal(t, "second disk failed", response.ErrorMsg)
+	require.Len(t, response.Snapshots, 1)
+	require.Equal(t, "captured-before-failure", response.Snapshots[0].SnapshotId)
+}
+
+func TestContainerSnapshotDisksRefusesAnUnknownContainer(t *testing.T) {
+	server := &ContainerRuntimeServer{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+
+	response, err := server.ContainerSnapshotDisks(context.Background(), &pb.ContainerSnapshotDisksRequest{ContainerId: "gone"})
+
+	require.NoError(t, err)
+	require.False(t, response.Ok)
+	require.Contains(t, response.ErrorMsg, "not found")
+}
+
+func TestContainerExecDoesNotMutateBaseOrInstanceProcess(t *testing.T) {
+	containerId := "container-exec-isolated"
+	instanceEnv := []string{"INSTANCE=original"}
+	capturingRuntime := &execCapturingRuntime{}
+	server := &ContainerRuntimeServer{
+		baseConfigSpec: specs.Spec{
+			Process: &specs.Process{
+				Args: []string{"base-command"},
+				Cwd:  "/base",
+				Env:  []string{"BASE=original"},
+			},
+		},
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		runtime:            capturingRuntime,
+	}
+	server.containerInstances.Set(containerId, &ContainerInstance{
+		Spec: &specs.Spec{
+			Process: &specs.Process{
+				Cwd: "/workspace",
+				Env: instanceEnv,
+			},
+		},
+		Request: &types.ContainerRequest{},
+	})
+
+	response, err := server.ContainerExec(context.Background(), &pb.ContainerExecRequest{
+		ContainerId: containerId,
+		Cmd:         "echo isolated",
+		Env:         []string{"REQUEST=isolated"},
+	})
+
+	require.NoError(t, err)
+	require.True(t, response.Ok)
+	require.Len(t, capturingRuntime.processes, 1)
+	require.Equal(t, []string{"base-command"}, server.baseConfigSpec.Process.Args)
+	require.Equal(t, "/base", server.baseConfigSpec.Process.Cwd)
+	require.Equal(t, []string{"BASE=original"}, server.baseConfigSpec.Process.Env)
+	require.Equal(t, []string{"INSTANCE=original"}, instanceEnv)
+
+	capturingRuntime.processes[0].Args[0] = "mutated-command"
+	capturingRuntime.processes[0].Env[0] = "INSTANCE=mutated"
+	require.Equal(t, []string{"base-command"}, server.baseConfigSpec.Process.Args)
+	require.Equal(t, []string{"BASE=original"}, server.baseConfigSpec.Process.Env)
+	require.Equal(t, []string{"INSTANCE=original"}, instanceEnv)
+}
+
+func TestContainerExecProcessesDoNotShareMutableState(t *testing.T) {
+	containerId := "container-exec-repeated"
+	instanceEnv := make([]string, 1, 4)
+	instanceEnv[0] = "INSTANCE=shared-source"
+	instanceProcess := &specs.Process{
+		Cwd: "/first",
+		Env: instanceEnv,
+	}
+	capturingRuntime := &execCapturingRuntime{}
+	server := &ContainerRuntimeServer{
+		baseConfigSpec: specs.Spec{
+			Process: &specs.Process{
+				Args: []string{"base-command"},
+				Cwd:  "/base",
+				Env:  []string{"BASE=original"},
+			},
+		},
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		runtime:            capturingRuntime,
+	}
+	server.containerInstances.Set(containerId, &ContainerInstance{
+		Spec:    &specs.Spec{Process: instanceProcess},
+		Request: &types.ContainerRequest{},
+	})
+
+	first, err := server.ContainerExec(context.Background(), &pb.ContainerExecRequest{
+		ContainerId: containerId,
+		Cmd:         "echo first",
+		Env:         []string{"REQUEST=first"},
+	})
+	require.NoError(t, err)
+	require.True(t, first.Ok)
+
+	instanceProcess.Cwd = "/second"
+	second, err := server.ContainerExec(context.Background(), &pb.ContainerExecRequest{
+		ContainerId: containerId,
+		Cmd:         "echo second",
+		Env:         []string{"REQUEST=second"},
+	})
+	require.NoError(t, err)
+	require.True(t, second.Ok)
+
+	require.Len(t, capturingRuntime.processes, 2)
+	firstProcess := &capturingRuntime.processes[0]
+	secondProcess := &capturingRuntime.processes[1]
+	require.Equal(t, []string{"sh", "-c", "echo first"}, firstProcess.Args)
+	require.Equal(t, "/first", firstProcess.Cwd)
+	require.Equal(t, []string{"INSTANCE=shared-source", "REQUEST=first"}, firstProcess.Env)
+	require.Equal(t, []string{"sh", "-c", "echo second"}, secondProcess.Args)
+	require.Equal(t, "/second", secondProcess.Cwd)
+	require.Equal(t, []string{"INSTANCE=shared-source", "REQUEST=second"}, secondProcess.Env)
+
+	firstProcess.Args[0] = "mutated"
+	firstProcess.Env[0] = "INSTANCE=mutated"
+	require.Equal(t, []string{"sh", "-c", "echo second"}, secondProcess.Args)
+	require.Equal(t, []string{"INSTANCE=shared-source", "REQUEST=second"}, secondProcess.Env)
+	require.Equal(t, []string{"INSTANCE=shared-source"}, instanceEnv)
+}
+
+func TestWaitForSandboxProcessManagerDoesNotProceedBeforeReadySignal(t *testing.T) {
+	containerId := "sandbox-test"
+	ready := make(chan struct{})
+	instance := &ContainerInstance{
+		Id:                      containerId,
+		ProcessManagerReadyChan: ready,
+	}
+
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+	}
+	server.containerInstances.Set(containerId, instance)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := server.waitForSandboxProcessManager(ctx, containerId, instance)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("waitForSandboxProcessManager returned before readiness signal: %v", err)
+	case <-time.After(2100 * time.Millisecond):
+	}
+
+	cancel()
+	require.ErrorContains(t, <-done, "Request cancelled")
+}
+
+func TestProcessManagerDialFailureRetriesReadyDeadline(t *testing.T) {
+	err := status.Error(codes.DeadlineExceeded, "context deadline exceeded while waiting for connections to become ready")
+	require.True(t, isProcessManagerDialFailure(err))
+}
+
+func TestSandboxKilledProcessMarksPersistUntilExpiryOrClear(t *testing.T) {
+	server := &ContainerRuntimeServer{}
+
+	require.False(t, server.sandboxProcessMarkedExited("sandbox-test", 42))
+	server.markSandboxProcessExited("sandbox-test", 42)
+	require.True(t, server.sandboxProcessMarkedExited("sandbox-test", 42))
+
+	server.clearSandboxProcessExited("sandbox-test", 42)
+	require.False(t, server.sandboxProcessMarkedExited("sandbox-test", 42))
+
+	server.killedSandboxProcesses.Store(sandboxProcessMarkKey("sandbox-test", 43), time.Now().Add(-11*time.Minute))
+	require.False(t, server.sandboxProcessMarkedExited("sandbox-test", 43))
+}
+
+func TestWaitForSandboxProcessManagerRefreshesAfterReadySignal(t *testing.T) {
+	containerId := "sandbox-test"
+	ready := make(chan struct{})
+	instance := &ContainerInstance{
+		Id:                      containerId,
+		ProcessManagerReadyChan: ready,
+	}
+
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+	}
+	server.containerInstances.Set(containerId, instance)
+
+	server.containerInstances.Set(containerId, &ContainerInstance{
+		Id:                         containerId,
+		ProcessManagerReadyChan:    ready,
+		SandboxProcessManagerReady: true,
+	})
+	close(ready)
+
+	got, err := server.waitForSandboxProcessManager(context.Background(), containerId, instance)
+	require.NoError(t, err)
+	require.True(t, got.SandboxProcessManagerReady)
+}
+
+func TestWriteInitialSpecFromImagePreservesBaseCwd(t *testing.T) {
+	baseSpec := specs.Spec{Process: &specs.Process{Cwd: "/workspace", Args: []string{"sh"}}}
+	server := &ContainerRuntimeServer{
+		baseConfigSpec: baseSpec,
+		imageClient:    &ImageClient{},
+	}
+	destPath := filepath.Join(t.TempDir(), "initial_config.json")
+
+	err := server.writeInitialSpecFromImage(context.Background(), &ContainerInstance{
+		Request: &types.ContainerRequest{ImageId: "image-without-clip-metadata"},
+	}, destPath)
+	require.NoError(t, err)
+
+	spec := readSpecFile(t, destPath)
+	require.Equal(t, "/workspace", spec.Process.Cwd)
+	require.Equal(t, "/workspace", server.baseConfigSpec.Process.Cwd)
+}
+
+func TestWriteInitialSpecFromImageUsesClipWorkingDirWithoutMutatingBase(t *testing.T) {
+	imageId := "image-with-workdir"
+	imageClient := &ImageClient{}
+	imageClient.cacheOCIMetadata(imageId, &clipCommon.ClipArchiveMetadata{
+		StorageInfo: &clipCommon.OCIStorageInfo{
+			ImageMetadata: &clipCommon.ImageMetadata{
+				WorkingDir: "/app",
+				Cmd:        []string{"python", "app.py"},
+			},
+		},
+	})
+	server := &ContainerRuntimeServer{
+		baseConfigSpec: specs.Spec{Process: &specs.Process{Cwd: "/workspace", Args: []string{"sh"}}},
+		imageClient:    imageClient,
+	}
+	destPath := filepath.Join(t.TempDir(), "initial_config.json")
+
+	err := server.writeInitialSpecFromImage(context.Background(), &ContainerInstance{
+		Request: &types.ContainerRequest{ImageId: imageId},
+	}, destPath)
+	require.NoError(t, err)
+
+	spec := readSpecFile(t, destPath)
+	require.Equal(t, "/app", spec.Process.Cwd)
+	require.Equal(t, []string{"python", "app.py"}, spec.Process.Args)
+	require.Equal(t, "/workspace", server.baseConfigSpec.Process.Cwd)
+}
+
+func TestWriteInitialSpecFromImageCombinesEntrypointAndCmd(t *testing.T) {
+	imageId := "image-with-entrypoint-and-cmd"
+	imageClient := &ImageClient{}
+	imageClient.cacheOCIMetadata(imageId, &clipCommon.ClipArchiveMetadata{
+		StorageInfo: &clipCommon.OCIStorageInfo{
+			ImageMetadata: &clipCommon.ImageMetadata{
+				Entrypoint: []string{"vllm", "serve"},
+				Cmd:        []string{"--model", "Qwen/Qwen2.5-1.5B-Instruct"},
+			},
+		},
+	})
+	server := &ContainerRuntimeServer{
+		baseConfigSpec: specs.Spec{Process: &specs.Process{Cwd: "/workspace", Args: []string{"sh"}}},
+		imageClient:    imageClient,
+	}
+	destPath := filepath.Join(t.TempDir(), "initial_config.json")
+
+	err := server.writeInitialSpecFromImage(context.Background(), &ContainerInstance{
+		Request: &types.ContainerRequest{ImageId: imageId},
+	}, destPath)
+	require.NoError(t, err)
+
+	spec := readSpecFile(t, destPath)
+	require.Equal(t, []string{
+		"vllm",
+		"serve",
+		"--model",
+		"Qwen/Qwen2.5-1.5B-Instruct",
+	}, spec.Process.Args)
+}
+
+func TestWriteInitialSpecFromImageDefaultsEmptyCwd(t *testing.T) {
+	server := &ContainerRuntimeServer{
+		baseConfigSpec: specs.Spec{Process: &specs.Process{Args: []string{"sh"}}},
+		imageClient:    &ImageClient{},
+	}
+	destPath := filepath.Join(t.TempDir(), "initial_config.json")
+
+	err := server.writeInitialSpecFromImage(context.Background(), &ContainerInstance{
+		Request: &types.ContainerRequest{ImageId: "image-with-empty-cwd"},
+	}, destPath)
+	require.NoError(t, err)
+
+	spec := readSpecFile(t, destPath)
+	require.Equal(t, "/", spec.Process.Cwd)
+	require.Empty(t, server.baseConfigSpec.Process.Cwd)
+}
+
+func readSpecFile(t *testing.T, path string) specs.Spec {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	var spec specs.Spec
+	require.NoError(t, json.Unmarshal(data, &spec))
+	require.NotNil(t, spec.Process)
+	return spec
+}
+
+func TestWaitForSandboxProcessManagerFailsAfterFailedReadySignal(t *testing.T) {
+	containerId := "sandbox-test"
+	ready := make(chan struct{})
+	instance := &ContainerInstance{
+		Id:                      containerId,
+		ProcessManagerReadyChan: ready,
+	}
+
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+	}
+	server.containerInstances.Set(containerId, instance)
+	close(ready)
+
+	got, err := server.waitForSandboxProcessManager(context.Background(), containerId, instance)
+	require.ErrorContains(t, err, "failed to become ready")
+	require.False(t, got.SandboxProcessManagerReady)
+}
+
+func TestWaitForSandboxProcessManagerWaitsForLateReadyChannel(t *testing.T) {
+	containerId := "sandbox-test"
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+	}
+	instance := &ContainerInstance{Id: containerId}
+	server.containerInstances.Set(containerId, instance)
+
+	ready := make(chan struct{})
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		fresh := &ContainerInstance{
+			Id:                      containerId,
+			ProcessManagerReadyChan: ready,
+		}
+		server.containerInstances.Set(containerId, fresh)
+
+		time.Sleep(25 * time.Millisecond)
+		fresh.signalProcessManagerReadiness(true)
+		server.containerInstances.Set(containerId, fresh)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	got, err := server.waitForSandboxProcessManager(ctx, containerId, instance)
+	require.NoError(t, err)
+	require.True(t, got.processManagerReady())
+}
+
+func TestContainerSandboxExecDoesNotPollRuntimeStateBeforeProcessManagerReady(t *testing.T) {
+	containerId := "sandbox-test"
+	ready := make(chan struct{})
+	close(ready)
+
+	rt := &stateCountingRuntime{}
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		runtime:            rt,
+	}
+	server.containerInstances.Set(containerId, &ContainerInstance{
+		Id:                      containerId,
+		ProcessManagerReadyChan: ready,
+		Spec:                    &specs.Spec{Process: &specs.Process{}},
+	})
+
+	resp, err := server.ContainerSandboxExec(context.Background(), &pb.ContainerSandboxExecRequest{
+		ContainerId: containerId,
+		Cmd:         "true",
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "Process manager failed")
+	require.Equal(t, int32(0), rt.stateCalls.Load())
+}
+
+func TestContainerSandboxStatusReportsPendingBeforeProcessManagerReady(t *testing.T) {
+	containerId := "sandbox-test"
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+	}
+	server.containerInstances.Set(containerId, &ContainerInstance{Id: containerId})
+
+	resp, err := server.ContainerSandboxStatus(context.Background(), &pb.ContainerSandboxStatusRequest{
+		ContainerId: containerId,
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Equal(t, string(types.SandboxStatusPending), resp.Status)
+	require.Equal(t, int32(-1), resp.ExitCode)
+}
+
+func TestContainerSandboxStatusReportsFailedProcessManagerInitialization(t *testing.T) {
+	containerId := "sandbox-test"
+	ready := make(chan struct{})
+	close(ready)
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+	}
+	server.containerInstances.Set(containerId, &ContainerInstance{
+		Id:                      containerId,
+		ProcessManagerReadyChan: ready,
+	})
+
+	resp, err := server.ContainerSandboxStatus(context.Background(), &pb.ContainerSandboxStatusRequest{
+		ContainerId: containerId,
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "failed to become ready")
+}
+
+func TestContainerSandboxStatusWaitsForReadinessEvent(t *testing.T) {
+	server := &ContainerRuntimeServer{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	instance := &ContainerInstance{Id: "sandbox-ready"}
+	instance.initializeProcessManagerReadiness()
+	server.containerInstances.Set(instance.Id, instance)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan *pb.ContainerSandboxStatusResponse, 1)
+	go func() {
+		resp, _ := server.ContainerSandboxStatus(ctx, &pb.ContainerSandboxStatusRequest{ContainerId: instance.Id, WaitForReady: true})
+		result <- resp
+	}()
+	select {
+	case <-result:
+		t.Fatal("readiness returned before the process manager started")
+	case <-time.After(20 * time.Millisecond):
+	}
+	instance.signalProcessManagerReadiness(true)
+	select {
+	case resp := <-result:
+		require.True(t, resp.Ok)
+		require.Equal(t, string(types.SandboxStatusRunning), resp.Status)
+	case <-ctx.Done():
+		t.Fatal("readiness did not wake on the worker event")
+	}
+}
+
+func TestContainerSandboxStatusReadinessWaitCanCancelOrFail(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		server := &ContainerRuntimeServer{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+		instance := &ContainerInstance{Id: "sandbox-ready"}
+		instance.initializeProcessManagerReadiness()
+		server.containerInstances.Set(instance.Id, instance)
+		ctx, cancel := context.WithCancel(context.Background())
+		if fail {
+			instance.signalProcessManagerReadiness(false)
+		} else {
+			cancel()
+		}
+		resp, err := server.ContainerSandboxStatus(ctx, &pb.ContainerSandboxStatusRequest{ContainerId: instance.Id, WaitForReady: true})
+		cancel()
+		require.NoError(t, err)
+		require.False(t, resp.Ok)
+		if fail {
+			require.Contains(t, resp.ErrorMsg, "failed to become ready")
+		} else {
+			require.Contains(t, resp.ErrorMsg, "cancelled")
+		}
+	}
+}
+
+func TestContainerSandboxStatusRequiresProcessManagerForPid(t *testing.T) {
+	containerId := "sandbox-test"
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+	}
+	server.containerInstances.Set(containerId, &ContainerInstance{Id: containerId})
+
+	resp, err := server.ContainerSandboxStatus(context.Background(), &pb.ContainerSandboxStatusRequest{
+		ContainerId: containerId,
+		Pid:         1,
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrorMsg, "process manager")
+}
+
+func TestWritableContainerAddressMapHandlesNilMap(t *testing.T) {
+	addressMap := writableContainerAddressMap(nil)
+	addressMap[1234] = "127.0.0.1:1234"
+
+	require.Equal(t, "127.0.0.1:1234", addressMap[1234])
+}
+
+func TestWritableContainerAddressMapClonesInput(t *testing.T) {
+	input := map[int32]string{1234: "127.0.0.1:1234"}
+	addressMap := writableContainerAddressMap(input)
+	addressMap[1234] = "127.0.0.1:5678"
+
+	require.Equal(t, "127.0.0.1:1234", input[1234])
+	require.Equal(t, "127.0.0.1:5678", addressMap[1234])
+}
+
+func TestRecordSandboxExposedPortOnlyAppendsMissingPort(t *testing.T) {
+	containerId := "sandbox-test"
+	instances := common.NewSafeMap[*ContainerInstance]()
+	instance := &ContainerInstance{
+		Id: containerId,
+		Request: &types.ContainerRequest{
+			Ports: []uint32{8000},
+		},
+	}
+	instances.Set(containerId, instance)
+
+	recordSandboxExposedPort(instances, containerId, instance, 8000)
+	recordSandboxExposedPort(instances, containerId, instance, 9000)
+	recordSandboxExposedPort(instances, containerId, instance, 9000)
+
+	got, exists := instances.Get(containerId)
+	require.True(t, exists)
+	require.Equal(t, []uint32{8000, 9000}, got.Request.Ports)
+
+	// A sandbox finalized mid-request must not be re-created by the write-back.
+	instances.Delete(containerId)
+	recordSandboxExposedPort(instances, containerId, instance, 9100)
+	require.Equal(t, 0, instances.Len())
+}
+
+func TestContainerSandboxExposePortRegistersBackendRoute(t *testing.T) {
+	containerId := "sandbox-test"
+	repoClient := &fakeContainerRepoClient{
+		addressMap: map[int32]string{
+			8080: "route://existing",
+		},
+	}
+	networkController := &fakeContainerNetworkController{}
+	instances := common.NewSafeMap[*ContainerInstance]()
+	instances.Set(containerId, &ContainerInstance{
+		Id:   containerId,
+		Spec: &specs.Spec{},
+		Request: &types.ContainerRequest{
+			ContainerId: containerId,
+			WorkspaceId: "workspace-1",
+			Ports:       []uint32{8080},
+		},
+	})
+
+	server := &ContainerRuntimeServer{
+		containerInstances:      instances,
+		containerRepoClient:     repoClient,
+		containerNetworkManager: networkController,
+		runtime:                 &stateCountingRuntime{},
+		podAddr:                 "10.0.0.2",
+		backendRoute: func(request *types.ContainerRequest, kind string, port int32, localTarget string) *pb.BackendRoute {
+			return &pb.BackendRoute{
+				RouteId:     "route-new",
+				WorkspaceId: request.WorkspaceId,
+				ContainerId: request.ContainerId,
+				Kind:        kind,
+				Port:        port,
+				Transport:   types.BackendRouteTransportTSNet,
+				LocalTarget: localTarget,
+			}
+		},
+	}
+
+	resp, err := server.ContainerSandboxExposePort(context.Background(), &pb.ContainerSandboxExposePortRequest{
+		ContainerId: containerId,
+		Port:        9000,
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Len(t, networkController.exposedPorts, 1)
+	require.Equal(t, 9000, networkController.exposedPorts[0].containerPort)
+	require.NotNil(t, repoClient.lastSetAddressMap)
+	require.Equal(t, "route://existing", repoClient.lastSetAddressMap.AddressMap[8080])
+	require.Contains(t, repoClient.lastSetAddressMap.AddressMap[9000], "10.0.0.2:")
+	require.Len(t, repoClient.lastSetAddressMap.Routes, 1)
+	require.Equal(t, "route-new", repoClient.lastSetAddressMap.Routes[0].RouteId)
+	require.Equal(t, int32(9000), repoClient.lastSetAddressMap.Routes[0].Port)
+	require.Equal(t, repoClient.lastSetAddressMap.AddressMap[9000], repoClient.lastSetAddressMap.Routes[0].LocalTarget)
+}
+
+func TestContainerSandboxExposePortUsesNetworkManagerAddressForBackendRoute(t *testing.T) {
+	containerId := "sandbox-test"
+	repoClient := &fakeContainerRepoClient{}
+	networkController := &fakeContainerNetworkController{
+		addresses: map[int]string{
+			9000: "192.168.0.44:9000",
+		},
+	}
+	instances := common.NewSafeMap[*ContainerInstance]()
+	instances.Set(containerId, &ContainerInstance{
+		Id:   containerId,
+		Spec: &specs.Spec{},
+		Request: &types.ContainerRequest{
+			ContainerId: containerId,
+			WorkspaceId: "workspace-1",
+		},
+	})
+
+	server := &ContainerRuntimeServer{
+		containerInstances:      instances,
+		containerRepoClient:     repoClient,
+		containerNetworkManager: networkController,
+		runtime:                 &stateCountingRuntime{},
+		podAddr:                 "127.0.0.1",
+		backendRoute: func(request *types.ContainerRequest, kind string, port int32, localTarget string) *pb.BackendRoute {
+			return &pb.BackendRoute{
+				RouteId:     "route-backend",
+				WorkspaceId: request.WorkspaceId,
+				ContainerId: request.ContainerId,
+				Kind:        kind,
+				Port:        port,
+				Transport:   types.BackendRouteTransportTSNet,
+				LocalTarget: localTarget,
+			}
+		},
+	}
+
+	resp, err := server.ContainerSandboxExposePort(context.Background(), &pb.ContainerSandboxExposePortRequest{
+		ContainerId: containerId,
+		Port:        9000,
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Len(t, networkController.exposedPorts, 1)
+	require.Equal(t, 9000, networkController.exposedPorts[0].containerPort)
+	require.NotNil(t, repoClient.lastSetAddressMap)
+	require.Equal(t, "192.168.0.44:9000", repoClient.lastSetAddressMap.AddressMap[9000])
+	require.Len(t, repoClient.lastSetAddressMap.Routes, 1)
+	require.Equal(t, "192.168.0.44:9000", repoClient.lastSetAddressMap.Routes[0].LocalTarget)
+}
+
+func TestContainerSandboxExposePortUpgradesExistingRawAddressToBackendRoute(t *testing.T) {
+	containerId := "sandbox-test"
+	repoClient := &fakeContainerRepoClient{
+		addressMap: map[int32]string{
+			9000: "10.0.0.2:32000",
+		},
+	}
+	networkController := &fakeContainerNetworkController{}
+	instances := common.NewSafeMap[*ContainerInstance]()
+	instances.Set(containerId, &ContainerInstance{
+		Id:   containerId,
+		Spec: &specs.Spec{},
+		Request: &types.ContainerRequest{
+			ContainerId: containerId,
+			WorkspaceId: "workspace-1",
+		},
+	})
+
+	server := &ContainerRuntimeServer{
+		containerInstances:      instances,
+		containerRepoClient:     repoClient,
+		containerNetworkManager: networkController,
+		runtime:                 &stateCountingRuntime{},
+		podAddr:                 "10.0.0.2",
+		backendRoute: func(request *types.ContainerRequest, kind string, port int32, localTarget string) *pb.BackendRoute {
+			return &pb.BackendRoute{
+				RouteId:     "route-existing",
+				WorkspaceId: request.WorkspaceId,
+				ContainerId: request.ContainerId,
+				Kind:        kind,
+				Port:        port,
+				Transport:   types.BackendRouteTransportTSNet,
+				LocalTarget: localTarget,
+			}
+		},
+	}
+
+	resp, err := server.ContainerSandboxExposePort(context.Background(), &pb.ContainerSandboxExposePortRequest{
+		ContainerId: containerId,
+		Port:        9000,
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Empty(t, networkController.exposedPorts)
+	require.NotNil(t, repoClient.lastSetAddressMap)
+	require.Equal(t, "10.0.0.2:32000", repoClient.lastSetAddressMap.AddressMap[9000])
+	require.Len(t, repoClient.lastSetAddressMap.Routes, 1)
+	require.Equal(t, "route-existing", repoClient.lastSetAddressMap.Routes[0].RouteId)
+	require.Equal(t, "10.0.0.2:32000", repoClient.lastSetAddressMap.Routes[0].LocalTarget)
+}
+
+type stateCountingRuntime struct {
+	mockRuntime
+	stateCalls atomic.Int32
+}
+
+func (r *stateCountingRuntime) State(ctx context.Context, containerID string) (betaruntime.State, error) {
+	r.stateCalls.Add(1)
+	return betaruntime.State{ID: containerID, Pid: 1, Status: types.RuncContainerStatusRunning}, nil
+}
+
+type fakeContainerNetworkController struct {
+	exposedPorts []fakeExposedPort
+	addresses    map[int]string
+}
+
+type fakeExposedPort struct {
+	containerID   string
+	hostPort      int
+	containerPort int
+}
+
+func (f *fakeContainerNetworkController) ExposePort(containerId string, hostPort, containerPort int) error {
+	f.exposedPorts = append(f.exposedPorts, fakeExposedPort{
+		containerID:   containerId,
+		hostPort:      hostPort,
+		containerPort: containerPort,
+	})
+	return nil
+}
+
+func (f *fakeContainerNetworkController) ExposePorts(containerId string, bindings []PortBinding) error {
+	for _, binding := range bindings {
+		if err := f.ExposePort(containerId, binding.HostPort, binding.ContainerPort); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeContainerNetworkController) ReservePorts(_ string, count int) ([]int, error) {
+	ports := make([]int, count)
+	for i := range ports {
+		ports[i] = 30000 + i
+	}
+	return ports, nil
+}
+
+func (f *fakeContainerNetworkController) ReleasePortReservations(string) {}
+
+func (f *fakeContainerNetworkController) Setup(containerId string, spec *specs.Spec, request *types.ContainerRequest) error {
+	return nil
+}
+
+func (f *fakeContainerNetworkController) TearDown(containerId string) error {
+	return nil
+}
+
+func (f *fakeContainerNetworkController) UpdateNetworkPermissions(containerId string, request *types.ContainerRequest) error {
+	return nil
+}
+
+func (f *fakeContainerNetworkController) ContainerPortAddress(containerId string, binding PortBinding) (string, error) {
+	if f.addresses != nil {
+		if address, ok := f.addresses[binding.ContainerPort]; ok {
+			return address, nil
+		}
+	}
+	return fmt.Sprintf("10.0.0.2:%d", binding.HostPort), nil
+}
+
+func (f *fakeContainerNetworkController) ContainerPortAddressMap(containerId string, bindings []PortBinding) (map[int32]string, error) {
+	addressMap := make(map[int32]string, len(bindings))
+	for _, binding := range bindings {
+		address, err := f.ContainerPortAddress(containerId, binding)
+		if err != nil {
+			return nil, err
+		}
+		addressMap[int32(binding.ContainerPort)] = address
+	}
+	return addressMap, nil
+}
+
+func (f *fakeContainerNetworkController) Close() error {
+	return nil
+}
+
+func sandboxFileFixture(t *testing.T) (*ContainerRuntimeServer, *ContainerInstance, string) {
+	t.Helper()
+	rootfs, uploads := t.TempDir(), t.TempDir()
+	instance := &ContainerInstance{Spec: &specs.Spec{
+		Root:    &specs.Root{Path: rootfs},
+		Process: &specs.Process{Cwd: "/work"},
+		Mounts: []specs.Mount{
+			{Source: uploads, Destination: "/tmp/.beta9", Type: "none", Options: []string{"rbind", "rw"}},
+			{Source: "proc", Destination: "/proc", Type: "proc"},
+		},
+	}}
+	server := &ContainerRuntimeServer{
+		containerInstances: common.NewSafeMap[*ContainerInstance](),
+		runtime:            &MockRuntime{state: betaruntime.State{Pid: 1, Status: types.RuncContainerStatusRunning}},
+	}
+	server.containerInstances.Set("sandbox-test", instance)
+	return server, instance, uploads
+}
+
+// The two escapes from the disclosure: ".." walking out of a bind mount's
+// source, and an absolute symlink in the image resolving against the worker.
+// Every file API must leave the worker's file unread and untouched.
+func TestSandboxFileAPIsStayInsideContainer(t *testing.T) {
+	server, instance, uploads := sandboxFileFixture(t)
+	hostDir := t.TempDir()
+	hostFile := filepath.Join(hostDir, "token")
+	require.NoError(t, os.WriteFile(hostFile, []byte("host-secret"), 0600))
+	require.NoError(t, os.Symlink(hostDir, filepath.Join(instance.Spec.Root.Path, "escape")))
+	require.NoError(t, os.Symlink(hostFile, filepath.Join(uploads, "link")))
+	ctx := context.Background()
+	id := "sandbox-test"
+
+	for _, path := range []string{
+		"/tmp/.beta9/" + strings.Repeat("../", 20) + strings.TrimPrefix(hostFile, "/"),
+		"/escape/token",
+		"/proc/1/root/etc/hostname",
+	} {
+		t.Run(path, func(t *testing.T) {
+			download, _ := server.ContainerSandboxDownloadFile(ctx, &pb.ContainerSandboxDownloadFileRequest{ContainerId: id, ContainerPath: path})
+			require.False(t, download.Ok)
+			stat, _ := server.ContainerSandboxStatFile(ctx, &pb.ContainerSandboxStatFileRequest{ContainerId: id, ContainerPath: path})
+			require.False(t, stat.Ok)
+			list, _ := server.ContainerSandboxListFiles(ctx, &pb.ContainerSandboxListFilesRequest{ContainerId: id, ContainerPath: filepath.Dir(path)})
+			require.False(t, list.Ok)
+			find, _ := server.ContainerSandboxFindInFiles(ctx, &pb.ContainerSandboxFindInFilesRequest{ContainerId: id, ContainerPath: path, Pattern: "host-secret"})
+			require.Empty(t, find.Results)
+			server.ContainerSandboxUploadFile(ctx, &pb.ContainerSandboxUploadFileRequest{ContainerId: id, ContainerPath: path, Data: []byte("changed"), Mode: 0600})
+			server.ContainerSandboxReplaceInFiles(ctx, &pb.ContainerSandboxReplaceInFilesRequest{ContainerId: id, ContainerPath: path, Pattern: "host-secret", NewString: "changed"})
+			server.ContainerSandboxCreateDirectory(ctx, &pb.ContainerSandboxCreateDirectoryRequest{ContainerId: id, ContainerPath: path + "/new-dir", Mode: 0755})
+			server.ContainerSandboxDeleteDirectory(ctx, &pb.ContainerSandboxDeleteDirectoryRequest{ContainerId: id, ContainerPath: filepath.Dir(path)})
+			server.ContainerSandboxDeleteFile(ctx, &pb.ContainerSandboxDeleteFileRequest{ContainerId: id, ContainerPath: path})
+			contents, err := os.ReadFile(hostFile)
+			require.NoError(t, err)
+			require.Equal(t, "host-secret", string(contents))
+		})
+	}
+
+	// Recursive operations over a directory skip symlinks rather than follow them.
+	find, _ := server.ContainerSandboxFindInFiles(ctx, &pb.ContainerSandboxFindInFilesRequest{ContainerId: id, ContainerPath: "/tmp/.beta9", Pattern: "host-secret"})
+	require.True(t, find.Ok, find.ErrorMsg)
+	require.Empty(t, find.Results)
+	replace, _ := server.ContainerSandboxReplaceInFiles(ctx, &pb.ContainerSandboxReplaceInFilesRequest{ContainerId: id, ContainerPath: "/tmp/.beta9", Pattern: "host-secret", NewString: "changed"})
+	require.True(t, replace.Ok, replace.ErrorMsg)
+	contents, err := os.ReadFile(hostFile)
+	require.NoError(t, err)
+	require.Equal(t, "host-secret", string(contents))
+}
+
+func TestSandboxFileAPIsRoundTrip(t *testing.T) {
+	server, _, _ := sandboxFileFixture(t)
+	ctx := context.Background()
+	id := "sandbox-test"
+	for _, path := range []string{"relative/value", "/tmp/.beta9/value"} {
+		for i, chunk := range []string{"hello ", "world\n"} {
+			resp, err := server.ContainerSandboxUploadFile(ctx, &pb.ContainerSandboxUploadFileRequest{ContainerId: id, ContainerPath: path, Data: []byte(chunk), Mode: 0644, Offset: int64(i * 6)})
+			require.NoError(t, err)
+			require.True(t, resp.Ok, resp.ErrorMsg)
+		}
+		download, _ := server.ContainerSandboxDownloadFile(ctx, &pb.ContainerSandboxDownloadFileRequest{ContainerId: id, ContainerPath: path, Offset: 6, Length: 5})
+		require.True(t, download.Ok, download.ErrorMsg)
+		require.Equal(t, "world", string(download.Data))
+		stat, _ := server.ContainerSandboxStatFile(ctx, &pb.ContainerSandboxStatFileRequest{ContainerId: id, ContainerPath: path})
+		require.True(t, stat.Ok, stat.ErrorMsg)
+		require.EqualValues(t, 12, stat.FileInfo.Size)
+		list, _ := server.ContainerSandboxListFiles(ctx, &pb.ContainerSandboxListFilesRequest{ContainerId: id, ContainerPath: filepath.Dir(path)})
+		require.True(t, list.Ok, list.ErrorMsg)
+		require.Len(t, list.Files, 1)
+		require.Equal(t, "value", list.Files[0].Name)
+
+		find, _ := server.ContainerSandboxFindInFiles(ctx, &pb.ContainerSandboxFindInFilesRequest{ContainerId: id, ContainerPath: filepath.Dir(path), Pattern: `w\w+`})
+		require.True(t, find.Ok, find.ErrorMsg)
+		require.Len(t, find.Results, 1)
+		absPath := path
+		if !filepath.IsAbs(absPath) {
+			absPath = "/work/" + path
+		}
+		require.Equal(t, absPath, find.Results[0].Path)
+		require.Len(t, find.Results[0].Matches, 1)
+		match := find.Results[0].Matches[0]
+		require.Equal(t, "world", match.Content)
+		require.EqualValues(t, 1, match.Range.Start.Line)
+		require.EqualValues(t, 7, match.Range.Start.Column)
+		require.EqualValues(t, 11, match.Range.End.Column)
+
+		replace, _ := server.ContainerSandboxReplaceInFiles(ctx, &pb.ContainerSandboxReplaceInFilesRequest{ContainerId: id, ContainerPath: path, Pattern: "world", NewString: "guest"})
+		require.True(t, replace.Ok, replace.ErrorMsg)
+		download, _ = server.ContainerSandboxDownloadFile(ctx, &pb.ContainerSandboxDownloadFileRequest{ContainerId: id, ContainerPath: path})
+		require.Equal(t, "hello guest\n", string(download.Data))
+
+		mkdir, _ := server.ContainerSandboxCreateDirectory(ctx, &pb.ContainerSandboxCreateDirectoryRequest{ContainerId: id, ContainerPath: filepath.Dir(path) + "/sub/dir", Mode: 0755})
+		require.True(t, mkdir.Ok, mkdir.ErrorMsg)
+		rmdir, _ := server.ContainerSandboxDeleteDirectory(ctx, &pb.ContainerSandboxDeleteDirectoryRequest{ContainerId: id, ContainerPath: filepath.Dir(path) + "/sub"})
+		require.True(t, rmdir.Ok, rmdir.ErrorMsg)
+		rm, _ := server.ContainerSandboxDeleteFile(ctx, &pb.ContainerSandboxDeleteFileRequest{ContainerId: id, ContainerPath: path})
+		require.True(t, rm.Ok, rm.ErrorMsg)
+		list, _ = server.ContainerSandboxListFiles(ctx, &pb.ContainerSandboxListFilesRequest{ContainerId: id, ContainerPath: filepath.Dir(path)})
+		require.Empty(t, list.Files)
+	}
+	rm, _ := server.ContainerSandboxDeleteDirectory(ctx, &pb.ContainerSandboxDeleteDirectoryRequest{ContainerId: id, ContainerPath: "/"})
+	require.False(t, rm.Ok)
+}
+
+func TestContainerRootSelectsMountLikeTheContainer(t *testing.T) {
+	_, instance, uploads := sandboxFileFixture(t)
+	rootfs := instance.Spec.Root.Path
+	nested := t.TempDir()
+	instance.Spec.Mounts = append(instance.Spec.Mounts, specs.Mount{Source: nested, Destination: "/tmp/.beta9/nested/", Options: []string{"rbind", "ro"}})
+	require.NoError(t, os.MkdirAll(filepath.Join(rootfs, "run"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(rootfs, "run/value"), []byte("rootfs"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(uploads, "value"), []byte("upload"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, "value"), []byte("nested"), 0600))
+	require.NoError(t, os.Symlink("value", filepath.Join(uploads, "relative")))
+	require.NoError(t, os.Symlink("/run", filepath.Join(rootfs, "var-run")))
+
+	read := func(path string) (string, error) {
+		root, name, err := containerRoot(instance, path, false)
+		if err != nil {
+			return "", err
+		}
+		defer root.Close()
+		data, err := root.ReadFile(name)
+		return string(data), err
+	}
+	for path, want := range map[string]string{
+		"/run/value":               "rootfs",
+		"/tmp/.beta9/value":        "upload",
+		"/tmp/.beta9/relative":     "upload",
+		"/tmp/.beta9/nested/value": "nested",
+		"//tmp/.beta9/./value":     "upload",
+	} {
+		got, err := read(path)
+		require.NoError(t, err, path)
+		require.Equal(t, want, got, path)
+	}
+	_, err := read("/var-run/value")
+	require.Error(t, err, "an absolute symlink resolves against the container root, where /run/value is not under the link")
+	_, err = read("/proc/self/status")
+	require.Error(t, err)
+	_, _, err = containerRoot(instance, "/tmp/.beta9/nested/value", true)
+	require.ErrorContains(t, err, "read-only")
+}
+
+func TestContainerSyncWorkspaceStaysInsideWorkspace(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "sandbox-sync-test-")
+	require.NoError(t, err)
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	containerID := filepath.Base(dir)
+	workspace := types.TempContainerWorkspace(containerID)
+	require.NoError(t, os.Mkdir(workspace, 0755))
+	hostDir := t.TempDir()
+	hostFile := filepath.Join(hostDir, "token")
+	require.NoError(t, os.WriteFile(hostFile, []byte("host-secret"), 0600))
+	require.NoError(t, os.Symlink(hostDir, filepath.Join(workspace, "escape")))
+	server := &ContainerRuntimeServer{containerInstances: common.NewSafeMap[*ContainerInstance]()}
+	server.containerInstances.Set(containerID, &ContainerInstance{})
+	sync := func(req *pb.SyncContainerWorkspaceRequest) bool {
+		req.ContainerId = containerID
+		resp, err := server.ContainerSyncWorkspace(context.Background(), req)
+		require.NoError(t, err)
+		return resp.Ok
+	}
+
+	for _, path := range []string{"../../" + strings.TrimPrefix(hostFile, "/"), "escape/token", "/escape/token", ""} {
+		require.False(t, sync(&pb.SyncContainerWorkspaceRequest{Path: path, Op: pb.SyncContainerWorkspaceOperation_WRITE, Data: []byte("changed")}), path)
+		require.False(t, sync(&pb.SyncContainerWorkspaceRequest{Path: path, Op: pb.SyncContainerWorkspaceOperation_DELETE}), path)
+	}
+	require.True(t, sync(&pb.SyncContainerWorkspaceRequest{Path: "nested/file", Op: pb.SyncContainerWorkspaceOperation_WRITE, Data: []byte("guest")}))
+	require.False(t, sync(&pb.SyncContainerWorkspaceRequest{Path: "nested/file", NewPath: "escape/token", Op: pb.SyncContainerWorkspaceOperation_MOVED}))
+	require.True(t, sync(&pb.SyncContainerWorkspaceRequest{Path: "nested/file", NewPath: "/moved", Op: pb.SyncContainerWorkspaceOperation_MOVED}))
+	contents, err := os.ReadFile(filepath.Join(workspace, "moved"))
+	require.NoError(t, err)
+	require.Equal(t, "guest", string(contents))
+	contents, err = os.ReadFile(hostFile)
+	require.NoError(t, err)
+	require.Equal(t, "host-secret", string(contents))
+}
+
+func TestRequestJournalSurvivesLostReply(t *testing.T) {
+	var journal requestJournal
+	var calls atomic.Int32
+	started, finish := make(chan struct{}), make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	request := &pb.ContainerSandboxExecRequest{ContainerId: "container", Cmd: "side-effect"}
+	run := func(ctx context.Context) (interface{}, error) {
+		calls.Add(1)
+		close(started)
+		<-finish
+		require.NoError(t, ctx.Err())
+		return &pb.ContainerSandboxExecResponse{Ok: true, Pid: 42, Stdout: "one result"}, nil
+	}
+	disconnected := make(chan error)
+	go func() { _, err := journal.Do(ctx, "id", "exec", request, nil, run); disconnected <- err }()
+	<-started
+	cancel()
+	require.ErrorIs(t, <-disconnected, context.Canceled)
+	close(finish)
+	response, err := journal.Do(context.Background(), "id", "exec", request, nil, run)
+	require.NoError(t, err)
+	require.Equal(t, int32(42), response.(*pb.ContainerSandboxExecResponse).Pid)
+	require.Equal(t, int32(1), calls.Load())
+	request.Cmd = "different-command"
+	_, err = journal.Do(context.Background(), "id", "exec", request, nil, run)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestRequestJournalReplaysConsumedOutputUntilAcknowledged(t *testing.T) {
+	var journal requestJournal
+	calls := 0
+	run := func(context.Context) (interface{}, error) {
+		calls++
+		return &pb.ContainerSandboxStdoutResponse{Ok: true, Stdout: "consumed output"}, nil
+	}
+	request := &pb.ContainerSandboxStdoutRequest{Pid: 42}
+	first, err := journal.Do(context.Background(), "first", "stdout", request, nil, run)
+	require.NoError(t, err)
+	replayed, err := journal.Do(context.Background(), "first", "stdout", request, nil, run)
+	require.NoError(t, err)
+	require.Equal(t, first, replayed)
+	require.Equal(t, 1, calls)
+	_, err = journal.Do(context.Background(), "next", "stdout", request, []string{"first"}, run)
+	require.NoError(t, err)
+	require.NotContains(t, journal.entries, "first")
+}
+
+func TestCompletedContainerReplaysLogsWithoutRetainingContainer(t *testing.T) {
+	dockerfile := "FROM ubuntu:22.04"
+	for name, request := range map[string]*types.ContainerRequest{
+		"function": {Stub: types.StubWithRelated{Stub: types.Stub{Type: types.StubType(types.StubTypeFunction)}}},
+		"build":    {BuildOptions: types.BuildOptions{Dockerfile: &dockerfile}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			logs := common.NewLogBuffer()
+			t.Cleanup(logs.Dispose)
+			require.True(t, logs.Write([]byte("first\nremaining\n")))
+			logs.Close()
+			require.Eventually(t, func() bool {
+				n, _ := logs.ReadAt(make([]byte, 6), 0)
+				return n == 6
+			}, time.Second, time.Millisecond)
+			instances := common.NewSafeMap[*ContainerInstance]()
+			server := &ContainerRuntimeServer{containerInstances: instances}
+			worker := &Worker{containerInstances: instances, containerServer: server}
+			instances.Set(name, &ContainerInstance{LogBuffer: logs, Request: request})
+			worker.deleteContainer(name)
+			_, active := instances.Get(name)
+			require.False(t, active)
+			stream := &logAttachmentStream{ctx: metadata.NewIncomingContext(context.Background(), metadata.Pairs(common.LogOffsetHeader, "6"))}
+			require.NoError(t, server.ContainerStreamLogs(&pb.ContainerStreamLogsRequest{ContainerId: name}, stream))
+			require.Equal(t, "remaining\n", stream.output.String())
+		})
+	}
+}

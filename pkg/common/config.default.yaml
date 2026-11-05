@@ -1,0 +1,513 @@
+clusterName: beta9
+debugMode: false
+prettyLogs: true
+database:
+  postgres:
+    host: postgresql
+    port: 5432
+    username: root
+    password: password
+    name: main
+    timezone: UTC
+    encryptionKey: sk_pKz38fK8v7lz01AneJI8MJnR70akmP2CtDNf1IufKcY=
+    # Postgres connections per gateway; 0 is unbounded. ~2-4x the database's vCPUs.
+    maxOpenConns: 0
+  redis:
+    mode: single
+    addrs:
+      - redis-master:6379
+    password:
+    enableTLS: false
+    insecureSkipVerify: false
+    dialTimeout: 3s
+  s2:
+    apiKey: ""
+    basin: beta9-events
+    streamPrefix: events
+events:
+  callbacks: []
+storage:
+  workspaceStorage:
+    baseMountPath: /workspace/data
+    defaultStorageMode: geese
+    defaultBucketPrefix: workspace
+    defaultAccessKey: test
+    defaultSecretKey: test
+    defaultEndpointUrl: http://localstack:4566
+    defaultPresignedEndpointUrl: http://127.0.0.1:4566
+    defaultRegion: us-east-1
+    geese:
+      debug: false
+      fsyncOnClose: true
+      memoryLimit: 2048
+      maxFlushers: 16
+      maxParallelParts: 8
+      httpTimeout: 60s
+      dirMode: "0777"
+      fileMode: "0666"
+      listType: 1
+      readAheadKB: 32768
+      readAheadLargeKB: 131072
+      fuseReadAheadKB: 32768
+      readAheadParallelKB: 4096
+      mountOptions: [allow_other]
+      stagedWriteModeEnabled: true
+      stagedWritePath: /tmp/geesefs-staged-write
+      stagedWriteDebounce: 30s
+      cacheStreamingEnabled: false
+      cacheDirectIO: false
+      cacheThroughEnabled: true
+gateway:
+  host: beta9-gateway
+  invokeURLType: host
+  grpc:
+    externalHost: beta9-gateway
+    externalPort: 1993
+    tls: false
+    port: 1993
+    maxRecvMsgSize: 16
+    maxSendMsgSize: 16
+  http:
+    externalHost: localhost
+    externalPort: 1994
+    tls: false
+    port: 1994
+    enablePrettyLogs: true
+    cors:
+      allowOrigins: "*"
+      allowHeaders: "*"
+      allowMethods: "*"
+  shutdownTimeout: 180s
+  taskCompletion:
+    timeout: 5m
+    resultUploadTimeout: 2m
+  stubLimits:
+    cpu: 128000
+    memory: 32768
+    maxReplicas: 10
+    maxGpuCount: 2
+  # Per-workspace cap on concurrently reserved capacity, applied only to
+  # workspaces without an explicit concurrency limit row. Disabled when
+  # either value is 0.
+  defaultConcurrencyLimit:
+    cpuMillicores: 0
+    gpuCount: 0
+  # Prepaid credit gate. In "http" mode the scheduler asks the billing
+  # service (POST {workspace_id} to endpoint) before running a container and
+  # periodically stops containers of workspaces that have run out of credit.
+  # "noop" allows everything (self-hosted default).
+  creditGate:
+    mode: noop
+    endpoint: ""
+    authToken: ""
+    timeout: 10s
+    cacheTTL: 30s
+    staleTTL: 10m
+    failOpen: true
+    enforceInterval: 1m
+fileService:
+  enabled: true
+imageService:
+  localCacheEnabled: true
+  # 120 ns per byte is a rough estimate of the time it takes per byte to pull, unpack, and archive an image.
+  # In the worst case, we have seen 10gb images take 20 minutes. That is 1e+10 bytes taking 1200 seconds.
+  # That gives 1200 / 1e+10 = 120 ns per byte.
+  archiveNanosecondsPerByte: 120
+  # Default to clip v2. Set to 1 to force legacy image format. NOTE: This only applies to new images.
+  clipVersion: 2
+  # Publish a build's delta as layers packed from the working container (no
+  # buildah commit/push/re-index). Unsupported Dockerfiles fall back to bud.
+  layeredBuilds: true
+  # apt settings for RUN steps of a build (bind-mounted, not baked into the
+  # image). Set mirror to a nearby Ubuntu mirror, e.g.
+  # http://mirrors.edge.kernel.org/ubuntu, when archive.ubuntu.com is slow.
+  buildApt:
+    mirror: ""
+    proxy: ""
+    timeoutS: 20
+    retries: 3
+  # The buildah layer store under the build cache keeps every layer a build on
+  # the node produced. Cap it at this fraction of its filesystem; after each
+  # build the oldest images go until it fits. 0 disables the cap.
+  buildLayerCacheMaxPct: 0.20
+  registryStore: local
+  registryCredentialProvider: docker
+  buildRegistry: registry.localhost:5000
+  buildRepositoryName: beta9-users
+  buildRegistryInsecure: true
+  buildContainerPoolSelector: build
+  pythonVersion: python3.10
+  registries:
+    docker:
+      username:
+      password:
+    s3:
+      bucketName: beta9-images
+      region: us-east-1
+      accessKey: test
+      secretKey: test
+      endpoint:
+  runner:
+    baseImageName: beta9-runner
+    baseImageRegistry: registry.localhost:5000
+    tags:
+      python3.8: py38-latest
+      python3.9: py39-latest
+      python3.10: py310-latest
+      python3.11: py311-latest
+      python3.12: py312-latest
+      micromamba3.8: micromamba3.8-latest
+      micromamba3.9: micromamba3.9-latest
+      micromamba3.10: micromamba3.10-latest
+      micromamba3.11: micromamba3.11-latest
+      micromamba3.12: micromamba3.12-latest
+    pythonStandalone:
+      versions:
+        python3.8: 3.8.20
+        python3.9: 3.9.20
+        python3.10: 3.10.15
+        python3.11: 3.11.10
+        python3.12: 3.12.7
+      installScriptTemplate: |
+        apt-get update -q && \
+        apt-get install -q -y build-essential curl git && \
+        curl -fsSL -o python.tgz 'https://github.com/indygreg/python-build-standalone/releases/download/20241002/cpython-{{.PythonVersion}}+20241002-{{.Architecture}}-{{.Vendor}}-{{.OS}}-gnu-install_only.tar.gz' && \
+        tar -xzf python.tgz -C /usr/local --strip-components 1 && \
+        rm -f python.tgz && \
+        rm -f /usr/bin/python && \
+        rm -f /usr/bin/python3 && \
+        ln -s /usr/local/bin/python3 /usr/bin/python && \
+        ln -s /usr/local/bin/python3 /usr/bin/python3 && \
+        rm -f /usr/bin/pip && \
+        rm -f /usr/bin/pip3 && \
+        ln -s /usr/local/bin/pip3 /usr/bin/pip && \
+        ln -s /usr/local/bin/pip3 /usr/bin/pip3
+worker:
+  pools:
+    default:
+      mode: local
+      priority: 1
+      # runtime: ""  # Optional: Kubernetes RuntimeClass for the pod (e.g., "nvidia")
+      containerRuntime: gvisor  # Pool-specific container runtime: "runc", "gvisor", or "microvm" (Cloud Hypervisor; use_vm sandboxes only, needs /dev/kvm)
+      containerStartConcurrency: 32
+      # cpuShareMultiplier: 1.5  # Optional: vCPUs scheduled per physical CPU, from 1 to 16 (CPU limits, memory and billing stay physical)
+      containerRuntimeConfig:
+        gvisorPlatform: systrap
+        gvisorRoot: /run/gvisor
+        # CLIP image roots are immutable, so gVisor can safely cache their
+        # path metadata. Non-root mounts retain gVisor's shared default.
+        gvisorExtraArgs:
+          - --overlay2=none
+          - --file-access=exclusive
+      # Optional per-pool durable disk and cache overrides for nodes with different storage layouts.
+      # Defaults to <storagePath>/durable-disks when storagePath is set, otherwise /var/lib/beta9/durable-disks.
+      # durableDisksPath: /mnt/nvme/beta9/durable-disks
+      # cache:
+      #   disk:
+      #     hostPath: /mnt/nvme/beta9/cache
+      #     mountPath: /var/lib/beta9/cache
+      #     maxUsagePct: 0.95
+      networkPreallocation: true
+      networkSlotPoolSize: 32
+      jobSpec:
+        nodeSelector: {}
+      criuEnabled: true
+      poolSizing:
+        defaultWorkerCpu: 2000m
+        defaultWorkerGpuType: ""
+        defaultWorkerMemory: 1Gi
+        minFreeCpu: 2000m
+        minFreeGpu: 0
+        minFreeMemory: 1Gi
+    build:
+      mode: local
+      requiresPoolSelector: true
+      # runtime: ""  # Optional: Kubernetes RuntimeClass for the pod
+      containerRuntime: runc  # Pool-specific container runtime: "runc", "gvisor", or "microvm" (Cloud Hypervisor; use_vm sandboxes only, needs /dev/kvm)
+      containerRuntimeConfig:
+        gvisorPlatform: systrap
+        gvisorRoot: /run/gvisor
+        gvisorExtraArgs:
+          - --overlay2=none
+          - --file-access=exclusive
+      # Optional per-pool durable disk and cache overrides.
+      # Defaults to <storagePath>/durable-disks when storagePath is set, otherwise /var/lib/beta9/durable-disks.
+      # durableDisksPath: /mnt/build-cache/beta9/durable-disks
+      # cache:
+      #   disk:
+      #     hostPath: /mnt/build-cache/beta9/cache
+      #     mountPath: /var/lib/beta9/cache
+      networkPreallocation: true
+      networkSlotPoolSize: 32
+      tmpSizeLimit: 50Gi
+      jobSpec:
+        nodeSelector: {}
+      poolSizing:
+        defaultWorkerCpu: 8000m
+        defaultWorkerGpuType: ""
+        defaultWorkerMemory: 32Gi
+        minFreeCpu: 8000m
+        minFreeGpu: 0
+        minFreeMemory: 32Gi
+        sharedMemoryLimitPct: 100%
+    # example gpu worker pool
+    # nvidia:
+    #   mode: local
+    #   gpuType: any
+    #   runtime: nvidia  # Kubernetes RuntimeClass for GPU support
+    #   containerRuntime: gvisor  # Pool-specific container runtime: "runc", "gvisor", or "microvm" (Cloud Hypervisor; use_vm sandboxes only, needs /dev/kvm)
+    #   containerRuntimeConfig:
+    #     gvisorPlatform: systrap
+    #     gvisorRoot: /run/gvisor
+    #   jobSpec:
+    #     nodeSelector: {}
+    #   poolSizing:
+    #     defaultWorkerCpu:
+    #     defaultWorkerGpuType: ""
+    #     defaultWorkerMemory:
+    #     minFreeCpu:
+    #     minFreeGpu:
+    #     minFreeMemory:
+    #     sharedMemoryLimitPct: 100%
+    # Public/serverless agent pool, joined with `machine create`.
+    # public-cpu:
+    #   mode: external
+    #   containerRuntime: runc
+    #   requiresPoolSelector: false
+    #   priority: 100
+    #   preemptable: false
+    #   containerStartConcurrency: 4
+    #   networkSlotPoolSize: 32
+    #   tmpSizeLimit: 50Gi
+    #   # On agent-backed pools these are host paths on each joined machine.
+    #   # Empty values fall back to the agent installer's state/cache dirs.
+    #   storagePath: /var/lib/beta9/storage
+    #   imagesPath: /var/lib/beta9/images
+    #   durableDisksPath: /var/lib/beta9/durable-disks
+    #   cache:
+    #     enabled: true
+    #     disk:
+    #       enabled: true
+    #       hostPath: /var/lib/beta9/cache
+    #       mountPath: /var/lib/beta9/cache
+    #       maxUsagePct: 0.95
+  # global pool attributes
+  useHostResolvConf: true
+  hostNetwork: false
+  useGatewayServiceHostname: true
+  imageTag: latest
+  imageName: beta9-worker
+  imageRegistry: registry.localhost:5000
+  imagePullSecrets: []
+  namespace: beta9
+  serviceAccountName: default
+  tmpSizeLimit: 30Gi
+  # non-standard k8s job spec
+  imagePVCName: beta9-images
+  jobResourcesEnforced: false
+  # Extra CPU/memory for the worker process itself (FUSE image/volume servers,
+  # runtime, log shipping), added to the pod on top of the container capacity
+  # the scheduler hands out. Only applies when jobResourcesEnforced is true.
+  jobResourceOverhead:
+    cpu: ''
+    memory: ''
+  containerResourceLimits:
+    cpuEnforced: true
+    cpuAffinityEnforced: false
+    memoryEnforced: false
+  defaultWorkerCPURequest: 2000
+  defaultWorkerMemoryRequest: 1024
+  terminationGracePeriod: 30
+  cleanupWorkerInterval: 1m
+  cleanupPendingWorkerAgeLimit: 10m
+  # An idle worker holding a pool's minimum free capacity (poolSizing.minFree*)
+  # stays up; past this age it exits anyway and the sizer replaces it.
+  headroomWorkerMaxAge: 6h
+  # Lifetime bound for any non-persistent worker, busy or idle: past it the
+  # worker stops accepting containers, lets running ones finish and exits, so
+  # steady traffic cannot keep a worker on an old image forever.
+  # Both ages get up to 1/8 worker-id jitter so workers do not leave together;
+  # 0 disables either bound.
+  maxAge: 24h
+  cacheEnabled: true
+  containerLogLinesPerHour: 6000
+  criu:
+    mode: nvidia
+  egress:
+    enabled: true
+    tlsPort: 0
+    httpPort: 0
+    otherPort: 0
+    maxConnectionsPerContainer: 256
+
+cache:
+  enabled: true
+  disk:
+    enabled: true
+    hostPath: /var/lib/beta9/cache
+    mountPath: /var/lib/beta9/cache
+    maxUsagePct: 0.95
+  memory:
+    enabled: false
+    maxCachePct: 0
+  coordinator:
+    token:
+    registrationTTLSeconds: 30
+    heartbeatIntervalSeconds: 10
+    hostWatchIntervalSeconds: 5
+  global:
+    defaultLocality: default
+    serverPort: 2050
+    discoveryIntervalS: 5
+    discoveryJitterS: 3
+    maxDiscoveryConcurrency: 8
+    hostMonitorIntervalS: 30
+    rttThresholdMilliseconds: 1000
+    hostStorageCapacityThresholdPct: 0.95
+    grpcDialTimeoutS: 1
+    grpcMessageSizeBytes: 1073741824 # 1GB
+    grpcInitialWindowSize: 4194304
+    grpcInitialConnWindowSize: 33554432
+    grpcWriteBufferSize: 262144
+    grpcReadBufferSize: 262144
+    grpcMaxConcurrentStreams: 1024
+    debugMode: false
+    prettyLogs: true
+  server:
+    pageSizeBytes: 4194304
+    smallRangeCopyThresholdBytes: 131072
+    objectTtlS: 0
+    s3DownloadConcurrency: 16
+    s3DownloadChunkSize: 64000000
+    readTransport:
+      enabled: true
+      sendfile: true
+      maxRequestSizeBytes: 67108864 # 64MiB; independent of the gRPC message limit.
+      maxInflightBytes: 1073741824 # Sixteen maximum-sized raw reads server-wide (not RAM with sendfile).
+      maxConcurrentRequests: 256 # One packed 16-CPU worker can have this many read-ahead windows in flight.
+    metadata:
+      mode: default
+      redisInsecureSkipVerify: false
+  client:
+    nTopHosts: 3
+    minRetryLengthBytes: 0 # 0 means retry all cache reads; increase to retry only larger reads.
+    maxGetContentAttempts: 3
+    readTransport:
+      enabled: true
+      maxActiveConnsPerHost: 64
+      maxIdleConnsPerHost: 16
+      requestSizeBytes: 67108864 # 64MiB; one request per GeeseFS cache-through window.
+      maxPartsPerRead: 8 # Only applies when a logical read is larger than requestSizeBytes.
+    cachefs:
+      maxBackgroundTasks: 256
+      maxReadAheadKB: 1024
+      maxWriteKB: 1024
+      enabled: true
+      mountPoint: /cache
+      directIO: false
+      directMount: false
+      options:
+      - max_read=1048576
+  reconciliation:
+    enabled: true
+    intervalSeconds: 15
+    recentStubTTLSeconds: 604800 # keep required content warm for 7 days after a stub's last container
+    lockTTLSeconds: 300
+    maxItemsPerCycle: 256 # re-prioritization batch size; exhausted cycles re-kick immediately
+    maxBytesPerCycle: 2147483648 # 2GiB between disk-usage gate rechecks
+    maxConcurrentFetches: 16
+    volumeMinBytes: 134217728 # 128MiB; only large geesefs volume objects are reconciled
+    originFallbackEnabled: true
+
+providers:
+  hetzner:
+    apiToken:
+    baseURL: https://api.hetzner.cloud/v1
+    image: ubuntu-24.04
+    imageByRegion: {}
+    sshKeys: []
+    sshKeysByRegion: {}
+    privateNetwork:
+      id: 0
+      name:
+      regionIds: {}
+      regionNames: {}
+      requireSubnet: true
+    serverTypePrices: {}
+    serverTypeCategories: {}
+    regionMetadata: {}
+    defaultRegions:
+    - ash
+    - hil
+tailscale:
+  controlUrl:
+  # Gateway tsnet auth key. Use an environment-scoped gateway tag, for example tag:beam-staging-gateway.
+  authKey:
+  # Private pool agent tsnet auth key. Use a separate environment-scoped agent tag, for example tag:beam-staging-agent.
+  agentAuthKey:
+  enabled: false
+  debug: false
+  hostName: headscale.internal
+  # Run Tailscale SSH on agents in control-plane managed pools (never on workspace
+  # hardware, provider pools included): `tailscale ssh root@beam-agent-<machine id>`. The tailnet policy
+  # needs an acls rule to tag:<agent tag>:22 and an ssh rule to tag:<agent tag>.
+  agentSsh:
+    enabled: false
+monitoring:
+  containerMetricsInterval: 3s
+  metricsCollector: prometheus
+  prometheus:
+    scrapeWorkers: true
+    port: 9090
+  telemetry:
+    enabled: false
+    endpoint: http://tempo.monitoring:4318
+    meterInterval: 3s
+    traceInterval: 3s
+    traceSampleRatio: 1.0
+  openmeter:
+    serverUrl: ""
+    apiKey: ""
+managedCompute:
+  billableMarginPct: 0.10
+  byoc:
+    pricing:
+      memoryHourlyMicrosPerGB: 4500
+      cpuHourlyMicrosPerVCPU: 9500
+    aws:
+      templateUrl: ""
+      controlRolePrincipalArn: ""
+  billing:
+    mode: noop
+    endpoint: ""
+    authToken: ""
+    required: false
+    timeout: 5s
+    reconcileInterval: 1m
+    minimumCreditCents: 2500
+    failureGracePeriod: 10m
+managedEndpoints:
+  enabled: false
+  preemption:
+    enabled: true
+  reconcile:
+    interval: 10s
+    failureBackoff: 30s
+  # Share of billed token revenue credited to the workspace whose contributed
+  # (provider pool) machine served the request.
+  providerRevenueShare: 0.7
+abstractions:
+  bot:
+    systemPrompt: ""
+    stepIntervalS: 1
+    sessionInactivityTimeoutS: 10
+  pod:
+    tcp:
+      enabled: true
+      externalHost: localhost
+      externalPort: 1995
+      port: 1995
+      certFile: ""
+      keyFile: ""
+      serviceProxyTarget: beta9-gateway:1995
+      serviceProxyVerify: false

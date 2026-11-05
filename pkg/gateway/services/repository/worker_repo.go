@@ -1,0 +1,540 @@
+package repository_services
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/cache"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/compute"
+	computesvc "github.com/beam-cloud/beta9/pkg/gateway/services/compute"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/scheduler"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type WorkerRepositoryService struct {
+	ctx                   context.Context
+	cacheCoordinator      *cache.Coordinator
+	cacheCoordinatorToken string
+	cacheMetadata         cache.CacheMetadataStore
+	workerEvents          *workerEventBroker
+	workerRepo            repository.WorkerRepository
+	containerRepo         repository.ContainerRepository
+	backendRepo           repository.BackendRepository
+	computeRepo           repository.ComputeRepository
+	computeService        *computesvc.Service
+	eventRepo             repository.EventRepository
+	appConfig             types.AppConfig
+	pb.UnimplementedWorkerRepositoryServiceServer
+}
+
+var _ auth.RequestAuthorizer = (*WorkerRepositoryService)(nil)
+
+type workerRepositoryRequest interface {
+	GetWorkerId() string
+}
+
+const (
+	containerRequestPollingInterval   = 100 * time.Millisecond
+	containerRequestHeartbeatInterval = 30 * time.Second
+	containerRequestBatchSize         = 128
+)
+
+func NewWorkerRepositoryService(ctx context.Context, workerRepo repository.WorkerRepository, containerRepo repository.ContainerRepository, backendRepo repository.BackendRepository, computeRepo repository.ComputeRepository, computeService *computesvc.Service, eventRepo repository.EventRepository, rdb *common.RedisClient, appConfig types.AppConfig, cacheCoordinatorToken string) *WorkerRepositoryService {
+	service := &WorkerRepositoryService{
+		ctx:                   ctx,
+		workerRepo:            workerRepo,
+		containerRepo:         containerRepo,
+		backendRepo:           backendRepo,
+		computeRepo:           computeRepo,
+		computeService:        computeService,
+		eventRepo:             eventRepo,
+		appConfig:             appConfig,
+		cacheCoordinatorToken: configuredCacheCoordinatorToken(cacheCoordinatorToken),
+	}
+	if rdb != nil {
+		service.cacheCoordinator = cache.NewCoordinator(repository.NewCacheRedisRepository(rdb))
+		service.cacheMetadata = cache.NewRedisCacheMetadataStoreWithClient(cache.GlobalConfig{}, cache.ServerConfig{}, rdb.UniversalClient)
+		service.workerEvents = newWorkerEventBroker(ctx, rdb)
+	}
+	return service
+}
+
+// AuthorizeRequest limits a worker token to the worker it was issued for and
+// the containers scheduled onto that worker. The auth interceptor also applies
+// it to decoded streaming requests.
+func (s *WorkerRepositoryService) AuthorizeRequest(ctx context.Context, req interface{}) error {
+	caller, err := auth.WorkerFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	// Network RPCs use scopedNetworkPrefix and carry no worker.
+	if request, ok := req.(workerRepositoryRequest); ok {
+		if request.GetWorkerId() != caller.ID {
+			return status.Error(codes.PermissionDenied, "worker token is not assigned to worker")
+		}
+		// Cluster workers learn their machine from their first keepalive.
+		if request, ok := req.(*pb.SetWorkerKeepAliveRequest); ok && request.MachineId != "" {
+			worker, err := s.workerRepo.GetWorkerById(request.WorkerId)
+			if err != nil || worker == nil || strings.TrimSpace(request.MachineId) != worker.MachineId && (worker.MachineId != "" || !caller.Trusted) {
+				return status.Error(codes.PermissionDenied, "worker cannot change its machine")
+			}
+		}
+	}
+
+	switch req := req.(type) {
+	case *pb.AddContainerToWorkerRequest:
+		_, err := caller.Container(s.containerRepo, req.ContainerId)
+		return err
+	case *pb.ClaimContainerRequest:
+		state, err := caller.Container(s.containerRepo, req.ContainerId)
+		if err != nil {
+			return err
+		}
+		if req.WorkerAddress != nil {
+			return authorizeBackendRoute(state, req.WorkerAddress.Route)
+		}
+	}
+	return nil
+}
+
+func (s *WorkerRepositoryService) GetNextContainerRequest(req *pb.GetNextContainerRequestRequest, stream pb.WorkerRepositoryService_GetNextContainerRequestServer) error {
+	if err := s.workerRepo.RecoverPendingContainerRequests(req.WorkerId); err != nil {
+		return err
+	}
+	var requestsReady <-chan struct{}
+	if s.workerEvents != nil {
+		sinkID, ready := s.workerEvents.registerRequests(req.WorkerId)
+		defer s.workerEvents.unregister(sinkID)
+		requestsReady = ready
+	}
+	if err := s.workerRepo.ToggleWorkerAvailable(req.WorkerId, ""); err != nil {
+		return err
+	}
+	poll := time.NewTicker(containerRequestPollingInterval)
+	defer poll.Stop()
+	heartbeatAt := time.Now().Add(containerRequestHeartbeatInterval)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		default:
+			requests, err := s.workerRepo.GetNextContainerRequests(req.WorkerId, containerRequestBatchSize)
+			if err != nil {
+				return stream.Send(&pb.GetNextContainerRequestResponse{
+					Ok:       false,
+					ErrorMsg: err.Error(),
+				})
+			}
+
+			for i, request := range requests {
+				compatibilityKey := ""
+				if request.Checkpoint != nil {
+					compatibilityKey = request.Checkpoint.CompatibilityKey
+				}
+				if err := stream.Send(&pb.GetNextContainerRequestResponse{
+					Ok:                         true,
+					ContainerRequest:           request.ToProto(),
+					DeliveryToken:              request.DeliveryToken,
+					CheckpointCompatibilityKey: compatibilityKey,
+				}); err != nil {
+					if requeueErr := s.workerRepo.RequeueContainerRequests(req.WorkerId, requests[i:]); requeueErr != nil {
+						log.Error().Err(requeueErr).Str("worker_id", req.WorkerId).Msg("failed to requeue undelivered container requests")
+					}
+					return err
+				}
+			}
+
+			if len(requests) > 0 {
+				continue
+			}
+			if time.Now().After(heartbeatAt) {
+				if err := stream.Send(&pb.GetNextContainerRequestResponse{Ok: true}); err != nil {
+					return err
+				}
+				heartbeatAt = time.Now().Add(containerRequestHeartbeatInterval)
+			}
+
+			select {
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			case <-requestsReady:
+			case <-poll.C:
+			}
+		}
+	}
+}
+
+func (s *WorkerRepositoryService) SetImagePullLock(ctx context.Context, req *pb.SetImagePullLockRequest) (*pb.SetImagePullLockResponse, error) {
+	token, err := s.workerRepo.SetImagePullLock(req.WorkerId, req.ImageId)
+	if err != nil {
+		return &pb.SetImagePullLockResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.SetImagePullLockResponse{Ok: true, Token: token}, nil
+}
+
+func (s *WorkerRepositoryService) RemoveImagePullLock(ctx context.Context, req *pb.RemoveImagePullLockRequest) (*pb.RemoveImagePullLockResponse, error) {
+	err := s.workerRepo.RemoveImagePullLock(req.WorkerId, req.ImageId, req.Token)
+	if err != nil {
+		return &pb.RemoveImagePullLockResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.RemoveImagePullLockResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) AddContainerToWorker(ctx context.Context, req *pb.AddContainerToWorkerRequest) (*pb.AddContainerToWorkerResponse, error) {
+	err := s.workerRepo.AddContainerToWorker(req.WorkerId, req.ContainerId, req.DeliveryToken)
+	if err != nil {
+		log.Error().Str("pool_name", req.PoolName).Str("hostname", req.PodHostname).Str("worker_id", req.WorkerId).Str("container_id", req.ContainerId).Msg("failed to add container to worker")
+		return &pb.AddContainerToWorkerResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	log.Info().Str("pool_name", req.PoolName).Str("hostname", req.PodHostname).Str("worker_id", req.WorkerId).Str("container_id", req.ContainerId).Msg("container added to worker")
+	return &pb.AddContainerToWorkerResponse{Ok: true}, nil
+}
+
+// ClaimContainer is the worker's single pre-start round trip: it acknowledges
+// the delivery (the same atomic script as AddContainerToWorker), refreshes the
+// pending lease, and vends runtime credentials against the state it just read.
+// Every step after the acknowledgement reports claimed=true so the worker knows
+// it owns the container's failure reporting.
+func (s *WorkerRepositoryService) ClaimContainer(ctx context.Context, req *pb.ClaimContainerRequest) (*pb.ClaimContainerResponse, error) {
+	logger := log.With().Str("pool_name", req.PoolName).Str("hostname", req.PodHostname).Str("worker_id", req.WorkerId).Str("container_id", req.ContainerId).Logger()
+	if req.WorkerAddress != nil && req.WorkerAddress.ContainerId != req.ContainerId {
+		return &pb.ClaimContainerResponse{ErrorMsg: "worker address must belong to the claimed container"}, nil
+	}
+	if req.WorkerAddress != nil && req.WorkerAddress.Route != nil {
+		route := req.WorkerAddress.Route
+		if route.WorkerId != req.WorkerId || route.Kind != types.BackendRouteKindWorker || route.ContainerId != "" {
+			return &pb.ClaimContainerResponse{ErrorMsg: "worker route must belong to the claiming worker"}, nil
+		}
+	}
+	if network := req.Network; network != nil {
+		if network.ToContainerId != req.ContainerId || req.WorkerId == "" || !strings.HasPrefix(network.FromContainerId, "network-slot:"+req.WorkerId+":") {
+			return &pb.ClaimContainerResponse{ErrorMsg: "network reservation must belong to the claiming worker and container"}, nil
+		}
+	}
+
+	if err := s.workerRepo.AddContainerToWorker(req.WorkerId, req.ContainerId, req.DeliveryToken); err != nil {
+		logger.Warn().Err(err).Msg("container claim rejected")
+		return &pb.ClaimContainerResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	resp := &pb.ClaimContainerResponse{Claimed: true}
+
+	// The claim is idempotent for its delivery token, so a transient
+	// repository failure after it is answered with UNAVAILABLE and the worker
+	// retries. A missing state is authoritative: the container is gone.
+	//
+	// The scheduler wrote the pending lease when it queued the request; renew
+	// it now so a long backlog wait cannot expire the state mid-startup. The
+	// worker's status heartbeat takes over from here. The renewal is a no-op
+	// when the container has already moved on (a STOPPING that raced the
+	// claim is refused, not overwritten), so the state is read after it: the
+	// worker acts on the persisted status, never on a stale snapshot.
+	if err := s.containerRepo.UpdateContainerStatus(req.ContainerId, types.ContainerStatusPending, int64(types.ContainerStateTtlSWhilePending)); err != nil {
+		if (&types.ErrContainerStateNotFound{}).From(err) {
+			resp.ErrorMsg = err.Error()
+			return resp, nil
+		}
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	state, err := s.containerRepo.GetContainerState(req.ContainerId)
+	if err != nil {
+		if (&types.ErrContainerStateNotFound{}).From(err) {
+			resp.ErrorMsg = err.Error()
+			return resp, nil
+		}
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	resp.State = containerStateToProto(state)
+	if req.WorkerAddress != nil && req.WorkerAddress.Route != nil && req.WorkerAddress.Route.WorkspaceId != state.WorkspaceId {
+		resp.ErrorMsg = "worker route must belong to the container workspace"
+		return resp, nil
+	}
+
+	if req.Credentials != nil {
+		resp.Credentials = s.vendRuntimeCredentials(ctx, req.Credentials, state)
+		if !resp.Credentials.Ok {
+			resp.ErrorMsg = resp.Credentials.ErrorMsg
+			return resp, nil
+		}
+	}
+	// The source reservation still owns the IP until this accepted claim
+	// moves it. A retry uses the same source, destination and IP fence.
+	if state.Status != types.ContainerStatusStopping {
+		if network := req.Network; network != nil {
+			if err := s.workerRepo.MoveContainerIp(s.scopedNetworkPrefix(ctx, network.NetworkPrefix), network.FromContainerId, network.ToContainerId, network.IpAddress); err != nil {
+				resp.ErrorMsg = err.Error()
+				return resp, nil
+			}
+		}
+		if req.WorkerAddress != nil {
+			if err := publishWorkerAddress(ctx, s.containerRepo, req.WorkerAddress); err != nil {
+				resp.ErrorMsg = err.Error()
+				return resp, nil
+			}
+		}
+		resp.StartupPrepared = true
+	}
+
+	logger.Info().Msg("container claimed by worker")
+	resp.Ok = true
+	return resp, nil
+}
+
+func (s *WorkerRepositoryService) RemoveContainerFromWorker(ctx context.Context, req *pb.RemoveContainerFromWorkerRequest) (*pb.RemoveContainerFromWorkerResponse, error) {
+	err := s.workerRepo.RemoveContainerFromWorker(req.WorkerId, req.ContainerId)
+	if err != nil {
+		log.Error().Str("pool_name", req.PoolName).Str("hostname", req.PodHostname).Str("worker_id", req.WorkerId).Str("container_id", req.ContainerId).Msg("failed to remove container from worker")
+		return &pb.RemoveContainerFromWorkerResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	log.Info().Str("pool_name", req.PoolName).Str("hostname", req.PodHostname).Str("worker_id", req.WorkerId).Str("container_id", req.ContainerId).Msg("container removed from worker")
+	return &pb.RemoveContainerFromWorkerResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) GetWorkerById(ctx context.Context, req *pb.GetWorkerByIdRequest) (*pb.GetWorkerByIdResponse, error) {
+	worker, err := s.workerRepo.GetWorkerById(req.WorkerId)
+	if err != nil {
+		return &pb.GetWorkerByIdResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.GetWorkerByIdResponse{Ok: true, Worker: worker.ToProto()}, nil
+}
+
+// GetWorkerMeteringConfig vends the control plane's metering configuration
+// (collector credentials and cost hook) to a control-plane managed agent
+// worker, which boots without one. The caller must present the worker token
+// assigned to its own slot.
+func (s *WorkerRepositoryService) GetWorkerMeteringConfig(ctx context.Context, req *pb.GetWorkerMeteringConfigRequest) (*pb.GetWorkerMeteringConfigResponse, error) {
+	fail := func(msg string) (*pb.GetWorkerMeteringConfigResponse, error) {
+		return &pb.GetWorkerMeteringConfigResponse{ErrorMsg: msg}, nil
+	}
+	authInfo, ok := auth.AuthInfoFromContext(ctx)
+	if !ok || authInfo == nil || authInfo.Token == nil || authInfo.Workspace == nil || authInfo.Token.TokenType != types.TokenTypeWorker {
+		return fail("managed worker token is required")
+	}
+	worker, err := s.workerRepo.GetWorkerById(req.GetWorkerId())
+	if err != nil {
+		return fail(err.Error())
+	}
+	if worker == nil || !worker.ControlPlaneManaged || worker.WorkspaceId != authInfo.Workspace.ExternalId {
+		return fail("worker is not control-plane managed")
+	}
+	slots, err := s.computeRepo.ListAgentWorkerSlotStates(ctx, worker.WorkspaceId, worker.PoolName, worker.MachineId)
+	if err != nil {
+		return fail(err.Error())
+	}
+	if !slices.ContainsFunc(slots, func(slot *compute.AgentWorkerSlotState) bool {
+		return slot != nil && slot.WorkerID == worker.Id && slot.WorkerTokenID == authInfo.Token.ExternalId
+	}) {
+		return fail("worker token is not assigned to worker")
+	}
+	metering := s.appConfig.Monitoring.Metering()
+	if !metering.Metered() || metering.ContainerCostHookConfig.Endpoint == "" || metering.ContainerCostHookConfig.Token == "" {
+		return fail("managed worker metering is not configured")
+	}
+	data, err := json.Marshal(metering)
+	if err != nil {
+		return fail(err.Error())
+	}
+	return &pb.GetWorkerMeteringConfigResponse{Ok: true, MeteringJson: string(data)}, nil
+}
+
+// GetWorkerServiceProxyConfig tells an agent-hosted worker where the TCP
+// gateway listens publicly. Such workers boot with the in-cluster default
+// target, which they can't reach, so their service proxy dials this instead.
+func (s *WorkerRepositoryService) GetWorkerServiceProxyConfig(ctx context.Context, req *pb.GetWorkerServiceProxyConfigRequest) (*pb.GetWorkerServiceProxyConfigResponse, error) {
+	tcp := s.appConfig.Abstractions.Pod.TCP
+	if !tcp.Enabled || tcp.ExternalHost == "" || tcp.ExternalPort <= 0 || net.ParseIP(tcp.ExternalHost) != nil {
+		return &pb.GetWorkerServiceProxyConfigResponse{ErrorMsg: "the TCP gateway has no public hostname"}, nil
+	}
+	return &pb.GetWorkerServiceProxyConfigResponse{
+		Ok:           true,
+		ExternalHost: tcp.ExternalHost,
+		ExternalPort: int32(tcp.ExternalPort),
+		VerifyTls:    tcp.CertFile != "",
+	}, nil
+}
+
+func (s *WorkerRepositoryService) ToggleWorkerAvailable(ctx context.Context, req *pb.ToggleWorkerAvailableRequest) (*pb.ToggleWorkerAvailableResponse, error) {
+	err := s.workerRepo.ToggleWorkerAvailable(req.WorkerId, req.Generation)
+	if err != nil {
+		return &pb.ToggleWorkerAvailableResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.ToggleWorkerAvailableResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) DisableWorker(ctx context.Context, req *pb.DisableWorkerRequest) (*pb.DisableWorkerResponse, error) {
+	var err error
+	if req.Cordon {
+		err = s.cordonWorker(ctx, req.WorkerId)
+	} else {
+		err = s.workerRepo.UpdateWorkerStatus(req.WorkerId, types.WorkerStatusDisabled)
+	}
+	if err != nil {
+		return &pb.DisableWorkerResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+	return &pb.DisableWorkerResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) cordonWorker(ctx context.Context, workerID string) error {
+	worker, err := s.workerRepo.GetWorkerById(workerID)
+	if err != nil {
+		return err
+	}
+	handled, err := s.computeService.SetAgentWorkerCordon(ctx, worker, true)
+	if err != nil || handled {
+		return err
+	}
+	return s.workerRepo.SetWorkerCordon(workerID, true)
+}
+
+func (s *WorkerRepositoryService) UpdateWorkerCapacity(ctx context.Context, req *pb.UpdateWorkerCapacityRequest) (*pb.UpdateWorkerCapacityResponse, error) {
+	worker := &types.Worker{Id: req.WorkerId}
+	err := s.workerRepo.UpdateWorkerCapacity(worker, types.NewContainerRequestFromProto(req.ContainerRequest), types.CapacityUpdateType(req.CapacityChange))
+	if err != nil {
+		return &pb.UpdateWorkerCapacityResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.UpdateWorkerCapacityResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) RemoveWorker(ctx context.Context, req *pb.RemoveWorkerRequest) (*pb.RemoveWorkerResponse, error) {
+	err := s.workerRepo.RemoveWorker(req.WorkerId)
+	if err != nil {
+		return &pb.RemoveWorkerResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.RemoveWorkerResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) SetWorkerKeepAlive(ctx context.Context, req *pb.SetWorkerKeepAliveRequest) (*pb.SetWorkerKeepAliveResponse, error) {
+	err := s.workerRepo.SetWorkerKeepAlive(req.WorkerId, types.WorkerKeepAlive{
+		MachineId:                  req.MachineId,
+		CheckpointCompatibilityKey: req.CheckpointCompatibilityKey,
+	})
+	if err != nil {
+		return &pb.SetWorkerKeepAliveResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	// Tell an idle worker whether it is the pool's headroom, so it does not
+	// idle out and leave the pool cold until the sizer's replacement boots.
+	// Only idle workers can spin down, so only they pay for the pool scan; a
+	// lookup failure answers "headroom" so the worker stays until a good read.
+	headroom := false
+	if req.Idle {
+		headroom = true
+		if worker, err := s.workerRepo.GetWorkerById(req.WorkerId); err == nil {
+			headroom = scheduler.WorkerHoldsPoolHeadroom(s.workerRepo, s.appConfig, worker)
+		}
+	}
+
+	return &pb.SetWorkerKeepAliveResponse{Ok: true, PoolHeadroom: headroom}, nil
+}
+
+func (s *WorkerRepositoryService) SetNetworkLock(ctx context.Context, req *pb.SetNetworkLockRequest) (*pb.SetNetworkLockResponse, error) {
+	token, err := s.workerRepo.SetNetworkLock(s.scopedNetworkPrefix(ctx, req.NetworkPrefix), int(req.Ttl), int(req.Retries))
+	if err != nil {
+		return &pb.SetNetworkLockResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.SetNetworkLockResponse{Ok: true, Token: token}, nil
+}
+
+func (s *WorkerRepositoryService) RemoveNetworkLock(ctx context.Context, req *pb.RemoveNetworkLockRequest) (*pb.RemoveNetworkLockResponse, error) {
+	err := s.workerRepo.RemoveNetworkLock(s.scopedNetworkPrefix(ctx, req.NetworkPrefix), req.Token)
+	if err != nil {
+		return &pb.RemoveNetworkLockResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.RemoveNetworkLockResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) SetContainerIp(ctx context.Context, req *pb.SetContainerIpRequest) (*pb.SetContainerIpResponse, error) {
+	err := s.workerRepo.SetContainerIp(s.scopedNetworkPrefix(ctx, req.NetworkPrefix), req.ContainerId, req.IpAddress)
+	if err != nil {
+		return &pb.SetContainerIpResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.SetContainerIpResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) MoveContainerIp(ctx context.Context, req *pb.MoveContainerIpRequest) (*pb.MoveContainerIpResponse, error) {
+	err := s.workerRepo.MoveContainerIp(s.scopedNetworkPrefix(ctx, req.NetworkPrefix), req.FromContainerId, req.ToContainerId, req.IpAddress)
+	if err != nil {
+		return &pb.MoveContainerIpResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.MoveContainerIpResponse{Ok: true}, nil
+}
+
+func (s *WorkerRepositoryService) GetContainerIp(ctx context.Context, req *pb.GetContainerIpRequest) (*pb.GetContainerIpResponse, error) {
+	ip, err := s.workerRepo.GetContainerIp(s.scopedNetworkPrefix(ctx, req.NetworkPrefix), req.ContainerId)
+	if err != nil {
+		return &pb.GetContainerIpResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.GetContainerIpResponse{Ok: true, IpAddress: ip}, nil
+}
+
+func (s *WorkerRepositoryService) GetContainerIps(ctx context.Context, req *pb.GetContainerIpsRequest) (*pb.GetContainerIpsResponse, error) {
+	ips, err := s.workerRepo.GetContainerIps(s.scopedNetworkPrefix(ctx, req.NetworkPrefix))
+	if err != nil {
+		return &pb.GetContainerIpsResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.GetContainerIpsResponse{Ok: true, Ips: ips}, nil
+}
+
+func (s *WorkerRepositoryService) GetContainerIpAssignments(ctx context.Context, req *pb.GetContainerIpAssignmentsRequest) (*pb.GetContainerIpAssignmentsResponse, error) {
+	assignments, err := s.workerRepo.GetContainerIpAssignments(s.scopedNetworkPrefix(ctx, req.NetworkPrefix))
+	if err != nil {
+		return &pb.GetContainerIpAssignmentsResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	responseAssignments := make([]*pb.ContainerIpAssignment, 0, len(assignments))
+	for _, assignment := range assignments {
+		responseAssignments = append(responseAssignments, &pb.ContainerIpAssignment{
+			ContainerId: assignment.ContainerID,
+			IpAddress:   assignment.IPAddress,
+		})
+	}
+
+	return &pb.GetContainerIpAssignmentsResponse{Ok: true, Assignments: responseAssignments}, nil
+}
+
+func (s *WorkerRepositoryService) RemoveContainerIp(ctx context.Context, req *pb.RemoveContainerIpRequest) (*pb.RemoveContainerIpResponse, error) {
+	err := s.workerRepo.RemoveContainerIp(s.scopedNetworkPrefix(ctx, req.NetworkPrefix), req.ContainerId)
+	if err != nil {
+		return &pb.RemoveContainerIpResponse{Ok: false, ErrorMsg: err.Error()}, nil
+	}
+
+	return &pb.RemoveContainerIpResponse{Ok: true}, nil
+}
+
+// scopedNetworkPrefix isolates private-worker network assignments and locks by workspace.
+func (s *WorkerRepositoryService) scopedNetworkPrefix(ctx context.Context, prefix string) string {
+	// AuthorizeRequest validates the private worker's workspace before dispatch.
+	authInfo, ok := auth.AuthInfoFromContext(ctx)
+	if ok && authInfo != nil && authInfo.Token != nil && authInfo.Token.TokenType == types.TokenTypeWorkerPrivate {
+		return "workspace:" + authInfo.Workspace.ExternalId + ":" + prefix
+	}
+	return prefix
+}

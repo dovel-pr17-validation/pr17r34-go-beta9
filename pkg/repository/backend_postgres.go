@@ -1,0 +1,3150 @@
+package repository
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Masterminds/squirrel"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
+	"github.com/pressly/goose/v3"
+
+	pkgCommon "github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/registry"
+	_ "github.com/beam-cloud/beta9/pkg/repository/backend_postgres_migrations"
+	"github.com/beam-cloud/beta9/pkg/repository/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+)
+
+const (
+	ScheduledJobsChannel                = "jobs"
+	listenToChannelPingInterval         = 10 * time.Second
+	listenToChannelMinReconnectInterval = 1 * time.Second
+	listenToChannelMaxReconnectInterval = 10 * time.Second
+)
+
+var PostgresDataError = pq.ErrorClass("22")
+
+const taskEventPublisherQueueSize = 4096
+
+type taskEventJob struct {
+	task     types.Task
+	callback func(*types.TaskWithRelated)
+}
+
+type taskEventPublisher struct {
+	repo  *PostgresBackendRepository
+	queue chan taskEventJob
+}
+
+func newTaskEventPublisher(repo *PostgresBackendRepository) *taskEventPublisher {
+	publisher := &taskEventPublisher{
+		repo:  repo,
+		queue: make(chan taskEventJob, taskEventPublisherQueueSize),
+	}
+	go publisher.run()
+
+	return publisher
+}
+
+func (p *taskEventPublisher) enqueue(job taskEventJob) {
+	if p == nil || job.callback == nil || job.task.ExternalId == "" {
+		return
+	}
+
+	p.queue <- job
+}
+
+func (p *taskEventPublisher) run() {
+	for job := range p.queue {
+		p.repo.handleTaskEvent(job.task, job.callback)
+	}
+}
+
+func GenerateDSN(config types.PostgresConfig) string {
+	sslMode := "disable"
+	if config.EnableTLS {
+		sslMode = "require"
+	}
+
+	return fmt.Sprintf(
+		"host=%s user=%s password=%s dbname=%s port=%d sslmode=%s TimeZone=%s",
+		config.Host,
+		config.Username,
+		config.Password,
+		config.Name,
+		config.Port,
+		sslMode,
+		config.TimeZone,
+	)
+}
+
+type PostgresBackendRepository struct {
+	client                *sqlx.DB
+	config                types.PostgresConfig
+	eventRepo             EventRepository
+	adminWorkspaceMu      sync.Mutex
+	adminWorkspace        *types.Workspace
+	adminWorkspaceLoading *adminWorkspaceLoad
+	taskEvents            *taskEventPublisher
+	vmLocksOnce           sync.Once
+	vmLocks               []vmLockSession
+}
+
+type adminWorkspaceLoad struct {
+	done      chan struct{}
+	workspace *types.Workspace
+	err       error
+}
+
+func NewBackendPostgresRepository(config types.PostgresConfig, eventRepo EventRepository) (*PostgresBackendRepository, error) {
+	dsn := GenerateDSN(config)
+
+	db, err := sqlx.Connect("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if config.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(config.MaxOpenConns)
+		db.SetMaxIdleConns(config.MaxOpenConns)
+	}
+
+	repo := &PostgresBackendRepository{
+		client:    db,
+		config:    config,
+		eventRepo: eventRepo,
+	}
+	if eventRepo != nil {
+		repo.taskEvents = newTaskEventPublisher(repo)
+	}
+
+	return repo, nil
+}
+
+type GooseLogger struct {
+	zerolog.Logger
+}
+
+func (l *GooseLogger) Fatalf(format string, v ...any) {
+	l.Logger.Fatal().Msgf(format, v...)
+}
+
+func (r *PostgresBackendRepository) Migrate() error {
+	return r.MigrateContext(context.Background())
+}
+
+func (r *PostgresBackendRepository) MigrateContext(ctx context.Context) error {
+	goose.SetLogger(&GooseLogger{log.Logger.Level(zerolog.InfoLevel)})
+	if err := goose.SetDialect("postgres"); err != nil {
+		return err
+	}
+
+	if err := goose.UpContext(ctx, r.client.DB, "./"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) Ping() error {
+	return r.client.Ping()
+}
+
+func (r *PostgresBackendRepository) generateExternalId() (string, error) {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return "", err
+	}
+	return id.String(), nil
+}
+
+// Context
+
+func (r *PostgresBackendRepository) ListWorkspaces(ctx context.Context) ([]types.Workspace, error) {
+	var workspaces []types.Workspace
+
+	query := `SELECT id, name, external_id, created_at, updated_at FROM workspace;`
+	err := r.client.SelectContext(ctx, &workspaces, query)
+	if err != nil {
+		return nil, err
+	}
+
+	return workspaces, nil
+}
+
+func (r *PostgresBackendRepository) CreateWorkspace(ctx context.Context) (types.Workspace, error) {
+	name := uuid.New().String()[:6] // Generate a short UUID for the workspace name
+
+	externalId, err := r.generateExternalId()
+	if err != nil {
+		return types.Workspace{}, err
+	}
+
+	// Generate a secure signing key for tasks
+	signingKeyBytes := make([]byte, 32) // 256 bits
+	if _, err := rand.Read(signingKeyBytes); err != nil {
+		return types.Workspace{}, err
+	}
+	signingKey := "sk_" + base64.StdEncoding.EncodeToString(signingKeyBytes)
+	storedSigningKey, err := r.sealCredential(signingKey)
+	if err != nil {
+		return types.Workspace{}, err
+	}
+
+	query := `
+	INSERT INTO workspace (name, external_id, signing_key, is_cluster_admin)
+	VALUES ($1, $2, $3, NOT EXISTS (SELECT 1 FROM workspace))
+	RETURNING id, name, external_id, signing_key, created_at, updated_at;
+	`
+
+	var context types.Workspace
+	if err := r.client.GetContext(ctx, &context, query, name, externalId, storedSigningKey); err != nil {
+		return types.Workspace{}, err
+	}
+	context.SigningKey = &signingKey
+
+	return context, nil
+}
+
+func (r *PostgresBackendRepository) GetWorkspaceByExternalId(ctx context.Context, externalId string) (types.Workspace, error) {
+	var workspace types.Workspace
+
+	query := `SELECT id, external_id, name, created_at, updated_at, concurrency_limit_id, volume_cache_enabled, multi_gpu_enabled, storage_id FROM workspace WHERE external_id = $1;`
+	err := r.client.GetContext(ctx, &workspace, query, externalId)
+	if err != nil {
+		return types.Workspace{}, err
+	}
+
+	return workspace, nil
+}
+
+func (r *PostgresBackendRepository) GetWorkspace(ctx context.Context, workspaceId uint) (*types.Workspace, error) {
+	var workspace types.Workspace
+
+	query := `
+	SELECT w.id, w.external_id, w.name, w.created_at, w.concurrency_limit_id, w.volume_cache_enabled, w.multi_gpu_enabled,
+	ws.id "storage.id", ws.bucket_name "storage.bucket_name", ws.access_key "storage.access_key",
+	ws.secret_key "storage.secret_key", ws.endpoint_url "storage.endpoint_url", ws.region "storage.region",
+	ws.created_at "storage.created_at", ws.updated_at "storage.updated_at"
+	FROM workspace w
+	LEFT JOIN workspace_storage ws ON w.storage_id = ws.id
+	WHERE w.id = $1;
+	`
+
+	err := r.client.GetContext(ctx, &workspace, query, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	if workspace.StorageAvailable() {
+		if err := r.decryptFields(workspace.Storage); err != nil {
+			return nil, err
+		}
+	}
+
+	return &workspace, nil
+}
+
+func (r *PostgresBackendRepository) GetWorkspaceByExternalIdWithSigningKey(ctx context.Context, externalId string) (types.Workspace, error) {
+	var workspace types.Workspace
+
+	query := `SELECT id, name, created_at, concurrency_limit_id, signing_key, volume_cache_enabled, multi_gpu_enabled FROM workspace WHERE external_id = $1;`
+	err := r.client.GetContext(ctx, &workspace, query, externalId)
+	if err != nil {
+		return types.Workspace{}, err
+	}
+	if err := r.openSigningKey(&workspace); err != nil {
+		return types.Workspace{}, err
+	}
+
+	return workspace, nil
+}
+
+func (r *PostgresBackendRepository) GetAdminWorkspace(ctx context.Context) (*types.Workspace, error) {
+	for {
+		r.adminWorkspaceMu.Lock()
+		if r.adminWorkspace != nil {
+			workspace := r.adminWorkspace
+			r.adminWorkspaceMu.Unlock()
+			return workspace, nil
+		}
+		if loading := r.adminWorkspaceLoading; loading != nil {
+			r.adminWorkspaceMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-loading.done:
+				sharedContextEnded := errors.Is(loading.err, context.Canceled) || errors.Is(loading.err, context.DeadlineExceeded)
+				if ctx.Err() == nil && sharedContextEnded {
+					continue
+				}
+				return loading.workspace, loading.err
+			}
+		}
+		loading := &adminWorkspaceLoad{done: make(chan struct{})}
+		r.adminWorkspaceLoading = loading
+		r.adminWorkspaceMu.Unlock()
+
+		var adminWorkspace types.Workspace
+		query := `SELECT w.id, w.external_id, w.name, w.created_at, w.concurrency_limit_id, w.volume_cache_enabled, w.multi_gpu_enabled,
+	ws.id "storage.id", ws.bucket_name "storage.bucket_name", ws.access_key "storage.access_key",
+	ws.secret_key "storage.secret_key", ws.endpoint_url "storage.endpoint_url", ws.region "storage.region",
+	ws.created_at "storage.created_at", ws.updated_at "storage.updated_at"
+	FROM workspace w
+	LEFT JOIN workspace_storage ws ON w.storage_id = ws.id
+	WHERE w.is_cluster_admin;`
+		err := r.client.GetContext(ctx, &adminWorkspace, query)
+		if err == nil && adminWorkspace.StorageAvailable() {
+			err = r.decryptFields(adminWorkspace.Storage)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+
+		r.adminWorkspaceMu.Lock()
+		if err == nil {
+			r.adminWorkspace = &adminWorkspace
+		}
+		loading.workspace = r.adminWorkspace
+		loading.err = err
+		r.adminWorkspaceLoading = nil
+		close(loading.done)
+		r.adminWorkspaceMu.Unlock()
+		return loading.workspace, loading.err
+	}
+}
+
+// Token
+
+const tokenLength = 64
+
+const tokenColumns = `id, external_id, key, created_at, updated_at, active, disabled_by_cluster_admin, token_type, reusable, workspace_id, worker_id`
+
+// Token types that workspace token management never toggles or deletes.
+const protectedTokenTypes = `('` + types.TokenTypeClusterAdmin + `', '` + types.TokenTypeWorker + `', '` + types.TokenTypeWorkerPrivate + `')`
+
+// Token types that workspace token management lists.
+const workspaceTokenTypes = `('` + types.TokenTypeWorkspacePrimary + `', '` + types.TokenTypeWorkspace + `', '` + types.TokenTypeWorkspaceRestricted + `', '` + types.TokenTypePlatformDeployer + `')`
+
+func (r *PostgresBackendRepository) CreateToken(ctx context.Context, workspaceId uint, tokenType string, reusable bool) (types.Token, error) {
+	return r.createToken(ctx, workspaceId, tokenType, reusable, "")
+}
+
+func (r *PostgresBackendRepository) CreateWorkerToken(ctx context.Context, workspaceId uint, tokenType string, workerId string) (types.Token, error) {
+	if !types.IsWorkerTokenType(tokenType) || workerId == "" {
+		return types.Token{}, fmt.Errorf("worker tokens require a worker type and worker id")
+	}
+	return r.createToken(ctx, workspaceId, tokenType, true, workerId)
+}
+
+func (r *PostgresBackendRepository) createToken(ctx context.Context, workspaceId uint, tokenType string, reusable bool, workerId string) (types.Token, error) {
+	externalId, err := r.generateExternalId()
+	if err != nil {
+		return types.Token{}, err
+	}
+
+	// Generate a new key for the token
+	randomBytes := make([]byte, tokenLength)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return types.Token{}, err
+	}
+	key := base64.URLEncoding.EncodeToString(randomBytes)
+	storedKey, err := r.sealCredential(key)
+	if err != nil {
+		return types.Token{}, err
+	}
+
+	query := `
+	INSERT INTO token (external_id, key, key_hash, active, token_type, reusable, workspace_id, worker_id)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	RETURNING ` + tokenColumns + `;`
+
+	var token types.Token
+	if err := r.client.GetContext(ctx, &token, query, externalId, storedKey, tokenKeyHash(key), true, tokenType, reusable, workspaceId, workerId); err != nil {
+		return types.Token{}, err
+	}
+	token.Key = key
+
+	return token, nil
+}
+
+// BindWorkerToken binds an unbound worker token to the worker it was issued
+// for. It reports whether the token is now bound to workerId.
+func (r *PostgresBackendRepository) BindWorkerToken(ctx context.Context, tokenKey, workerId string) (bool, error) {
+	if tokenKey == "" || workerId == "" {
+		return false, nil
+	}
+	match, args := r.tokenKeyMatch("", 2, tokenKey)
+	query := `
+	WITH bound AS (
+		UPDATE token SET worker_id = $1
+		WHERE ` + match + `
+		AND token_type IN ('worker', 'worker_private') AND worker_id = ''
+		RETURNING id
+	)
+	SELECT EXISTS (SELECT 1 FROM bound) OR EXISTS (
+		SELECT 1 FROM token
+		WHERE ` + match + `
+		AND token_type IN ('worker', 'worker_private') AND worker_id = $1
+	);`
+	var bound bool
+	err := r.client.GetContext(ctx, &bound, query, append([]any{workerId}, args...)...)
+	return bound, err
+}
+
+// tokenKeyMatch matches a token by the key bound to $n. Sealed keys are found
+// by their hash, bound to $n+1, which is indexed once credentials are encrypted.
+func (r *PostgresBackendRepository) tokenKeyMatch(alias string, n int, key string) (string, []any) {
+	if !r.config.EncryptCredentials {
+		return fmt.Sprintf("%skey = $%d", alias, n), []any{key}
+	}
+	return fmt.Sprintf("(%[1]skey_hash = $%[3]d OR (%[1]skey_hash IS NULL AND %[1]skey = $%[2]d))", alias, n, n+1), []any{key, tokenKeyHash(key)}
+}
+
+func (r *PostgresBackendRepository) AuthorizeToken(ctx context.Context, tokenKey string) (*types.Token, *types.Workspace, error) {
+	match, args := r.tokenKeyMatch("t.", 1, tokenKey)
+	query := `
+	SELECT t.id, t.external_id, t.key, t.created_at, t.updated_at, t.active, t.disabled_by_cluster_admin , t.token_type, t.reusable, t.workspace_id, t.worker_id,
+	       w.id "workspace.id", w.name "workspace.name", w.external_id "workspace.external_id", w.signing_key "workspace.signing_key", w.created_at "workspace.created_at",
+		   w.updated_at "workspace.updated_at", w.volume_cache_enabled "workspace.volume_cache_enabled", w.multi_gpu_enabled "workspace.multi_gpu_enabled", w.storage_id "workspace.storage_id",
+		   ws.id AS "workspace.storage.id", ws.external_id AS "workspace.storage.external_id", ws.bucket_name AS "workspace.storage.bucket_name", ws.access_key AS "workspace.storage.access_key", 
+		   ws.secret_key AS "workspace.storage.secret_key", ws.endpoint_url AS "workspace.storage.endpoint_url", ws.region AS "workspace.storage.region", ws.created_at AS "workspace.storage.created_at", ws.updated_at AS "workspace.storage.updated_at"
+	FROM token t
+	INNER JOIN workspace w ON t.workspace_id = w.id
+	LEFT JOIN workspace_storage ws ON w.storage_id = ws.id
+	WHERE ` + match + ` AND t.active = TRUE;
+	`
+
+	var token types.Token
+
+	if err := r.client.GetContext(ctx, &token, query, args...); err != nil {
+		return nil, nil, err
+	}
+	token.Key = tokenKey
+	if err := r.openSigningKey(token.Workspace); err != nil {
+		return nil, nil, err
+	}
+
+	if token.Workspace.StorageAvailable() {
+		if err := r.decryptFields(token.Workspace.Storage); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// After successful authorization, check if the token is reusable.
+	// If it's not, update the token to expire it by setting active to false.
+	if !token.Reusable {
+		updateQuery := `
+        UPDATE token
+        SET active = FALSE
+        WHERE id = $1;
+        `
+
+		if _, err := r.client.ExecContext(ctx, updateQuery, token.Id); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return &token, token.Workspace, nil
+}
+
+func (r *PostgresBackendRepository) RetrieveActiveToken(ctx context.Context, workspaceId uint, tokenType string) (*types.Token, error) {
+	query := `
+	SELECT ` + tokenColumns + `
+	FROM token
+	WHERE workspace_id = $1 AND active = TRUE AND token_type = $2 AND disabled_by_cluster_admin = FALSE
+	ORDER BY created_at DESC, id DESC
+	LIMIT 1;
+	`
+
+	var token types.Token
+	err := r.client.GetContext(ctx, &token, query, workspaceId, tokenType)
+	if err != nil {
+		return nil, err
+	}
+	if token.Key, err = r.openCredential(token.Key); err != nil {
+		return nil, err
+	}
+
+	return &token, nil
+}
+
+func (r *PostgresBackendRepository) ListTokens(ctx context.Context, workspaceId uint) ([]types.Token, error) {
+	query := `
+    SELECT ` + tokenColumns + `
+    FROM token
+    WHERE workspace_id = $1
+	AND token_type IN ` + workspaceTokenTypes + `
+    ORDER BY created_at DESC;
+    `
+
+	var tokens []types.Token
+	err := r.client.SelectContext(ctx, &tokens, query, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.openTokenKeys(tokens); err != nil {
+		return nil, err
+	}
+
+	return tokens, nil
+}
+
+// openTokenKeys opens stored token keys in place. Cluster admin keys are never
+// returned.
+func (r *PostgresBackendRepository) openTokenKeys(tokens []types.Token) error {
+	for i := range tokens {
+		if tokens[i].TokenType == types.TokenTypeClusterAdmin {
+			tokens[i].Key = ""
+			continue
+		}
+		key, err := r.openCredential(tokens[i].Key)
+		if err != nil {
+			return err
+		}
+		tokens[i].Key = key
+	}
+	return nil
+}
+
+func (r *PostgresBackendRepository) GetTokenByExternalId(ctx context.Context, workspaceId uint, extTokenId string) (*types.Token, error) {
+	query := `SELECT ` + tokenColumns + ` FROM token WHERE external_id = $1 AND workspace_id = $2;`
+
+	var token types.Token
+	err := r.client.GetContext(ctx, &token, query, extTokenId, workspaceId)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("token not found: %w", err)
+		}
+		return nil, err
+	}
+	if token.Key, err = r.openCredential(token.Key); err != nil {
+		return nil, err
+	}
+
+	return &token, nil
+}
+
+func (r *PostgresBackendRepository) ToggleToken(ctx context.Context, workspaceId uint, extTokenId string) (types.Token, error) {
+	query := `
+	UPDATE token
+	SET active = NOT active
+	WHERE external_id = $1 AND workspace_id = $2 AND token_type NOT IN ` + protectedTokenTypes + `
+	RETURNING ` + tokenColumns + `;
+	`
+
+	var token types.Token
+	err := r.client.GetContext(ctx, &token, query, extTokenId, workspaceId)
+	if err != nil {
+		return types.Token{}, err
+	}
+	if token.Key, err = r.openCredential(token.Key); err != nil {
+		return types.Token{}, err
+	}
+
+	return token, nil
+}
+
+func (r *PostgresBackendRepository) DeleteToken(ctx context.Context, workspaceId uint, extTokenId string) error {
+	query := `DELETE FROM token WHERE external_id = $1 AND workspace_id = $2 AND token_type NOT IN ` + protectedTokenTypes + `;`
+	_, err := r.client.ExecContext(ctx, query, extTokenId, workspaceId)
+	return err
+}
+
+// RevokeTokenByExternalId deactivates a token and returns its key, which is
+// empty when there is no such token.
+func (r *PostgresBackendRepository) RevokeTokenByExternalId(ctx context.Context, externalId string) (string, error) {
+	var key string
+	err := r.client.GetContext(ctx, &key, `UPDATE token SET active = FALSE WHERE external_id = $1 RETURNING key;`, externalId)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return r.openCredential(key)
+}
+
+// SetWorkspaceTokensDisabled sets disabled_by_cluster_admin on every token in
+// the workspace except cluster admin and cluster worker tokens, and returns
+// their keys.
+func (r *PostgresBackendRepository) SetWorkspaceTokensDisabled(ctx context.Context, workspaceId uint, disabled bool) ([]string, error) {
+	query := `UPDATE token SET disabled_by_cluster_admin = $2 WHERE workspace_id = $1 AND token_type NOT IN ($3, $4) RETURNING ` + tokenColumns + `;`
+	var tokens []types.Token
+	if err := r.client.SelectContext(ctx, &tokens, query, workspaceId, disabled, types.TokenTypeClusterAdmin, types.TokenTypeWorker); err != nil {
+		return nil, err
+	}
+	if err := r.openTokenKeys(tokens); err != nil {
+		return nil, err
+	}
+	keys := make([]string, len(tokens))
+	for i, token := range tokens {
+		keys[i] = token.Key
+	}
+	return keys, nil
+}
+
+// Object
+
+func (r *PostgresBackendRepository) CreateObject(ctx context.Context, hash string, size int64, workspaceId uint) (*types.Object, error) {
+	query := `
+    INSERT INTO object (hash, size, workspace_id)
+    VALUES ($1, $2, $3)
+    RETURNING id, external_id, hash, size, created_at, workspace_id;
+    `
+
+	var newObject types.Object
+	if err := r.client.GetContext(ctx, &newObject, query, hash, size, workspaceId); err != nil {
+		return nil, err
+	}
+
+	return &newObject, nil
+}
+
+func (r *PostgresBackendRepository) GetObjectByHash(ctx context.Context, hash string, workspaceId uint) (*types.Object, error) {
+	var object types.Object
+
+	query := `SELECT id, external_id, hash, size, created_at FROM object WHERE hash = $1 AND workspace_id = $2;`
+	err := r.client.GetContext(ctx, &object, query, hash, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &object, nil
+}
+
+func (r *PostgresBackendRepository) GetObjectByExternalId(ctx context.Context, externalId string, workspaceId uint) (types.Object, error) {
+	var object types.Object
+
+	query := `SELECT id, external_id, hash, size, created_at FROM object WHERE external_id = $1 AND workspace_id = $2;`
+	err := r.client.GetContext(ctx, &object, query, externalId, workspaceId)
+	if err != nil {
+		return types.Object{}, err
+	}
+
+	return object, nil
+}
+
+func (r *PostgresBackendRepository) GetObjectByExternalStubId(ctx context.Context, stubId string, workspaceId uint) (types.Object, error) {
+	query := `
+	SELECT o.id, o.external_id, o.hash, o.size, o.created_at
+	FROM object o
+	INNER JOIN stub s ON o.id = s.object_id
+	WHERE s.external_id = $1 AND o.workspace_id = $2;
+	`
+
+	var object types.Object
+	err := r.client.GetContext(ctx, &object, query, stubId, workspaceId)
+	if err != nil {
+		return types.Object{}, err
+	}
+
+	return object, nil
+}
+
+func (r *PostgresBackendRepository) UpdateObjectSizeByExternalId(ctx context.Context, externalId string, size int) error {
+	query := `
+	UPDATE object
+	SET size = $2
+	WHERE external_id = $1;
+	`
+	_, err := r.client.ExecContext(ctx, query, externalId, size)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) DeleteObjectByExternalId(ctx context.Context, externalId string) error {
+	query := `DELETE FROM object WHERE external_id = $1;`
+	_, err := r.client.ExecContext(ctx, query, externalId)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Task
+
+func (r *PostgresBackendRepository) handleTaskEvent(task types.Task, callback func(*types.TaskWithRelated)) {
+	taskWithRelated, err := r.GetTaskWithRelated(context.Background(), task.ExternalId)
+	if err != nil {
+		return
+	}
+	if taskWithRelated == nil {
+		return
+	}
+
+	// Event payloads must reflect the exact row snapshot that triggered them.
+	taskWithRelated.Task = task
+	callback(taskWithRelated)
+}
+
+func (r *PostgresBackendRepository) enqueueTaskEvent(task types.Task, callback func(*types.TaskWithRelated)) {
+	if r.eventRepo == nil {
+		return
+	}
+	if r.taskEvents == nil {
+		r.handleTaskEvent(task, callback)
+		return
+	}
+	r.taskEvents.enqueue(taskEventJob{task: task, callback: callback})
+}
+
+func (r *PostgresBackendRepository) CreateTask(ctx context.Context, params *types.TaskParams) (*types.Task, error) {
+	if params.TaskId == "" {
+		externalId, err := r.generateExternalId()
+		if err != nil {
+			return nil, err
+		}
+
+		params.TaskId = externalId
+	}
+
+	query := `
+    INSERT INTO task (external_id, container_id, workspace_id, stub_id)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id, external_id, status, failure_reason, container_id, workspace_id, stub_id, started_at, ended_at, created_at, updated_at;
+    `
+
+	var newTask types.Task
+
+	if err := r.client.GetContext(ctx, &newTask, query, params.TaskId, params.ContainerId, params.WorkspaceId, params.StubId); err != nil {
+		return &types.Task{}, err
+	}
+
+	if r.eventRepo != nil {
+		r.enqueueTaskEvent(newTask, r.eventRepo.PushTaskCreatedEvent)
+	}
+	return &newTask, nil
+}
+
+func (r *PostgresBackendRepository) UpdateTask(ctx context.Context, externalId string, updatedTask types.Task) (*types.Task, error) {
+	query := `
+	UPDATE task
+	SET status = $2, container_id = $3, started_at = $4, ended_at = $5, workspace_id = $6, stub_id = $7, failure_reason = $8, updated_at = CURRENT_TIMESTAMP
+	WHERE external_id = $1
+	RETURNING id, external_id, status, failure_reason, container_id, workspace_id, stub_id, started_at, ended_at, created_at, updated_at;
+	`
+
+	var task types.Task
+	if err := r.client.GetContext(ctx, &task, query,
+		externalId, updatedTask.Status, updatedTask.ContainerId,
+		updatedTask.StartedAt, updatedTask.EndedAt,
+		updatedTask.WorkspaceId, updatedTask.StubId, updatedTask.FailureReason); err != nil {
+		return &types.Task{}, err
+	}
+
+	if r.eventRepo != nil {
+		r.enqueueTaskEvent(task, r.eventRepo.PushTaskUpdatedEvent)
+	}
+	return &task, nil
+}
+
+func (r *PostgresBackendRepository) DeleteTask(ctx context.Context, externalId string) error {
+	query := `DELETE FROM task WHERE external_id = $1;`
+	_, err := r.client.ExecContext(ctx, query, externalId)
+	return err
+}
+
+func (r *PostgresBackendRepository) GetTask(ctx context.Context, externalId string) (*types.Task, error) {
+	var task types.Task
+	query := `SELECT id, external_id, status, failure_reason, container_id, started_at, ended_at, workspace_id, stub_id, created_at, updated_at FROM task WHERE external_id = $1;`
+	err := r.client.GetContext(ctx, &task, query, externalId)
+	if err != nil {
+		return &types.Task{}, err
+	}
+
+	return &task, nil
+}
+
+func (r *PostgresBackendRepository) GetTaskStatus(ctx context.Context, externalId string) (types.TaskStatus, error) {
+	var status string
+	query := `SELECT status FROM task WHERE external_id = $1;`
+	err := r.client.GetContext(ctx, &status, query, externalId)
+	if err != nil {
+		return "", err
+	}
+
+	return types.TaskStatus(status), nil
+}
+
+func (r *PostgresBackendRepository) GetTaskWithRelated(ctx context.Context, externalId string) (*types.TaskWithRelated, error) {
+	var taskWithRelated types.TaskWithRelated
+	query := `
+	SELECT
+		t.*,
+		w.external_id AS "workspace.external_id",
+		w.name AS "workspace.name",
+		w.created_at AS "workspace.created_at",
+		w.updated_at AS "workspace.updated_at",
+		s.external_id AS "stub.external_id",
+		s.name AS "stub.name",
+		s.config AS "stub.config",
+		s.type AS "stub.type",
+		s.app_id AS "app.id",
+		a.external_id AS "app.external_id",
+		a.name AS "app.name",
+		a.external_id AS "app.external_id",
+		d.name AS "deployment.name",
+		d.version AS "deployment.version",
+		d.external_id AS "deployment.external_id"
+	FROM task t
+	JOIN workspace w ON t.workspace_id = w.id
+	JOIN stub s ON t.stub_id = s.id
+	JOIN app a ON s.app_id = a.id
+	LEFT JOIN deployment d ON d.stub_id = s.id
+	WHERE t.external_id = $1;
+	`
+
+	err := r.client.GetContext(ctx, &taskWithRelated, query, externalId)
+	if err != nil {
+		if err, ok := err.(*pq.Error); ok && err.Code.Class() == PostgresDataError {
+			return nil, nil
+		}
+
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	return &taskWithRelated, nil
+}
+
+func (r *PostgresBackendRepository) GetTaskByWorkspace(ctx context.Context, externalId string, workspace *types.Workspace) (*types.TaskWithRelated, error) {
+	var taskWithRelated types.TaskWithRelated
+	query := `
+	SELECT
+		w.external_id AS "workspace.external_id", w.name AS "workspace.name", w.updated_at AS "workspace.updated_at", w.created_at AS "workspace.created_at", t.*,
+		s.external_id AS "stub.external_id", s.name AS "stub.name", s.config AS "stub.config", s.type AS "stub.type", s.created_at AS "stub.created_at", s.updated_at AS "stub.updated_at"
+	FROM task t
+	JOIN workspace w ON t.workspace_id = w.id
+	JOIN stub s ON t.stub_id = s.id
+	WHERE
+		t.external_id = $1
+		AND w.id = $2;
+    `
+	err := r.client.GetContext(ctx, &taskWithRelated, query, externalId, workspace.Id)
+	if err != nil {
+		if err, ok := err.(*pq.Error); ok && err.Code.Class() == PostgresDataError {
+			return nil, nil
+		}
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return &taskWithRelated, nil
+}
+
+func (r *PostgresBackendRepository) ListTasks(ctx context.Context) ([]types.Task, error) {
+	var tasks []types.Task
+	query := `SELECT id, external_id, status, failure_reason, container_id, started_at, ended_at, workspace_id, stub_id, created_at, updated_at FROM task;`
+	err := r.client.SelectContext(ctx, &tasks, query)
+	if err != nil {
+		return nil, err
+	}
+
+	return tasks, nil
+}
+
+const taskWithRelatedColumns = "t.*, w.external_id AS \"workspace.external_id\", w.name AS \"workspace.name\", " +
+	"w.created_at AS \"workspace.created_at\", w.updated_at AS \"workspace.updated_at\", " +
+	"s.external_id AS \"stub.external_id\", s.name AS \"stub.name\", s.config AS \"stub.config\", s.type AS \"stub.type\", d.external_id AS \"deployment.external_id\", d.name AS \"deployment.name\", d.version AS \"deployment.version\""
+
+func (c *PostgresBackendRepository) listTaskWithRelatedQueryBuilder(filters types.TaskFilter, pageOnly bool) squirrel.SelectBuilder {
+	columns := taskWithRelatedColumns
+	if pageOnly {
+		columns = "t.id, t.created_at"
+	}
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select(columns).From("task t").Join("stub s ON t.stub_id = s.id")
+	if !pageOnly {
+		qb = qb.Join("workspace w ON t.workspace_id = w.id").LeftJoin("deployment d ON s.id = d.stub_id").OrderBy("t.id DESC")
+	}
+
+	// Apply filters
+	if filters.WorkspaceID > 0 {
+		qb = qb.Where(squirrel.Eq{"t.workspace_id": filters.WorkspaceID})
+	}
+
+	if len(filters.StubIds) > 0 {
+		// Subquery to get the stub ids from the external ids
+		stubIdsSubquery := squirrel.Select("id").From("stub").Where(squirrel.Eq{"external_id": filters.StubIds})
+		qb = qb.Where(squirrel.Expr("s.id in (?)", stubIdsSubquery))
+	}
+
+	if len(filters.StubNames) > 0 {
+		qb = qb.Where(squirrel.Eq{"s.name": filters.StubNames})
+	}
+
+	if len(filters.StubTypes) > 0 {
+		qb = qb.Where(squirrel.Eq{"s.type": filters.StubTypes})
+	}
+
+	if len(filters.ContainerIds) > 0 {
+		qb = qb.Where(squirrel.Eq{"t.container_id": filters.ContainerIds})
+	}
+
+	if len(filters.TaskIds) > 0 {
+		validTaskIds := []string{}
+
+		for _, taskId := range filters.TaskIds {
+			// Filter out invalid UUIDs
+			if _, err := uuid.Parse(taskId); err == nil {
+				validTaskIds = append(validTaskIds, taskId)
+			}
+		}
+
+		if len(validTaskIds) > 0 {
+			qb = qb.Where(squirrel.Eq{"t.external_id": validTaskIds})
+		}
+	}
+
+	if filters.CreatedAtStart != "" {
+		qb = qb.Where(squirrel.GtOrEq{"t.created_at": filters.CreatedAtStart})
+	}
+
+	if filters.CreatedAtEnd != "" {
+		qb = qb.Where(squirrel.LtOrEq{"t.created_at": filters.CreatedAtEnd})
+	}
+
+	if filters.Offset > 0 {
+		qb = qb.Offset(uint64(filters.Offset))
+	}
+
+	if filters.Status != "" {
+		statuses := strings.Split(filters.Status, ",")
+		if len(statuses) > 0 {
+			qb = qb.Where(squirrel.Eq{"t.status": statuses})
+		}
+	}
+
+	if filters.MinDuration > 0 {
+		qb = qb.Where("EXTRACT(EPOCH FROM (t.ended_at - t.started_at)) * 1000 >= ?", filters.MinDuration)
+	}
+
+	if filters.MaxDuration > 0 {
+		qb = qb.Where("EXTRACT(EPOCH FROM (t.ended_at - t.started_at)) * 1000 <= ?", filters.MaxDuration)
+	}
+
+	if filters.Limit > 0 {
+		qb = qb.Limit(uint64(filters.Limit))
+	}
+
+	if filters.AppId != "" {
+		qb = qb.Join("app a ON s.app_id = a.id")
+		if filters.WorkspaceID > 0 {
+			qb = qb.Where(squirrel.Eq{"a.workspace_id": filters.WorkspaceID})
+		}
+		qb = qb.Where(squirrel.Eq{"a.external_id": filters.AppId})
+		qb = qb.Where("a.deleted_at IS NULL")
+	}
+
+	return qb
+}
+
+func (c *PostgresBackendRepository) GetTaskCountPerDeployment(ctx context.Context, filters types.TaskFilter) ([]types.TaskCountPerDeployment, error) {
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select(
+		"d.name as deployment_name, COUNT(t.id) AS task_count",
+	).
+		From("deployment d").
+		Join("task t ON d.stub_id = t.stub_id").
+		GroupBy(
+			"d.name",
+		).OrderBy("task_count DESC")
+
+	// Apply filters
+	if filters.WorkspaceID > 0 {
+		qb = qb.Where(squirrel.Eq{"t.workspace_id": filters.WorkspaceID})
+	}
+
+	if len(filters.StubIds) > 0 || filters.AppId != "" {
+		qb = qb.Join("stub s ON t.stub_id = s.id")
+	}
+
+	if len(filters.StubIds) > 0 {
+		qb = qb.Where(squirrel.Eq{"s.external_id": filters.StubIds})
+	}
+
+	if filters.CreatedAtStart != "" {
+		qb = qb.Where(squirrel.GtOrEq{"t.created_at": filters.CreatedAtStart})
+	}
+
+	if filters.CreatedAtEnd != "" {
+		qb = qb.Where(squirrel.LtOrEq{"t.created_at": filters.CreatedAtEnd})
+	}
+
+	if filters.AppId != "" {
+		qb = qb.Join("app a ON s.app_id = a.id")
+		qb = qb.Where(squirrel.Eq{"a.external_id": filters.AppId})
+	}
+
+	sql, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	var taskCounts []types.TaskCountPerDeployment
+	err = c.client.SelectContext(ctx, &taskCounts, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return taskCounts, nil
+}
+
+type taskActivityRow struct {
+	AppExternalID string    `db:"app_external_id"`
+	Time          time.Time `db:"time"`
+	Total         int       `db:"total"`
+	Failed        int       `db:"failed"`
+}
+
+// AggregateTaskActivityByApp buckets tasks created since `since` by app and
+// hour, for a set of apps, in one query. Backs the dashboard's per-card
+// activity strips, replacing one aggregate request per card.
+func (c *PostgresBackendRepository) AggregateTaskActivityByApp(ctx context.Context, workspaceID uint, appExternalIDs []string, since time.Time) (map[string][]types.AppActivityBucket, error) {
+	result := make(map[string][]types.AppActivityBucket, len(appExternalIDs))
+	if workspaceID == 0 || len(appExternalIDs) == 0 {
+		return result, nil
+	}
+
+	query := `
+		SELECT a.external_id AS app_external_id,
+		       DATE_TRUNC('hour', t.created_at) AS time,
+		       COUNT(t.id) AS total,
+		       COUNT(t.id) FILTER (WHERE t.status = 'ERROR') AS failed
+		FROM task t
+		JOIN stub s ON s.id = t.stub_id
+		JOIN app a ON a.id = s.app_id
+		WHERE t.workspace_id = $1
+		  AND t.created_at >= $2
+		  AND a.external_id = ANY($3)
+		GROUP BY a.external_id, DATE_TRUNC('hour', t.created_at)
+		ORDER BY a.external_id, time;
+	`
+
+	var rows []taskActivityRow
+	if err := c.client.SelectContext(ctx, &rows, query, workspaceID, since, pq.Array(appExternalIDs)); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		result[row.AppExternalID] = append(result[row.AppExternalID], types.AppActivityBucket{
+			Time:   row.Time.UTC(),
+			Total:  row.Total,
+			Failed: row.Failed,
+		})
+	}
+	return result, nil
+}
+
+var ErrInvalidTaskInterval = errors.New("invalid task aggregation interval")
+
+func (c *PostgresBackendRepository) AggregateTasksByTimeWindow(ctx context.Context, filters types.TaskFilter) ([]types.TaskCountByTime, error) {
+	interval := strings.ToLower(filters.Interval)
+	if interval == "" {
+		interval = "hour"
+	}
+	switch interval {
+	case "microseconds", "milliseconds", "second", "minute", "hour", "day", "week", "month", "quarter", "year", "decade", "century", "millennium":
+	default:
+		return nil, ErrInvalidTaskInterval
+	}
+
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select().Column(
+		`DATE_TRUNC(?, t.created_at) as time, COUNT(t.id) as count,
+			json_build_object(
+				'COMPLETE', SUM(CASE WHEN t.status = 'COMPLETE' THEN 1 ELSE 0 END),
+				'ERROR', SUM(CASE WHEN t.status = 'ERROR' THEN 1 ELSE 0 END),
+				'CANCELLED', SUM(CASE WHEN t.status = 'CANCELLED' THEN 1 ELSE 0 END),
+				'TIMEOUT', SUM(CASE WHEN t.status = 'TIMEOUT' THEN 1 ELSE 0 END),
+				'RETRY', SUM(CASE WHEN t.status = 'RETRY' THEN 1 ELSE 0 END),
+				'PENDING', SUM(CASE WHEN t.status = 'PENDING' THEN 1 ELSE 0 END),
+				'RUNNING', SUM(CASE WHEN t.status = 'RUNNING' THEN 1 ELSE 0 END)
+			)::json AS status_counts`, interval,
+	).
+		From("task t").GroupBy("time").OrderBy("time DESC")
+
+	// Apply filters
+	if filters.WorkspaceID > 0 {
+		qb = qb.Where(squirrel.Eq{"t.workspace_id": filters.WorkspaceID})
+	}
+
+	if len(filters.StubIds) > 0 {
+		qb = qb.Join("stub s ON t.stub_id = s.id")
+	}
+
+	if len(filters.StubIds) > 0 {
+		qb = qb.Where(squirrel.Eq{"s.external_id": filters.StubIds})
+	}
+
+	if filters.AppId != "" {
+		appStubIds := squirrel.Select("app_stub.id").From("stub app_stub").
+			Join("app app_scope ON app_stub.app_id = app_scope.id").
+			Where(squirrel.Eq{"app_scope.workspace_id": filters.WorkspaceID}).
+			Where(squirrel.Eq{"app_scope.external_id": filters.AppId}).
+			Where("app_scope.deleted_at IS NULL")
+		qb = qb.Where(squirrel.Expr("t.stub_id IN (?)", appStubIds))
+	}
+
+	if filters.CreatedAtStart != "" {
+		qb = qb.Where(squirrel.GtOrEq{"t.created_at": filters.CreatedAtStart})
+	}
+
+	if filters.CreatedAtEnd != "" {
+		qb = qb.Where(squirrel.LtOrEq{"t.created_at": filters.CreatedAtEnd})
+	}
+
+	sql, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	var taskCounts []types.TaskCountByTime
+	err = c.client.SelectContext(ctx, &taskCounts, sql, args...)
+	if err != nil {
+		log.Printf("%v", err)
+		return nil, err
+	}
+
+	return taskCounts, nil
+}
+
+func (c *PostgresBackendRepository) ListTasksWithRelated(ctx context.Context, filters types.TaskFilter) ([]types.TaskWithRelated, error) {
+	qb := c.listTaskWithRelatedQueryBuilder(filters, false)
+
+	sql, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	var tasks []types.TaskWithRelated
+	err = c.client.SelectContext(ctx, &tasks, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return tasks, nil
+}
+
+func (c *PostgresBackendRepository) ListTasksWithRelatedPaginated(ctx context.Context, filters types.TaskFilter) (common.CursorPaginationInfo[types.TaskWithRelated], error) {
+	pageOnly := filters.AppId != ""
+	qb := c.listTaskWithRelatedQueryBuilder(filters, pageOnly)
+	queryWrapper := func(page squirrel.SelectBuilder, pageSize int) squirrel.SelectBuilder {
+		if !pageOnly {
+			return page
+		}
+		return squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select(taskWithRelatedColumns).
+			FromSelect(page, "page").Join("task t ON t.id = page.id").
+			Join("workspace w ON t.workspace_id = w.id").Join("stub s ON t.stub_id = s.id").
+			LeftJoin("LATERAL (SELECT d.external_id, d.name, d.version FROM deployment d WHERE d.stub_id = s.id AND d.deleted_at IS NULL ORDER BY d.created_at DESC, d.id DESC LIMIT 1) d ON true").
+			OrderBy("page.created_at DESC", "page.id DESC").Limit(uint64(pageSize + 1))
+	}
+
+	page, err := common.Paginate(
+		common.SquirrelCursorPaginator[types.TaskWithRelated]{
+			Client:          c.client,
+			SelectBuilder:   qb,
+			SortOrder:       "DESC",
+			SortColumn:      "created_at",
+			SortQueryPrefix: "t",
+			PageSize:        int(filters.Limit),
+			QueryWrapper:    queryWrapper,
+		},
+		filters.Cursor,
+	)
+	if err != nil {
+		return common.CursorPaginationInfo[types.TaskWithRelated]{}, err
+	}
+
+	return *page, nil
+}
+
+// Stub
+
+func (r *PostgresBackendRepository) GetOrCreateStub(ctx context.Context, name, stubType string, config types.StubConfigV1, objectId, workspaceId uint, forceCreate bool, appId uint) (types.Stub, error) {
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return types.Stub{}, err
+	}
+
+	// Resolve, create/touch, and update app activity in one transaction and
+	// round trip. Concurrent VM starts otherwise queue for a connection three times.
+	const columns = `id, external_id, name, type, config, config_version, object_id, workspace_id, created_at, updated_at, app_id`
+	query := `
+	WITH existing AS MATERIALIZED (
+		SELECT id FROM stub
+		WHERE name=$1 AND type=$2 AND object_id=$3 AND config::jsonb=$4::jsonb
+			AND workspace_id=$5 AND app_id=$6 AND NOT $7
+		LIMIT 1
+	), created AS (
+		INSERT INTO stub (name, type, config, object_id, workspace_id, app_id)
+		SELECT $1, $2, $4, $3, $5, $6 WHERE NOT EXISTS (SELECT 1 FROM existing)
+		RETURNING ` + columns + `
+	), touched AS (
+		UPDATE stub SET updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM existing)
+		RETURNING ` + columns + `
+	), activity AS (
+		UPDATE app SET updated_at=NOW() WHERE id=$6
+			AND ` + appActivityNeedsRefresh + `
+	)
+	SELECT * FROM created UNION ALL SELECT * FROM touched`
+	var stub types.Stub
+	err = r.client.GetContext(ctx, &stub, query, name, stubType, objectId, string(configJSON), workspaceId, appId, forceCreate)
+	return stub, err
+}
+
+func (r *PostgresBackendRepository) UpdateStubConfig(ctx context.Context, stubId uint, config *types.StubConfigV1) error {
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	query := `UPDATE stub SET config = $1 WHERE id = $2;`
+	_, err = r.client.ExecContext(ctx, query, string(configJSON), stubId)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) GetStubByExternalId(ctx context.Context, externalId string, queryFilters ...types.QueryFilter) (*types.StubWithRelated, error) {
+	var stub types.StubWithRelated
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select(
+		`s.id, s.external_id, s.name, s.type, s.config, s.config_version, s.object_id, s.workspace_id, s.created_at, s.updated_at, s.public, s.app_id,
+	    w.id AS "workspace.id", w.external_id AS "workspace.external_id", w.name AS "workspace.name", w.created_at AS "workspace.created_at", w.updated_at AS "workspace.updated_at", w.signing_key AS "workspace.signing_key", w.volume_cache_enabled AS "workspace.volume_cache_enabled", w.multi_gpu_enabled AS "workspace.multi_gpu_enabled",
+	    o.id AS "object.id", o.external_id AS "object.external_id", o.hash AS "object.hash", o.size AS "object.size", o.workspace_id AS "object.workspace_id", o.created_at AS "object.created_at",
+			a.id as "app.id", a.external_id as "app.external_id", a.name as "app.name"
+		`,
+		`ws.id AS "workspace.storage.id", ws.external_id AS "workspace.storage.external_id", ws.bucket_name AS "workspace.storage.bucket_name", ws.access_key AS "workspace.storage.access_key", ws.secret_key AS "workspace.storage.secret_key", 
+		ws.endpoint_url AS "workspace.storage.endpoint_url", ws.region AS "workspace.storage.region", ws.created_at AS "workspace.storage.created_at", ws.updated_at AS "workspace.storage.updated_at"`,
+	).
+		From("stub s").
+		Join("workspace w ON s.workspace_id = w.id").
+		Join("app a ON s.app_id = a.id").
+		LeftJoin("object o ON s.object_id = o.id").
+		LeftJoin("workspace_storage ws ON w.storage_id = ws.id").
+		Where(squirrel.Eq{"s.external_id": externalId})
+
+	var stubFilters types.StubFilter
+	types.ParseConditionFromQueryFilters(&stubFilters, queryFilters...)
+
+	if stubFilters.WorkspaceID != "" {
+		qb = qb.Where(squirrel.Eq{"w.external_id": stubFilters.WorkspaceID})
+	}
+
+	query, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	err = r.client.GetContext(ctx, &stub, query, args...)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return &types.StubWithRelated{}, err
+	}
+	if err := r.openSigningKey(&stub.Workspace); err != nil {
+		return nil, err
+	}
+
+	if stub.Workspace.StorageAvailable() {
+		if err := r.decryptFields(stub.Workspace.Storage); err != nil {
+			return nil, err
+		}
+	}
+
+	return &stub, nil
+}
+
+func (r *PostgresBackendRepository) GetStubById(ctx context.Context, stubId uint, queryFilters ...types.QueryFilter) (*types.StubWithRelated, error) {
+	var stub types.StubWithRelated
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select(
+		`s.id, s.external_id, s.name, s.type, s.config, s.config_version, s.object_id, s.workspace_id, s.created_at, s.updated_at, s.public, s.app_id,
+	    w.id AS "workspace.id", w.external_id AS "workspace.external_id", w.name AS "workspace.name", w.created_at AS "workspace.created_at", w.updated_at AS "workspace.updated_at", w.signing_key AS "workspace.signing_key", w.volume_cache_enabled AS "workspace.volume_cache_enabled", w.multi_gpu_enabled AS "workspace.multi_gpu_enabled",
+	    o.id AS "object.id", o.external_id AS "object.external_id", o.hash AS "object.hash", o.size AS "object.size", o.workspace_id AS "object.workspace_id", o.created_at AS "object.created_at",
+			a.id as "app.id", a.external_id as "app.external_id", a.name as "app.name"
+		`,
+		`ws.id AS "workspace.storage.id", ws.external_id AS "workspace.storage.external_id", ws.bucket_name AS "workspace.storage.bucket_name", ws.access_key AS "workspace.storage.access_key", ws.secret_key AS "workspace.storage.secret_key", 
+		ws.endpoint_url AS "workspace.storage.endpoint_url", ws.region AS "workspace.storage.region", ws.created_at AS "workspace.storage.created_at", ws.updated_at AS "workspace.storage.updated_at"`,
+	).
+		From("stub s").
+		Join("workspace w ON s.workspace_id = w.id").
+		Join("app a ON s.app_id = a.id").
+		LeftJoin("object o ON s.object_id = o.id").
+		LeftJoin("workspace_storage ws ON w.storage_id = ws.id").
+		Where(squirrel.Eq{"s.id": stubId})
+
+	var stubFilters types.StubFilter
+	types.ParseConditionFromQueryFilters(&stubFilters, queryFilters...)
+
+	if stubFilters.WorkspaceID != "" {
+		qb = qb.Where(squirrel.Eq{"w.external_id": stubFilters.WorkspaceID})
+	}
+
+	query, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	err = r.client.GetContext(ctx, &stub, query, args...)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return &types.StubWithRelated{}, err
+	}
+	if err := r.openSigningKey(&stub.Workspace); err != nil {
+		return nil, err
+	}
+
+	if stub.Workspace.StorageAvailable() {
+		if err := r.decryptFields(stub.Workspace.Storage); err != nil {
+			return nil, err
+		}
+	}
+
+	return &stub, nil
+}
+
+// Volume
+func (c *PostgresBackendRepository) GetVolume(ctx context.Context, workspaceId uint, name string) (*types.Volume, error) {
+	var volume types.Volume
+
+	queryGet := `SELECT id, external_id, name, workspace_id, created_at, updated_at FROM volume WHERE name = $1 AND workspace_id = $2;`
+
+	if err := c.client.GetContext(ctx, &volume, queryGet, name, workspaceId); err != nil {
+		return nil, err
+	}
+
+	return &volume, nil
+}
+
+func (c *PostgresBackendRepository) GetVolumeByExternalId(ctx context.Context, workspaceId uint, externalId string) (*types.Volume, error) {
+	var volume types.Volume
+	queryGet := `SELECT id, external_id, name, workspace_id, created_at, updated_at FROM volume WHERE external_id = $1 AND workspace_id = $2;`
+
+	if err := c.client.GetContext(ctx, &volume, queryGet, externalId, workspaceId); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return &volume, nil
+}
+
+func (c *PostgresBackendRepository) GetOrCreateVolume(ctx context.Context, workspaceId uint, name string) (*types.Volume, error) {
+	v, err := c.GetVolume(ctx, workspaceId, name)
+	if err == nil {
+		return v, nil
+	}
+
+	queryCreate := `INSERT INTO volume (name, workspace_id) VALUES ($1, $2) RETURNING id, external_id, name, workspace_id, created_at, updated_at;`
+
+	var volume types.Volume
+	err = c.client.GetContext(ctx, &volume, queryCreate, name, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &volume, nil
+}
+
+func (c *PostgresBackendRepository) DeleteVolume(ctx context.Context, workspaceId uint, name string) error {
+	query := `DELETE FROM volume WHERE name = $1 AND workspace_id = $2;`
+	_, err := c.client.ExecContext(ctx, query, name, workspaceId)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *PostgresBackendRepository) ListVolumesWithRelated(ctx context.Context, workspaceId uint) ([]types.VolumeWithRelated, error) {
+	var volumes []types.VolumeWithRelated
+	query := `
+		SELECT v.id, v.external_id, v.name, v.workspace_id, v.created_at, v.updated_at, w.name as "workspace.name"
+		FROM volume v
+		JOIN workspace w ON v.workspace_id = w.id
+		WHERE v.workspace_id = $1;
+	`
+
+	err := c.client.SelectContext(ctx, &volumes, query, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	return volumes, nil
+}
+
+// Deployment
+
+func (c *PostgresBackendRepository) GetLatestDeploymentByName(ctx context.Context, workspaceId uint, name string, stubType string, filterDeleted bool) (*types.DeploymentWithRelated, error) {
+	var deploymentWithRelated types.DeploymentWithRelated
+
+	filterDeletedQuery := ""
+	if filterDeleted {
+		filterDeletedQuery = "AND d.deleted_at IS NULL "
+	}
+
+	query := `
+        SELECT
+            d.*,
+            w.external_id AS "workspace.external_id", w.name AS "workspace.name", w.id AS "workspace.id",
+            s.external_id AS "stub.external_id",
+            s.name AS "stub.name",
+            s.type AS "stub.type",
+            s.config AS "stub.config"
+        FROM deployment d
+		JOIN workspace w ON d.workspace_id = w.id
+        JOIN stub s ON d.stub_id = s.id
+        WHERE d.workspace_id = $1 AND d.name = $2 AND d.stub_type = $3 ` + filterDeletedQuery + `
+        ORDER BY d.version DESC
+        LIMIT 1;
+    `
+
+	err := c.client.GetContext(ctx, &deploymentWithRelated, query, workspaceId, name, stubType)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Return nil if no deployment found
+		}
+		return nil, err
+	}
+
+	return &deploymentWithRelated, nil
+}
+
+func (c *PostgresBackendRepository) GetDeploymentByNameAndVersion(ctx context.Context, workspaceId uint, name string, version uint, stubType string) (*types.DeploymentWithRelated, error) {
+	var deploymentWithRelated types.DeploymentWithRelated
+
+	query := `
+        SELECT d.*,
+               w.external_id AS "workspace.external_id", w.name AS "workspace.name", w.id AS "workspace.id",
+               s.external_id AS "stub.external_id", s.name AS "stub.name", s.type AS "stub.type", s.config AS "stub.config"
+        FROM deployment d
+        JOIN workspace w ON d.workspace_id = w.id
+        JOIN stub s ON d.stub_id = s.id
+        WHERE d.workspace_id = $1 AND d.name = $2 AND d.version = $3 AND d.stub_type = $4 and d.deleted_at IS NULL
+        LIMIT 1;
+    `
+
+	err := c.client.GetContext(ctx, &deploymentWithRelated, query, workspaceId, name, version, stubType)
+	if err != nil {
+		return nil, err
+	}
+
+	return &deploymentWithRelated, nil
+}
+
+// GetDeploymentBySubdomain retrieves the deployment by name, version, and stub group
+// If version is 0, it will return the latest version
+func (c *PostgresBackendRepository) GetDeploymentBySubdomain(ctx context.Context, subdomain string, version uint) (*types.DeploymentWithRelated, error) {
+	var deploymentWithRelated types.DeploymentWithRelated
+
+	query := `
+		WITH deployment_data AS (
+			SELECT
+				d.*,
+				w.external_id AS "workspace.external_id", w.name AS "workspace.name",
+				s.external_id AS "stub.external_id", s.name AS "stub.name", s.type AS "stub.type", s.config AS "stub.config"
+			FROM deployment d
+			JOIN workspace w ON d.workspace_id = w.id
+			JOIN stub s ON d.stub_id = s.id
+			WHERE
+				d.subdomain = $1
+				AND d.deleted_at IS NULL
+		)
+		SELECT
+			d.id, d.name, d.external_id, d.version,
+			d."workspace.external_id", d."workspace.name",
+			d."stub.external_id", d."stub.name", d."stub.type", d."stub.config"
+		FROM deployment_data d
+		WHERE version = CASE
+				WHEN $2 = 0 THEN (SELECT MAX(version) FROM deployment_data)
+				ELSE $2
+			END
+		LIMIT 1;
+	`
+	err := c.client.GetContext(ctx, &deploymentWithRelated, query, subdomain, version)
+	if err != nil {
+		return nil, err
+	}
+
+	return &deploymentWithRelated, nil
+}
+
+func (c *PostgresBackendRepository) ListLatestDeploymentsWithRelatedPaginated(ctx context.Context, filters types.DeploymentFilter) (common.CursorPaginationInfo[types.DeploymentWithRelated], error) {
+	query := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).
+		Select(
+			"d.*",
+			"s.external_id AS \"stub.external_id\"", "s.name AS \"stub.name\"", "s.config AS \"stub.config\"",
+			"s.created_at AS \"stub.created_at\"", "s.type AS \"stub.type\"", "s.updated_at AS \"stub.updated_at\"",
+		).
+		From("deployment d").
+		Join(`(
+			select name, max(version) as version, stub_type
+			from deployment
+			where workspace_id = ? and deleted_at is null
+			group by name, stub_type
+		)
+		as latest
+		on d.name = latest.name
+		and d.stub_type = latest.stub_type
+		and d.version = latest.version
+		and d.workspace_id = ?`, filters.WorkspaceID, filters.WorkspaceID).
+		Join(
+			"stub s ON d.stub_id = s.id",
+		)
+
+	if filters.AppId != "" {
+		query = query.Join("app a on d.app_id=a.id")
+		query = query.Where(squirrel.Eq{"a.external_id": filters.AppId})
+	}
+
+	if filters.SearchQuery != "" {
+		if err := uuid.Validate(filters.SearchQuery); err == nil {
+			query = query.Where(squirrel.Eq{"d.external_id": filters.SearchQuery})
+		} else {
+			query = query.Where(squirrel.Like{"d.name": "%" + filters.SearchQuery + "%"})
+		}
+	}
+
+	if len(filters.StubType) > 0 {
+		query = query.Where(squirrel.Eq{"s.type": filters.StubType})
+	}
+
+	page, err := common.Paginate(
+		common.SquirrelCursorPaginator[types.DeploymentWithRelated]{
+			Client:          c.client,
+			SelectBuilder:   query,
+			SortOrder:       "DESC",
+			SortColumn:      "created_at",
+			SortQueryPrefix: "d",
+			PageSize:        int(filters.Limit),
+		},
+		filters.Cursor,
+	)
+
+	if err != nil {
+		log.Error().Err(err).Msg("error paginating deployments")
+		return common.CursorPaginationInfo[types.DeploymentWithRelated]{}, err
+	}
+
+	return *page, nil
+}
+
+func (c *PostgresBackendRepository) GetDeploymentByExternalId(ctx context.Context, workspaceId uint, deploymentExternalId string) (*types.DeploymentWithRelated, error) {
+	var deploymentWithRelated types.DeploymentWithRelated
+
+	query := `
+        SELECT d.*,
+               w.external_id AS "workspace.external_id", w.name AS "workspace.name",
+               s.id AS "stub.id", s.external_id AS "stub.external_id", s.name AS "stub.name", s.config AS "stub.config", s.type AS "stub.type",
+							 a.external_id AS "app.external_id", a.name AS "app.name"
+        FROM deployment d
+        JOIN workspace w ON d.workspace_id = w.id
+        JOIN stub s ON d.stub_id = s.id
+				JOIN app a ON d.app_id = a.id
+        WHERE d.workspace_id = $1 AND d.external_id = $2 and d.deleted_at IS NULL
+        LIMIT 1;
+    `
+
+	err := c.client.GetContext(ctx, &deploymentWithRelated, query, workspaceId, deploymentExternalId)
+	if err != nil {
+		if err, ok := err.(*pq.Error); ok && err.Code.Class() == PostgresDataError {
+			return nil, nil
+		}
+
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	return &deploymentWithRelated, nil
+}
+
+func (c *PostgresBackendRepository) GetAnyDeploymentByExternalId(ctx context.Context, deploymentExternalId string) (*types.DeploymentWithRelated, error) {
+	var deploymentWithRelated types.DeploymentWithRelated
+
+	query := `
+        SELECT d.*,
+               w.external_id AS "workspace.external_id", w.name AS "workspace.name",
+               s.id AS "stub.id", s.external_id AS "stub.external_id", s.name AS "stub.name", s.config AS "stub.config", s.type AS "stub.type"
+        FROM deployment d
+        JOIN workspace w ON d.workspace_id = w.id
+        JOIN stub s ON d.stub_id = s.id
+        WHERE d.external_id = $1 and d.deleted_at IS NULL
+        LIMIT 1;
+    `
+
+	err := c.client.GetContext(ctx, &deploymentWithRelated, query, deploymentExternalId)
+	if err != nil {
+		if err, ok := err.(*pq.Error); ok && err.Code.Class() == PostgresDataError {
+			return nil, nil
+		}
+
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	return &deploymentWithRelated, nil
+}
+
+func (c *PostgresBackendRepository) GetDeploymentByStubExternalId(ctx context.Context, workspaceId uint, stubExternalId string) (*types.DeploymentWithRelated, error) {
+	var deploymentWithRelated types.DeploymentWithRelated
+
+	query := `
+        SELECT d.*,
+               w.external_id AS "workspace.external_id", w.name AS "workspace.name",
+               s.id AS "stub.id", s.external_id AS "stub.external_id", s.name AS "stub.name", s.config AS "stub.config", s.type AS "stub.type"
+        FROM deployment d
+        JOIN workspace w ON d.workspace_id = w.id
+        JOIN stub s ON d.stub_id = s.id
+        WHERE d.workspace_id = $1 AND s.external_id = $2 and d.deleted_at IS NULL
+        LIMIT 1;
+    `
+
+	err := c.client.GetContext(ctx, &deploymentWithRelated, query, workspaceId, stubExternalId)
+	if err != nil {
+		if err, ok := err.(*pq.Error); ok && err.Code.Class() == PostgresDataError {
+			return nil, nil
+		}
+
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	return &deploymentWithRelated, nil
+}
+
+func (c *PostgresBackendRepository) listDeploymentsQueryBuilder(filters types.DeploymentFilter) squirrel.SelectBuilder {
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select(
+		"d.id, d.external_id, d.name, d.active, d.subdomain, d.workspace_id, d.stub_id, d.stub_type, d.version, d.created_at, d.updated_at, d.deleted_at",
+		"w.external_id AS \"workspace.external_id\"", "w.name AS \"workspace.name\"", "w.created_at AS \"workspace.created_at\"", "w.updated_at AS \"workspace.updated_at\"",
+		"s.id AS \"stub.id\"", "s.external_id AS \"stub.external_id\"", "s.name AS \"stub.name\"", "s.config AS \"stub.config\"", "s.type AS \"stub.type\"", "s.created_at AS \"stub.created_at\"", "s.updated_at AS \"stub.updated_at\"",
+		"a.external_id AS \"app.external_id\"", "a.name AS \"app.name\"", "a.created_at AS \"app.created_at\"", "a.updated_at AS \"app.updated_at\"",
+	).From("deployment d").
+		Join("workspace w ON d.workspace_id = w.id").
+		Join("stub s ON d.stub_id = s.id").
+		Join("app a ON d.app_id = a.id").
+		OrderBy("d.created_at DESC")
+
+	// Apply filters
+	if !filters.ShowDeleted {
+		qb = qb.Where("d.deleted_at IS NULL")
+	}
+
+	if filters.WorkspaceID != 0 {
+		qb = qb.Where(squirrel.Eq{"d.workspace_id": filters.WorkspaceID})
+	}
+
+	if len(filters.StubIds) > 0 {
+		qb = qb.Where(squirrel.Eq{"s.external_id": filters.StubIds})
+	}
+
+	if len(filters.StubType) > 0 {
+		qb = qb.Where(squirrel.Eq{"d.stub_type": filters.StubType})
+	}
+
+	if filters.Subdomain != "" {
+		qb = qb.Where(squirrel.Eq{"d.subdomain": filters.Subdomain})
+	}
+
+	if filters.SearchQuery != "" {
+		if err := uuid.Validate(filters.SearchQuery); err == nil {
+			qb = qb.Where(squirrel.Eq{"d.external_id": filters.SearchQuery})
+		} else {
+			qb = qb.Where(squirrel.Like{"d.name": "%" + filters.SearchQuery + "%"})
+		}
+	}
+
+	if filters.Name != "" {
+		qb = qb.Where(squirrel.Like{"d.name": fmt.Sprintf("%%%s%%", filters.Name)})
+	}
+
+	if filters.Active != nil {
+		qb = qb.Where(squirrel.Eq{"d.active": filters.Active})
+	}
+
+	if filters.Version > 0 {
+		qb = qb.Where(squirrel.Eq{"d.version": filters.Version})
+	}
+
+	if filters.Offset > 0 {
+		qb = qb.Offset(uint64(filters.Offset))
+	}
+
+	if filters.Limit > 0 {
+		qb = qb.Limit(uint64(filters.Limit))
+	}
+
+	if filters.CreatedAtStart != "" {
+		qb = qb.Where(squirrel.GtOrEq{"d.created_at": filters.CreatedAtStart})
+	}
+
+	if filters.CreatedAtEnd != "" {
+		qb = qb.Where(squirrel.LtOrEq{"d.created_at": filters.CreatedAtEnd})
+	}
+
+	if filters.MinContainersGTE > 0 {
+		qb = qb.Where("COALESCE((s.config->'autoscaler'->>'min_containers')::int, 0) >= ?", filters.MinContainersGTE)
+	}
+
+	if filters.AppId != "" {
+		qb = qb.Where(squirrel.Eq{"a.external_id": filters.AppId})
+	}
+
+	return qb
+}
+
+func (c *PostgresBackendRepository) ListDeploymentsWithRelated(ctx context.Context, filters types.DeploymentFilter) ([]types.DeploymentWithRelated, error) {
+	qb := c.listDeploymentsQueryBuilder(filters)
+
+	sql, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	var deployments []types.DeploymentWithRelated
+	err = c.client.SelectContext(ctx, &deployments, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return deployments, nil
+}
+
+type latestDeploymentByAppRow struct {
+	types.DeploymentWithRelated
+	AppExternalID string `db:"app_external_id"`
+}
+
+func (c *PostgresBackendRepository) ListLatestDeploymentsByAppIDs(ctx context.Context, workspaceID uint, appExternalIDs []string) (map[string]types.DeploymentWithRelated, error) {
+	deploymentsByApp := make(map[string]types.DeploymentWithRelated, len(appExternalIDs))
+	if workspaceID == 0 || len(appExternalIDs) == 0 {
+		return deploymentsByApp, nil
+	}
+
+	query := `
+		SELECT DISTINCT ON (a.external_id)
+			a.external_id AS app_external_id,
+			d.id, d.external_id, d.name, d.active, d.subdomain, d.workspace_id, d.stub_id, d.stub_type, d.version, d.created_at, d.updated_at, d.deleted_at, d.app_id,
+			w.external_id AS "workspace.external_id", w.name AS "workspace.name", w.created_at AS "workspace.created_at", w.updated_at AS "workspace.updated_at",
+			s.external_id AS "stub.external_id", s.name AS "stub.name", s.config AS "stub.config", s.type AS "stub.type", s.created_at AS "stub.created_at", s.updated_at AS "stub.updated_at",
+			a.id AS "app.id", a.external_id AS "app.external_id", a.name AS "app.name", a.description AS "app.description", a.workspace_id AS "app.workspace_id", a.created_at AS "app.created_at", a.updated_at AS "app.updated_at", a.deleted_at AS "app.deleted_at"
+		FROM app a
+		JOIN deployment d ON d.app_id = a.id AND d.deleted_at IS NULL
+		JOIN workspace w ON d.workspace_id = w.id
+		JOIN stub s ON d.stub_id = s.id
+		WHERE a.workspace_id = $1
+		  AND a.deleted_at IS NULL
+		  AND a.external_id = ANY($2)
+		ORDER BY a.external_id, d.created_at DESC, d.id DESC;
+	`
+
+	var rows []latestDeploymentByAppRow
+	if err := c.client.SelectContext(ctx, &rows, query, workspaceID, pq.Array(appExternalIDs)); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		deploymentsByApp[row.AppExternalID] = row.DeploymentWithRelated
+	}
+	return deploymentsByApp, nil
+}
+
+type activeDeploymentCountRow struct {
+	AppExternalID string `db:"app_external_id"`
+	Count         int    `db:"count"`
+}
+
+// CountActiveDeploymentsByApp returns, per app, how many of its deployments
+// are currently active. Unlike ListLatestDeploymentsByAppIDs this considers
+// every deployment in the app, so an app whose newest deployment was stopped
+// while an older function is still deployed reports as idle rather than
+// stopped. A nil appExternalIDs covers every app in the workspace, which is
+// what the dashboard needs to compute workspace-wide state counts; apps with
+// no active deployment are simply absent from the result.
+func (c *PostgresBackendRepository) CountActiveDeploymentsByApp(ctx context.Context, workspaceID uint, appExternalIDs []string) (map[string]int, error) {
+	counts := make(map[string]int, len(appExternalIDs))
+	if workspaceID == 0 || (appExternalIDs != nil && len(appExternalIDs) == 0) {
+		return counts, nil
+	}
+
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).
+		Select("a.external_id AS app_external_id", "COUNT(d.id) AS count").
+		From("app a").
+		Join("deployment d ON d.app_id = a.id AND d.deleted_at IS NULL AND d.active = true").
+		Where(squirrel.Eq{"a.workspace_id": workspaceID}).
+		Where("a.deleted_at IS NULL").
+		GroupBy("a.external_id")
+	if appExternalIDs != nil {
+		qb = qb.Where(squirrel.Eq{"a.external_id": appExternalIDs})
+	}
+	query, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	var rows []activeDeploymentCountRow
+	if err := c.client.SelectContext(ctx, &rows, query, args...); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		counts[row.AppExternalID] = row.Count
+	}
+	return counts, nil
+}
+
+func (c *PostgresBackendRepository) ListDeploymentsPaginated(ctx context.Context, filters types.DeploymentFilter) (common.CursorPaginationInfo[types.DeploymentWithRelated], error) {
+	qb := c.listDeploymentsQueryBuilder(filters)
+
+	page, err := common.Paginate(
+		common.SquirrelCursorPaginator[types.DeploymentWithRelated]{
+			Client:          c.client,
+			SelectBuilder:   qb,
+			SortOrder:       "DESC",
+			SortColumn:      "created_at",
+			SortQueryPrefix: "d",
+			PageSize:        int(filters.Limit),
+		},
+		filters.Cursor,
+	)
+	if err != nil {
+		return common.CursorPaginationInfo[types.DeploymentWithRelated]{}, err
+	}
+
+	return *page, nil
+}
+
+func (c *PostgresBackendRepository) CreateDeployment(ctx context.Context, workspaceId uint, name string, version uint, stubId uint, stubType string, appId uint) (*types.Deployment, error) {
+	var deployment types.Deployment
+
+	subdomain := GenerateSubdomain(name, stubType, workspaceId)
+	queryCreate := `
+		INSERT INTO deployment (name, active, subdomain, workspace_id, stub_id, version, stub_type, app_id)
+		VALUES ($1, true, $2, $3, $4, $5, $6, $7)
+		RETURNING id, external_id, name, active, subdomain, workspace_id, stub_id, stub_type, version, created_at, updated_at, app_id;
+	`
+	err := c.client.GetContext(ctx, &deployment, queryCreate, name, subdomain, workspaceId, stubId, version, stubType, appId)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.updateAppActivity(ctx, appId); err != nil {
+		return nil, err
+	}
+
+	return &deployment, nil
+}
+
+func (c *PostgresBackendRepository) listStubsQueryBuilder(filters types.StubFilter) squirrel.SelectBuilder {
+	// The app is joined loosely so callers resolving stubs by id (e.g. billing
+	// attribution) learn which app each stub belongs to, even for stubs whose
+	// app has since been deleted.
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select(
+		"s.*",
+		"w.external_id AS \"workspace.external_id\"", "w.name AS \"workspace.name\"",
+		"COALESCE(a.external_id::text, '') AS \"app.external_id\"", "COALESCE(a.name, '') AS \"app.name\"",
+	).From("stub s").
+		Join("workspace w ON s.workspace_id = w.id").
+		LeftJoin("app a ON s.app_id = a.id")
+
+	// Apply filters
+	if filters.WorkspaceID != "" {
+		qb = qb.Where(squirrel.Eq{"w.external_id": filters.WorkspaceID})
+	}
+
+	if len(filters.StubIds) > 0 {
+		qb = qb.Where(squirrel.Eq{"s.external_id": filters.StubIds})
+	}
+
+	if len(filters.StubTypes) > 0 {
+		qb = qb.Where(squirrel.Eq{"s.type": filters.StubTypes})
+	}
+
+	if filters.PreparationCacheKey != "" {
+		qb = qb.
+			Where("s.config->>'preparation_cache_key' = ?", filters.PreparationCacheKey).
+			OrderBy("s.updated_at DESC", "s.id DESC").
+			Limit(1)
+	}
+
+	if filters.AppId != "" {
+		qb = qb.Where(squirrel.Eq{"a.external_id": filters.AppId})
+		qb = qb.Where("a.deleted_at IS NULL")
+	}
+
+	return qb
+}
+
+func (c *PostgresBackendRepository) ListStubs(ctx context.Context, filters types.StubFilter) ([]types.StubWithRelated, error) {
+	qb := c.listStubsQueryBuilder(filters)
+
+	sql, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	var stubs []types.StubWithRelated
+	err = c.client.SelectContext(ctx, &stubs, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return stubs, nil
+}
+
+type latestStubByAppRow struct {
+	types.StubWithRelated
+	AppExternalID string `db:"app_external_id"`
+}
+
+func (c *PostgresBackendRepository) ListLatestStubsByAppIDs(ctx context.Context, workspaceID uint, appExternalIDs []string) (map[string]types.StubWithRelated, error) {
+	stubsByApp := make(map[string]types.StubWithRelated, len(appExternalIDs))
+	if workspaceID == 0 || len(appExternalIDs) == 0 {
+		return stubsByApp, nil
+	}
+
+	query := `
+		SELECT DISTINCT ON (a.external_id)
+			a.external_id AS app_external_id,
+			s.*,
+			w.external_id AS "workspace.external_id", w.name AS "workspace.name", w.created_at AS "workspace.created_at", w.updated_at AS "workspace.updated_at",
+			a.id AS "app.id", a.external_id AS "app.external_id", a.name AS "app.name", a.description AS "app.description", a.workspace_id AS "app.workspace_id", a.created_at AS "app.created_at", a.updated_at AS "app.updated_at", a.deleted_at AS "app.deleted_at"
+		FROM app a
+		JOIN stub s ON s.app_id = a.id
+		JOIN workspace w ON s.workspace_id = w.id
+		WHERE a.workspace_id = $1
+		  AND a.deleted_at IS NULL
+		  AND a.external_id = ANY($2)
+		ORDER BY a.external_id, s.created_at DESC, s.id DESC;
+	`
+
+	var rows []latestStubByAppRow
+	if err := c.client.SelectContext(ctx, &rows, query, workspaceID, pq.Array(appExternalIDs)); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		stubsByApp[row.AppExternalID] = row.StubWithRelated
+	}
+	return stubsByApp, nil
+}
+
+type stubAppIDRow struct {
+	StubExternalID string `db:"stub_external_id"`
+	AppExternalID  string `db:"app_external_id"`
+}
+
+func (c *PostgresBackendRepository) ListAppIDsByStubExternalIDs(ctx context.Context, workspaceID string, stubExternalIDs []string) (map[string]string, error) {
+	appIDsByStub := make(map[string]string, len(stubExternalIDs))
+	if workspaceID == "" || len(stubExternalIDs) == 0 {
+		return appIDsByStub, nil
+	}
+
+	query := `
+		SELECT s.external_id AS stub_external_id, a.external_id AS app_external_id
+		FROM stub s
+		JOIN workspace w ON s.workspace_id = w.id
+		JOIN app a ON s.app_id = a.id
+		WHERE w.external_id = $1
+		  AND s.external_id = ANY($2)
+		  AND a.deleted_at IS NULL
+		  AND a.name <> $3;
+	`
+
+	var rows []stubAppIDRow
+	if err := c.client.SelectContext(ctx, &rows, query, workspaceID, pq.Array(stubExternalIDs), types.VMAppName); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		appIDsByStub[row.StubExternalID] = row.AppExternalID
+	}
+	return appIDsByStub, nil
+}
+
+func (c *PostgresBackendRepository) ListStubsPaginated(ctx context.Context, filters types.StubFilter) (common.CursorPaginationInfo[types.StubWithRelated], error) {
+	qb := c.listStubsQueryBuilder(filters)
+
+	page, err := common.Paginate(
+		common.SquirrelCursorPaginator[types.StubWithRelated]{
+			Client:          c.client,
+			SelectBuilder:   qb,
+			SortOrder:       "DESC",
+			SortColumn:      "created_at",
+			SortQueryPrefix: "s",
+			PageSize:        int(filters.Limit),
+		},
+		filters.Cursor,
+	)
+	if err != nil {
+		return common.CursorPaginationInfo[types.StubWithRelated]{}, err
+	}
+	return *page, nil
+}
+
+func (r *PostgresBackendRepository) UpdateDeployment(ctx context.Context, deployment types.Deployment) (*types.Deployment, error) {
+	query := `
+	UPDATE deployment
+	SET name = $3, active = $4, version = $5, updated_at = CURRENT_TIMESTAMP
+	WHERE (id = $1 OR external_id = $2) AND deleted_at IS NULL
+	RETURNING id, external_id, name, active, version, workspace_id, stub_id, stub_type, created_at, updated_at;
+	`
+
+	var updated types.Deployment
+	if err := r.client.GetContext(
+		ctx, &updated, query,
+		deployment.Id, deployment.ExternalId,
+		deployment.Name, deployment.Active, deployment.Version,
+	); err != nil {
+		return &updated, err
+	}
+
+	return &updated, nil
+}
+
+func (r *PostgresBackendRepository) DeleteDeployment(ctx context.Context, deployment types.Deployment) error {
+	query := `
+	UPDATE deployment
+	SET deleted_at = CURRENT_TIMESTAMP,
+	ACTIVE = FALSE
+	WHERE id = $1;
+	`
+
+	if _, err := r.client.ExecContext(ctx, query, deployment.Id); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) GetConcurrencyLimit(ctx context.Context, concurrencyLimitId uint) (*types.ConcurrencyLimit, error) {
+	var limit types.ConcurrencyLimit
+
+	query := `SELECT gpu_limit, cpu_millicore_limit, created_at, updated_at FROM concurrency_limit WHERE id = $1;`
+	err := r.client.GetContext(ctx, &limit, query, concurrencyLimitId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &limit, nil
+}
+
+func (r *PostgresBackendRepository) GetWorkspaceStorage(ctx context.Context, storageId uint) (*types.WorkspaceStorage, error) {
+	var storage types.WorkspaceStorage
+
+	query := `SELECT bucket_name, access_key, secret_key, endpoint_url, region, created_at, updated_at FROM workspace_storage WHERE id = $1;`
+	if err := r.client.GetContext(ctx, &storage, query, storageId); err != nil {
+		return nil, err
+	}
+
+	if err := r.decryptFields(&storage); err != nil {
+		return nil, err
+	}
+
+	return &storage, nil
+}
+
+func (r *PostgresBackendRepository) CreateWorkspaceStorage(ctx context.Context, workspaceId uint, storage types.WorkspaceStorage) (*types.WorkspaceStorage, error) {
+	query := `
+	INSERT INTO workspace_storage (bucket_name, access_key, secret_key, endpoint_url, region)
+	VALUES ($1, $2, $3, $4, $5)
+	RETURNING id, external_id, bucket_name, access_key, secret_key, endpoint_url, region, created_at, updated_at;
+	`
+
+	if err := r.encryptFields(&storage); err != nil {
+		return nil, err
+	}
+
+	var created types.WorkspaceStorage
+	if err := r.client.GetContext(ctx, &created, query, storage.BucketName, storage.AccessKey, storage.SecretKey, storage.EndpointUrl, storage.Region); err != nil {
+		return nil, err
+	}
+
+	queryUpdateWorkspace := `
+	UPDATE workspace
+	SET storage_id = $1
+	WHERE id = $2;
+	`
+
+	if _, err := r.client.ExecContext(ctx, queryUpdateWorkspace, created.Id, workspaceId); err != nil {
+		return nil, err
+	}
+
+	return &created, nil
+}
+
+func (r *PostgresBackendRepository) CreateConcurrencyLimit(ctx context.Context, workspaceId uint, gpuLimit uint32, cpuMillicoreLimit uint32) (*types.ConcurrencyLimit, error) {
+	query := `
+	INSERT INTO concurrency_limit (workspace_id, gpu_limit, cpu_millicore_limit)
+	VALUES ($1, $2, $3)
+	RETURNING id, external_id, workspace_id, gpu_limit, cpu_millicore_limit, created_at, updated_at;
+	`
+
+	var limit types.ConcurrencyLimit
+	if err := r.client.GetContext(ctx, &limit, query, workspaceId, gpuLimit, cpuMillicoreLimit); err != nil {
+		return nil, err
+	}
+
+	// Add concurrency limit to workspace
+	queryUpdateWorkspace := `
+	UPDATE workspace
+	SET concurrency_limit_id = $1
+	WHERE id = $2;
+	`
+
+	if _, err := r.client.ExecContext(ctx, queryUpdateWorkspace, limit.Id, workspaceId); err != nil {
+		return nil, err
+	}
+
+	return &limit, nil
+}
+
+func (r *PostgresBackendRepository) UpdateConcurrencyLimit(ctx context.Context, concurrencyLimitId uint, gpuLimit uint32, cpuMillicoreLimit uint32) (*types.ConcurrencyLimit, error) {
+	query := `
+	UPDATE concurrency_limit
+	SET gpu_limit = $2, cpu_millicore_limit = $3, updated_at = CURRENT_TIMESTAMP
+	WHERE id = $1
+	RETURNING id, gpu_limit, cpu_millicore_limit, created_at, updated_at;
+	`
+
+	var limit types.ConcurrencyLimit
+	if err := r.client.GetContext(ctx, &limit, query, concurrencyLimitId, gpuLimit, cpuMillicoreLimit); err != nil {
+		return nil, err
+	}
+
+	return &limit, nil
+}
+
+func (r *PostgresBackendRepository) GetConcurrencyLimitByWorkspaceId(ctx context.Context, workspaceId string) (*types.ConcurrencyLimit, error) {
+	var limit types.ConcurrencyLimit
+
+	query := `SELECT cl.id, cl.gpu_limit, cl.cpu_millicore_limit, cl.created_at, cl.updated_at FROM concurrency_limit cl join workspace w on cl.id = w.concurrency_limit_id WHERE w.external_id = $1;`
+	err := r.client.GetContext(ctx, &limit, query, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &limit, nil
+}
+
+func (r *PostgresBackendRepository) DeleteConcurrencyLimit(ctx context.Context, workspaceId types.Workspace) error {
+	updateWorkspaceQuery := `UPDATE workspace SET concurrency_limit_id = NULL WHERE id = $1;`
+	deleteConcurrencyLimitQuery := `DELETE FROM concurrency_limit WHERE id = $1;`
+
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(updateWorkspaceQuery, workspaceId.Id)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(deleteConcurrencyLimitQuery, workspaceId.ConcurrencyLimitId)
+	if err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) ListConcurrencyLimitsByWorkspaceId(ctx context.Context, workspaceId string) ([]types.ConcurrencyLimit, error) {
+	var limits []types.ConcurrencyLimit
+
+	query := `
+		SELECT cl.id, cl.external_id, cl.workspace_id, cl.gpu_limit, cl.cpu_millicore_limit, cl.created_at, cl.updated_at 
+		FROM concurrency_limit cl 
+		JOIN workspace w ON cl.workspace_id = w.id 
+		WHERE w.external_id = $1
+		ORDER BY cl.created_at DESC;
+	`
+
+	err := r.client.SelectContext(ctx, &limits, query, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	return limits, nil
+}
+
+func (r *PostgresBackendRepository) RevertToConcurrencyLimit(ctx context.Context, workspaceId string, concurrencyLimitId string) (*types.ConcurrencyLimit, error) {
+	query := `
+		SELECT cl.*
+		FROM concurrency_limit cl 
+		JOIN workspace w ON cl.workspace_id = w.id 
+		WHERE w.external_id = $1 AND cl.external_id = $2;
+	`
+
+	var concurrencyLimit types.ConcurrencyLimit
+	err := r.client.GetContext(ctx, &concurrencyLimit, query, workspaceId, concurrencyLimitId)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("concurrency limit %s does not exist", concurrencyLimitId)
+		}
+		return nil, err
+	}
+
+	updateQuery := `
+			UPDATE workspace 
+			SET concurrency_limit_id = $1 
+			WHERE external_id = $2
+	`
+
+	_, err = r.client.ExecContext(ctx, updateQuery, concurrencyLimit.Id, workspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &concurrencyLimit, nil
+}
+
+func validateEnvironmentVariableName(name string) error {
+	/* https://docs.aws.amazon.com/opsworks/latest/APIReference/API_EnvironmentVariable.html#:~:text=(Required)%20The%20environment%20variable's%20name,with%20a%20letter%20or%20underscore.
+
+	The environment variable's name, which can consist of up to 64 characters and must be specified. The name can contain upper- and lowercase letters, numbers, and underscores (_), but it must start with a letter or underscore.
+	*/
+
+	regexp := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
+	if !regexp.MatchString(name) {
+		return fmt.Errorf("invalid environment variable name: %s", name)
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) CreateSecret(ctx context.Context, workspace *types.Workspace, tokenId uint, name string, value string, validateName bool, hosts []string) (*types.Secret, error) {
+	if err := pkgCommon.ValidateSecretHosts(hosts, value); err != nil {
+		return nil, err
+	}
+	query := `
+	INSERT INTO workspace_secret (name, value, workspace_id, last_updated_by, hosts)
+	VALUES ($1, $2, $3, $4, $5)
+	RETURNING hosts, placeholder, id, external_id, name, workspace_id, last_updated_by, created_at, updated_at;
+	`
+
+	if validateName {
+		err := validateEnvironmentVariableName(name)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	secretKey, err := pkgCommon.ParseSecretKey(*workspace.SigningKey)
+	if err != nil {
+		return nil, err
+	}
+
+	encryptedValue, err := pkgCommon.Encrypt(secretKey, value)
+	if err != nil {
+		return nil, err
+	}
+
+	var secret types.Secret
+	if err := r.client.GetContext(ctx, &secret, query, name, encryptedValue, workspace.Id, tokenId, pq.Array(append([]string{}, hosts...))); err != nil {
+		return nil, err
+	}
+
+	return &secret, nil
+}
+
+func (r *PostgresBackendRepository) GetSecretByName(ctx context.Context, workspace *types.Workspace, name string) (*types.Secret, error) {
+	var secret types.Secret
+
+	query := `SELECT hosts, placeholder, id, external_id, name, value, workspace_id, last_updated_by, created_at, updated_at FROM workspace_secret WHERE name = $1 AND workspace_id = $2;`
+	err := r.client.GetContext(ctx, &secret, query, name, workspace.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	return &secret, nil
+}
+
+func (r *PostgresBackendRepository) GetSecretsByName(ctx context.Context, workspace *types.Workspace, names []string) ([]types.Secret, error) {
+	query := `SELECT hosts, placeholder, id, external_id, name, value, workspace_id, last_updated_by, created_at, updated_at FROM workspace_secret WHERE name = ANY($1) AND workspace_id = $2;`
+
+	var secrets []types.Secret
+	err := r.client.SelectContext(ctx, &secrets, query, pq.Array(names), workspace.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	return secrets, nil
+}
+
+func (r *PostgresBackendRepository) GetSecretByNameDecrypted(ctx context.Context, workspace *types.Workspace, name string) (*types.Secret, error) {
+	if workspace == nil || workspace.SigningKey == nil || *workspace.SigningKey == "" {
+		return nil, fmt.Errorf("workspace signing key is required to decrypt secrets")
+	}
+
+	secret, err := r.GetSecretByName(ctx, workspace, name)
+	if err != nil {
+		return nil, err
+	}
+
+	secretKey, err := pkgCommon.ParseSecretKey(*workspace.SigningKey)
+	if err != nil {
+		return nil, err
+	}
+
+	decryptedSecret, err := pkgCommon.Decrypt(secretKey, secret.Value)
+	if err != nil {
+		return nil, err
+	}
+
+	secret.Value = string(decryptedSecret)
+
+	return secret, nil
+}
+
+func (r *PostgresBackendRepository) GetSecretsByNameDecrypted(ctx context.Context, workspace *types.Workspace, names []string) ([]types.Secret, error) {
+	if workspace.SigningKey == nil || *workspace.SigningKey == "" {
+		return nil, fmt.Errorf("workspace %s has no signing key to decrypt secrets", workspace.ExternalId)
+	}
+
+	secrets, err := r.GetSecretsByName(ctx, workspace, names)
+	if err != nil {
+		return nil, err
+	}
+
+	secretKey, err := pkgCommon.ParseSecretKey(*workspace.SigningKey)
+	if err != nil {
+		return nil, err
+	}
+
+	for i, secret := range secrets {
+		decryptedSecret, err := pkgCommon.Decrypt(secretKey, secret.Value)
+		if err != nil {
+			return nil, err
+		}
+		secrets[i].Value = string(decryptedSecret)
+	}
+
+	return secrets, nil
+}
+
+func (r *PostgresBackendRepository) ListSecrets(ctx context.Context, workspace *types.Workspace) ([]types.Secret, error) {
+	query := `SELECT hosts, placeholder, id, external_id, name, workspace_id, last_updated_by, created_at, updated_at FROM workspace_secret WHERE workspace_id = $1;`
+
+	var secrets []types.Secret
+	err := r.client.SelectContext(ctx, &secrets, query, workspace.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	return secrets, nil
+}
+
+func (r *PostgresBackendRepository) DeleteSecret(ctx context.Context, workspace *types.Workspace, name string) error {
+	query := `DELETE FROM workspace_secret WHERE name = $1 AND workspace_id = $2;`
+	_, err := r.client.ExecContext(ctx, query, name, workspace.Id)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) UpdateSecret(ctx context.Context, workspace *types.Workspace, tokenId uint, secretName string, value string, hosts []string) (*types.Secret, error) {
+	validateHosts := hosts
+	if hosts == nil {
+		existing, err := r.GetSecretByName(ctx, workspace, secretName)
+		if err != nil {
+			return nil, err
+		}
+		validateHosts = existing.Hosts
+	}
+	if err := pkgCommon.ValidateSecretHosts(validateHosts, value); err != nil {
+		return nil, err
+	}
+	query := `
+	UPDATE workspace_secret
+	SET value = $3, hosts = COALESCE($5,hosts), last_updated_by = $4, updated_at = CURRENT_TIMESTAMP
+	WHERE name = $1 AND workspace_id = $2
+	RETURNING hosts, placeholder, id, external_id, name, workspace_id, last_updated_by, created_at, updated_at;
+	`
+
+	secretKey, err := pkgCommon.ParseSecretKey(*workspace.SigningKey)
+	if err != nil {
+		return nil, err
+	}
+
+	encryptedValue, err := pkgCommon.Encrypt(secretKey, value)
+	if err != nil {
+		return nil, err
+	}
+
+	var secret types.Secret
+	if err := r.client.GetContext(ctx, &secret, query, secretName, workspace.Id, encryptedValue, tokenId, pq.Array(hosts)); err != nil {
+		return nil, err
+	}
+
+	return &secret, nil
+}
+
+const stackColumns = "id, external_id, workspace_id, name, spec, created_at, updated_at"
+
+func (r *PostgresBackendRepository) ListStacks(ctx context.Context, workspaceId uint) ([]types.Stack, error) {
+	query := `SELECT ` + stackColumns + ` FROM workspace_stack WHERE workspace_id = $1 ORDER BY created_at;`
+
+	stacks := []types.Stack{}
+	if err := r.client.SelectContext(ctx, &stacks, query, workspaceId); err != nil {
+		return nil, err
+	}
+	return stacks, nil
+}
+
+func (r *PostgresBackendRepository) CreateStack(ctx context.Context, workspaceId uint, name string, spec json.RawMessage) (*types.Stack, error) {
+	// Coordinate create-by-name across gateway replicas without relying on a
+	// client-side list/create race. Existing stacks keep their spec and layout.
+	tx, err := r.client.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	lockKey := fmt.Sprintf("stack:%d:%s", workspaceId, name)
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+		return nil, err
+	}
+
+	query := `
+	SELECT ` + stackColumns + ` FROM workspace_stack
+	WHERE workspace_id = $1 AND name = $2
+	ORDER BY id LIMIT 1;
+	`
+
+	var stack types.Stack
+	err = tx.GetContext(ctx, &stack, query, workspaceId, name)
+	if err == nil {
+		return &stack, tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	query = `
+	INSERT INTO workspace_stack (workspace_id, name, spec)
+	VALUES ($1, $2, $3)
+	RETURNING ` + stackColumns + `;
+	`
+
+	if err := tx.GetContext(ctx, &stack, query, workspaceId, name, spec); err != nil {
+		return nil, err
+	}
+	return &stack, tx.Commit()
+}
+
+func (r *PostgresBackendRepository) UpdateStack(ctx context.Context, workspaceId uint, externalId, name string, spec json.RawMessage) (*types.Stack, error) {
+	tx, err := r.client.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Dashboard saves cannot overwrite checkpoints owned by the agent's CAS path.
+	query := `
+	UPDATE workspace_stack
+	SET name = $3, spec = spec || ($4::jsonb - 'desired' - 'operation'), updated_at = CURRENT_TIMESTAMP
+	WHERE external_id = $1 AND workspace_id = $2
+	RETURNING ` + stackColumns + `;
+	`
+
+	var stack types.Stack
+	if err := tx.GetContext(ctx, &stack, query, externalId, workspaceId, name, spec); err != nil {
+		return nil, err
+	}
+	if len(stack.Spec) > types.StackSpecMaxBytes {
+		return nil, types.ErrStackSpecTooLarge
+	}
+	return &stack, tx.Commit()
+}
+
+// UpdateStackIfUnchanged serializes agent checkpoints across gateway replicas.
+// Comparing the previous JSON also detects concurrent dashboard edits.
+func (r *PostgresBackendRepository) UpdateStackIfUnchanged(ctx context.Context, workspaceId uint, externalId, name string, previous, spec json.RawMessage) (*types.Stack, error) {
+	query := `
+	UPDATE workspace_stack
+	SET name = $3, spec = $4, updated_at = CURRENT_TIMESTAMP
+	WHERE external_id = $1 AND workspace_id = $2 AND spec = $5::jsonb
+	RETURNING ` + stackColumns + `;
+	`
+
+	var stack types.Stack
+	if err := r.client.GetContext(ctx, &stack, query, externalId, workspaceId, name, spec, previous); err != nil {
+		return nil, err
+	}
+	return &stack, nil
+}
+
+func (r *PostgresBackendRepository) DeleteStack(ctx context.Context, workspaceId uint, externalId string) error {
+	query := `DELETE FROM workspace_stack WHERE external_id = $1 AND workspace_id = $2;`
+	_, err := r.client.ExecContext(ctx, query, externalId, workspaceId)
+	return err
+}
+
+func (r *PostgresBackendRepository) CreateScheduledJob(ctx context.Context, scheduledJob *types.ScheduledJob) (*types.ScheduledJob, error) {
+	payloadJSON, err := json.Marshal(scheduledJob.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal scheduled job payload: %v", err)
+	}
+
+	if matched, _ := regexp.MatchString(`@reboot|@restart`, scheduledJob.Schedule); matched {
+		return nil, fmt.Errorf("invalid schedule: %s", scheduledJob.Schedule)
+	}
+
+	var jobId *uint64
+	query := `SELECT cron.schedule($1, $2, 'NOTIFY ' || $3 || ', ''' || $4 || '''');`
+	if err := r.client.GetContext(ctx, &jobId, query, scheduledJob.JobName, scheduledJob.Schedule, ScheduledJobsChannel, payloadJSON); err != nil {
+		return nil, err
+	}
+
+	var s types.ScheduledJob
+	query = `
+	INSERT INTO scheduled_job (job_id, job_name, job_schedule, job_payload, deployment_id, stub_id)
+	VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+	RETURNING id, external_id, job_id, job_schedule, job_payload, stub_id, created_at, updated_at, deleted_at;
+	`
+	if err := r.client.GetContext(ctx, &s, query, jobId, scheduledJob.JobName, scheduledJob.Schedule, payloadJSON, scheduledJob.DeploymentId, scheduledJob.StubId); err != nil {
+		r.unscheduleCron(ctx, *jobId)
+		return nil, err
+	}
+
+	return &s, nil
+}
+
+func (r *PostgresBackendRepository) GetScheduledJob(ctx context.Context, deploymentId uint) (*types.ScheduledJob, error) {
+	var scheduledJob types.ScheduledJob
+	query := `
+	SELECT sj.*
+	FROM scheduled_job sj
+	JOIN cron.job j ON sj.job_id = j.jobid
+	JOIN deployment d ON sj.deployment_id = d.id
+	WHERE sj.deployment_id = $1 AND sj.deleted_at IS NULL;
+	`
+	err := r.client.GetContext(ctx, &scheduledJob, query, deploymentId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &scheduledJob, nil
+}
+
+func (r *PostgresBackendRepository) DeleteScheduledJob(ctx context.Context, scheduledJob *types.ScheduledJob) error {
+	updateQuery := `
+	UPDATE scheduled_job
+	SET deleted_at = CURRENT_TIMESTAMP
+	WHERE id = $1;
+	`
+	if _, err := r.client.ExecContext(ctx, updateQuery, scheduledJob.Id); err != nil {
+		return err
+	}
+
+	if err := r.unscheduleCron(ctx, scheduledJob.JobId); err != nil {
+		return fmt.Errorf("failed to unschedule job: %v", err)
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) unscheduleCron(ctx context.Context, jobId uint64) error {
+	unscheduleQuery := `SELECT cron.unschedule($1::integer);`
+	if _, err := r.client.ExecContext(ctx, unscheduleQuery, jobId); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *PostgresBackendRepository) DeletePreviousScheduledJob(ctx context.Context, deployment *types.Deployment) error {
+	// Get previous deployment if exists
+	if previousDeployment, err := r.GetDeploymentByNameAndVersion(ctx, deployment.WorkspaceId, deployment.Name, deployment.Version-1, deployment.StubType); err == nil {
+		// Found previous deployment. Get scheduled job of previous deployment.
+		if previousScheduledJob, err := r.GetScheduledJob(ctx, previousDeployment.Id); err == nil {
+			// Found previous scheduled job. Delete it.
+			return r.DeleteScheduledJob(ctx, previousScheduledJob)
+		}
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) ListenToChannel(ctx context.Context, channel string) (<-chan string, error) {
+	dsn := GenerateDSN(r.config)
+
+	listener := pq.NewListener(dsn, listenToChannelMinReconnectInterval, listenToChannelMaxReconnectInterval, func(ev pq.ListenerEventType, err error) {
+		if err != nil {
+			log.Error().Err(err).Msg("failed to create new listener")
+		}
+	})
+
+	if err := listener.Listen(channel); err != nil {
+		return nil, err
+	}
+
+	ch := make(chan string)
+
+	go func() {
+		defer func() {
+			close(ch)
+			listener.Unlisten(channel)
+			listener.Close()
+		}()
+
+		for {
+			select {
+			case n := <-listener.Notify:
+				if n != nil {
+					ch <- n.Extra
+				}
+			case <-time.After(listenToChannelPingInterval):
+				listener.Ping()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return ch, nil
+}
+
+func (r *PostgresBackendRepository) GetTaskMetrics(ctx context.Context, periodStart, periodEnd time.Time) (types.TaskMetrics, error) {
+	query := `
+	SELECT status, count(id)
+	FROM task
+	WHERE created_at >= $1
+	AND created_at <= $2
+	GROUP BY status;
+	`
+
+	rows, err := r.client.QueryContext(ctx, query, periodStart, periodEnd)
+	if err != nil {
+		return types.TaskMetrics{}, err
+	}
+
+	var metrics types.TaskMetrics
+	metrics.TaskByStatusCounts = make(map[string]int)
+
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return types.TaskMetrics{}, err
+		}
+
+		metrics.TaskByStatusCounts[status] = count
+	}
+
+	return metrics, nil
+}
+
+func (r *PostgresBackendRepository) GetOrCreateApp(ctx context.Context, workspaceId uint, appName string) (*types.App, error) {
+	// Check if the app already exists
+	var app types.App
+	query := `SELECT id, external_id, name, workspace_id, created_at, updated_at FROM app WHERE name=$1 and workspace_id=$2 and deleted_at is null;`
+	err := r.client.GetContext(ctx, &app, query, appName, workspaceId)
+	if err == nil {
+		return &app, nil
+	} else if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	query = `
+	INSERT INTO app (name, workspace_id, description)
+	VALUES ($1, $2, $3)
+	RETURNING id, external_id, name, description, workspace_id, created_at, updated_at;
+	`
+
+	if err := r.client.GetContext(ctx, &app, query, appName, workspaceId, ""); err != nil {
+		return nil, err
+	}
+
+	return &app, nil
+}
+
+func (r *PostgresBackendRepository) ListApps(ctx context.Context, workspaceId uint) ([]types.App, error) {
+	var apps []types.App
+
+	query := `SELECT * FROM app WHERE workspace_id = $1 and deleted_at is null and name <> $2`
+	err := r.client.SelectContext(ctx, &apps, query, workspaceId, types.VMAppName)
+	if err != nil {
+		return nil, err
+	}
+
+	return apps, nil
+}
+
+func (r *PostgresBackendRepository) RetrieveApp(ctx context.Context, workspaceId uint, appId string) (*types.App, error) {
+	var app types.App
+	query := `SELECT id, external_id, name, workspace_id, created_at, updated_at, description, deleted_at FROM app WHERE external_id=$1 and workspace_id=$2 and deleted_at is null;`
+	err := r.client.GetContext(ctx, &app, query, appId, workspaceId)
+	if err == nil {
+		return &app, nil
+	}
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+
+	return nil, err
+}
+
+func (r *PostgresBackendRepository) DeleteApp(ctx context.Context, appId string) error {
+	query := `UPDATE app set deleted_at=NOW() where external_id=$1`
+	_, err := r.client.ExecContext(ctx, query, appId)
+	return err
+}
+
+func (r *PostgresBackendRepository) RetrieveAppByStubExternalId(ctx context.Context, stubExternalId string) (*types.App, error) {
+	var app types.App
+	query := `SELECT a.id, a.external_id, a.name, a.workspace_id, a.created_at, a.updated_at, a.description, a.deleted_at FROM app a JOIN stub s ON a.id = s.app_id WHERE s.external_id = $1 and a.deleted_at is null;`
+	err := r.client.GetContext(ctx, &app, query, stubExternalId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &app, nil
+}
+
+func (r *PostgresBackendRepository) ListAppsPaginated(ctx context.Context, workspaceId uint, filters types.AppFilter) (common.CursorPaginationInfo[types.App], error) {
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).Select("a.*").From("app a").Where(squirrel.Eq{"workspace_id": workspaceId}).Where(squirrel.Eq{"deleted_at": nil}).Where(squirrel.NotEq{"a.name": types.VMAppName})
+
+	if filters.Name != "" {
+		qb = qb.Where(squirrel.Like{"LOWER(a.name)": fmt.Sprintf("%%%s%%", strings.ToLower(filters.Name))})
+	}
+
+	// State filters arrive as explicit id sets (running / idle apps are known
+	// from Redis + deployments). An empty include set means "nothing matches";
+	// squirrel renders that as (1=0), which is what we want.
+	if filters.IncludeExternalIds != nil {
+		qb = qb.Where(squirrel.Eq{"a.external_id": filters.IncludeExternalIds})
+	}
+	if len(filters.ExcludeExternalIds) > 0 {
+		qb = qb.Where(squirrel.NotEq{"a.external_id": filters.ExcludeExternalIds})
+	}
+
+	page, err := common.Paginate(
+		common.SquirrelCursorPaginator[types.App]{
+			Client:          r.client,
+			SelectBuilder:   qb,
+			SortOrder:       "DESC",
+			SortColumn:      "updated_at",
+			SortQueryPrefix: "a",
+			PageSize:        int(filters.Limit),
+		},
+		filters.Cursor,
+	)
+	if err != nil {
+		return common.CursorPaginationInfo[types.App]{}, err
+	}
+
+	return *page, nil
+}
+
+// CountApps returns the number of live (non-deleted) apps in a workspace.
+func (r *PostgresBackendRepository) CountApps(ctx context.Context, workspaceId uint) (int, error) {
+	var count int
+	err := r.client.GetContext(ctx, &count, `SELECT COUNT(*) FROM app WHERE workspace_id = $1 AND deleted_at IS NULL AND name <> $2;`, workspaceId, types.VMAppName)
+	return count, err
+}
+
+const appActivityNeedsRefresh = `(updated_at IS NULL OR updated_at < NOW() - INTERVAL '1 second')`
+
+// updateAppActivity refreshes activity when a stub or deployment is created.
+// Skipped while the row is fresh so concurrent stub creations in one app
+// don't queue on its lock.
+func (r *PostgresBackendRepository) updateAppActivity(ctx context.Context, appId uint) error {
+	_, err := r.client.ExecContext(ctx, `UPDATE app SET updated_at = NOW() WHERE id = $1 AND `+appActivityNeedsRefresh, appId)
+	return err
+}
+
+// decryptFields decrypts fields of a struct using AES-GCM
+func (r *PostgresBackendRepository) decryptFields(row interface{}) error {
+	secretKey, err := pkgCommon.ParseSecretKey(r.config.EncryptionKey)
+	if err != nil {
+		return err
+	}
+
+	v := reflect.ValueOf(row)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem() // Dereference the pointer to get the underlying struct
+	}
+
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		if v.Type().Field(i).Tag.Get("encrypt") == "true" {
+			var value string
+			if field.Kind() == reflect.Ptr && !field.IsNil() {
+				value = field.Elem().String()
+			} else if field.Kind() == reflect.String {
+				value = field.String()
+			} else {
+				continue // Skip if not a string or nil pointer
+			}
+
+			if decryptedValue, err := pkgCommon.Decrypt(secretKey, value); err == nil {
+				if field.Kind() == reflect.Ptr {
+					field.Set(reflect.ValueOf(&decryptedValue))
+				} else {
+					field.SetString(decryptedValue)
+				}
+			} else {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// encryptFields encrypts fields of a struct using AES-GCM
+func (r *PostgresBackendRepository) encryptFields(row interface{}) error {
+	secretKey, err := pkgCommon.ParseSecretKey(r.config.EncryptionKey)
+	if err != nil {
+		return err
+	}
+
+	v := reflect.ValueOf(row)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem() // Dereference the pointer to get the underlying struct
+	}
+
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+
+		if v.Type().Field(i).Tag.Get("encrypt") == "true" {
+			var value string
+			if field.Kind() == reflect.Ptr && !field.IsNil() {
+				value = field.Elem().String()
+			} else if field.Kind() == reflect.String {
+				value = field.String()
+			} else {
+				continue // Skip if not a string or nil pointer
+			}
+
+			if encryptedValue, err := pkgCommon.Encrypt(secretKey, value); err == nil {
+				if field.Kind() == reflect.Ptr {
+					field.Set(reflect.ValueOf(&encryptedValue))
+				} else {
+					field.SetString(encryptedValue)
+				}
+			} else {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *PostgresBackendRepository) GetImageClipVersion(ctx context.Context, imageId string) (uint32, error) {
+	var clipVersion uint32
+	query := `SELECT clip_version FROM image WHERE image_id=$1;`
+	err := r.client.GetContext(ctx, &clipVersion, query, imageId)
+	if err == nil {
+		return clipVersion, nil
+	}
+
+	return 0, err
+}
+
+func (r *PostgresBackendRepository) CreateImage(ctx context.Context, imageId string, clipVersion uint32) (uint32, error) {
+	query := `
+		INSERT INTO image (image_id, clip_version)
+		VALUES ($1, $2)
+		ON CONFLICT (image_id) DO UPDATE
+		SET clip_version = EXCLUDED.clip_version,
+		    updated_at = CURRENT_TIMESTAMP
+		RETURNING clip_version;
+	`
+	if err := r.client.QueryRowContext(ctx, query, imageId, clipVersion).Scan(&clipVersion); err != nil {
+		return 0, err
+	}
+
+	return clipVersion, nil
+}
+
+func (r *PostgresBackendRepository) SetImageCredentialSecretNames(ctx context.Context, imageId string, names []string) error {
+	query := `UPDATE image SET credential_secret_names = $2 WHERE image_id = $1;`
+	_, err := r.client.ExecContext(ctx, query, imageId, pq.Array(names))
+	return err
+}
+
+// GetImageCredentials returns the registry credentials for an image, read from
+// the workspace secrets it names, in the form the worker parses. Empty when the
+// image names none.
+func (r *PostgresBackendRepository) GetImageCredentials(ctx context.Context, workspace *types.Workspace, imageId string) (string, error) {
+	var names pq.StringArray
+	query := `SELECT credential_secret_names FROM image WHERE image_id = $1;`
+	if err := r.client.QueryRowContext(ctx, query, imageId).Scan(&names); err != nil || len(names) == 0 {
+		return "", err
+	}
+
+	// Callers often pass a workspace copied off a container request, which
+	// carries no signing key; decryption needs it.
+	if workspace.SigningKey == nil || *workspace.SigningKey == "" {
+		withKey, err := r.GetWorkspaceByExternalIdWithSigningKey(ctx, workspace.ExternalId)
+		if err != nil {
+			return "", fmt.Errorf("load signing key for workspace %s: %w", workspace.ExternalId, err)
+		}
+		copied := *workspace
+		copied.SigningKey = withKey.SigningKey
+		workspace = &copied
+	}
+
+	secrets, err := r.GetSecretsByNameDecrypted(ctx, workspace, names)
+	if err != nil {
+		return "", err
+	}
+	creds := make(map[string]string, len(secrets))
+	for _, secret := range secrets {
+		creds[secret.Name] = secret.Value
+	}
+	return registry.MarshalCredentials("", registry.DetectCredentialType("", creds), creds)
+}
+
+const checkpointColumns = `c.checkpoint_id, c.external_id, c.source_container_id, c.container_ip, c.status, c.remote_key,
+	c.workspace_id, c.stub_id, c.stub_type, c.app_id, c.exposed_ports, c.created_at, c.last_restored_at,
+	c.cache_hash, c.cache_size_bytes, c.origin_key, c.locality, c.accelerator, c.runtime, c.compatibility_key`
+
+func (r *PostgresBackendRepository) CreateCheckpoint(ctx context.Context, checkpoint *types.Checkpoint, compatibilityKey string) (*types.Checkpoint, error) {
+	query := `
+		INSERT INTO checkpoint AS c (
+			checkpoint_id, source_container_id, container_ip, status, remote_key,
+			workspace_id, stub_id, stub_type, app_id, exposed_ports,
+			cache_hash, cache_size_bytes, origin_key, locality, accelerator, runtime, compatibility_key
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+		)
+		RETURNING ` + checkpointColumns + `;`
+
+	exposedPortsInt32 := make([]int32, len(checkpoint.ExposedPorts))
+	for i, port := range checkpoint.ExposedPorts {
+		exposedPortsInt32[i] = int32(port)
+	}
+
+	return scanCheckpoint(r.client.QueryRowxContext(ctx, query,
+		checkpoint.CheckpointId,
+		checkpoint.SourceContainerId,
+		checkpoint.ContainerIp,
+		checkpoint.Status,
+		checkpoint.RemoteKey,
+		checkpoint.WorkspaceId,
+		checkpoint.StubId,
+		checkpoint.StubType,
+		checkpoint.AppId,
+		pq.Array(exposedPortsInt32),
+		checkpoint.CacheHash,
+		checkpoint.CacheSizeBytes,
+		checkpoint.OriginKey,
+		checkpoint.Locality,
+		checkpoint.Accelerator,
+		checkpoint.Runtime,
+		compatibilityKey,
+	))
+}
+
+func (r *PostgresBackendRepository) ListCheckpoints(ctx context.Context, workspaceExternalId string) ([]types.Checkpoint, error) {
+	query := `
+		SELECT ` + checkpointColumns + `
+		FROM checkpoint c
+		INNER JOIN workspace w ON c.workspace_id = w.id
+		WHERE w.external_id = $1 AND c.deleted_at IS NULL
+		ORDER BY c.created_at DESC;`
+
+	rows, err := r.client.QueryxContext(ctx, query, workspaceExternalId)
+	if err != nil {
+		return nil, err
+	}
+	checkpoints, err := scanCheckpointRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	return checkpoints, nil
+}
+
+func (r *PostgresBackendRepository) UpdateCheckpoint(ctx context.Context, checkpoint *types.Checkpoint) (*types.Checkpoint, error) {
+	updateBuilder := squirrel.Update("checkpoint AS c").
+		Where(squirrel.Eq{"checkpoint_id": checkpoint.CheckpointId}).
+		Where(squirrel.Eq{"deleted_at": nil}).
+		Suffix("RETURNING " + checkpointColumns)
+
+	if checkpoint.ContainerIp != "" {
+		updateBuilder = updateBuilder.Set("container_ip", checkpoint.ContainerIp)
+	}
+	if checkpoint.Status != "" {
+		updateBuilder = updateBuilder.Set("status", checkpoint.Status)
+	}
+	if checkpoint.RemoteKey != "" {
+		updateBuilder = updateBuilder.Set("remote_key", checkpoint.RemoteKey)
+	}
+	if len(checkpoint.ExposedPorts) > 0 {
+		exposedPortsInt32 := make([]int32, len(checkpoint.ExposedPorts))
+		for i, port := range checkpoint.ExposedPorts {
+			exposedPortsInt32[i] = int32(port)
+		}
+		updateBuilder = updateBuilder.Set("exposed_ports", pq.Array(exposedPortsInt32))
+	}
+	if !checkpoint.LastRestoredAt.Time.IsZero() {
+		updateBuilder = updateBuilder.Set("last_restored_at", checkpoint.LastRestoredAt.Time)
+	}
+
+	query, args, err := updateBuilder.PlaceholderFormat(squirrel.Dollar).ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	updated, err := scanCheckpoint(r.client.QueryRowxContext(ctx, query, args...))
+	if err == sql.ErrNoRows {
+		return nil, &types.ErrCheckpointNotFound{CheckpointId: checkpoint.CheckpointId}
+	}
+	return updated, err
+}
+
+func (r *PostgresBackendRepository) GetCheckpointById(ctx context.Context, checkpointId string) (*types.Checkpoint, error) {
+	query := `
+		SELECT ` + checkpointColumns + `
+		FROM checkpoint c
+		WHERE c.checkpoint_id = $1 AND c.deleted_at IS NULL
+		LIMIT 1;`
+
+	checkpoint, err := scanCheckpoint(r.client.QueryRowxContext(ctx, query, checkpointId))
+	if err == sql.ErrNoRows {
+		return nil, &types.ErrCheckpointNotFound{CheckpointId: checkpointId}
+	}
+	return checkpoint, err
+}
+
+func (r *PostgresBackendRepository) GetLatestCheckpointByStubId(ctx context.Context, stubExternalId string, compatibilityKeys ...string) (*types.Checkpoint, error) {
+	compatibilityKey := ""
+	if len(compatibilityKeys) > 0 {
+		compatibilityKey = compatibilityKeys[0]
+	}
+	legacyKey := compatibilityKey
+	if profile, retainsDevices := strings.CutPrefix(compatibilityKey, types.CheckpointCompatibilityGPUDevicesPrefix); retainsDevices && profile != "" {
+		legacyKey = types.CheckpointCompatibilityLegacyPrefix + profile
+	}
+	query := `
+		SELECT ` + checkpointColumns + `
+		FROM checkpoint c
+		INNER JOIN stub s ON c.stub_id = s.id
+		WHERE s.external_id = $1 AND c.deleted_at IS NULL AND c.status = $2 AND ($3 = '' OR c.compatibility_key IN ($3, $4))
+		ORDER BY c.created_at DESC
+		LIMIT 1;`
+
+	checkpoint, err := scanCheckpoint(r.client.QueryRowxContext(ctx, query, stubExternalId, string(types.CheckpointStatusAvailable), compatibilityKey, legacyKey))
+	if err == sql.ErrNoRows {
+		return nil, &types.ErrCheckpointNotFound{CheckpointId: fmt.Sprintf("stub:%s", stubExternalId)}
+	}
+	return checkpoint, err
+}
+
+const unreferencedVMCheckpoint = `AND NOT EXISTS (SELECT 1 FROM persistent_vm v WHERE v.data->>'memory_checkpoint_id' = c.checkpoint_id AND v.data->>'desired_state' <> 'deleted')`
+
+func (r *PostgresBackendRepository) ListStaleCheckpoints(ctx context.Context, activeRecentStubKeys []string, stubLastUsedBefore time.Time) ([]types.Checkpoint, error) {
+	// Treat recent keys as a relation: ANY's selectivity estimate can make
+	// PostgreSQL rescan all checkpoints for each stub as launch history grows.
+	query := `
+		SELECT ` + checkpointColumns + `
+		FROM checkpoint c
+		INNER JOIN stub s ON c.stub_id = s.id
+		INNER JOIN workspace w ON s.workspace_id = w.id
+		WHERE c.deleted_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM unnest($1::text[]) recent(stub_key)
+			WHERE recent.stub_key = w.external_id || '|' || s.external_id
+		  )
+		  AND s.updated_at < $2
+		  ` + unreferencedVMCheckpoint + `;`
+
+	rows, err := r.client.QueryxContext(ctx, query, pq.Array(activeRecentStubKeys), stubLastUsedBefore)
+	if err != nil {
+		return nil, err
+	}
+	return scanCheckpointRows(rows)
+}
+
+func (r *PostgresBackendRepository) PruneCheckpoints(ctx context.Context, checkpointIds []string) ([]types.Checkpoint, error) {
+	if len(checkpointIds) == 0 {
+		return nil, nil
+	}
+
+	query := `
+		UPDATE checkpoint c
+		SET deleted_at = CURRENT_TIMESTAMP
+		WHERE c.deleted_at IS NULL
+		  AND c.checkpoint_id = ANY($1::text[])
+		  ` + unreferencedVMCheckpoint + `
+		RETURNING ` + checkpointColumns + `;`
+
+	rows, err := r.client.QueryxContext(ctx, query, pq.Array(checkpointIds))
+	if err != nil {
+		return nil, err
+	}
+	return scanCheckpointRows(rows)
+}
+
+func scanCheckpoint(row interface{ Scan(...any) error }) (*types.Checkpoint, error) {
+	var checkpoint types.Checkpoint
+	var exposedPortsInt32 []int32
+	if err := row.Scan(
+		&checkpoint.CheckpointId, &checkpoint.ExternalId, &checkpoint.SourceContainerId,
+		&checkpoint.ContainerIp, &checkpoint.Status, &checkpoint.RemoteKey,
+		&checkpoint.WorkspaceId, &checkpoint.StubId, &checkpoint.StubType, &checkpoint.AppId,
+		pq.Array(&exposedPortsInt32), &checkpoint.CreatedAt, &checkpoint.LastRestoredAt,
+		&checkpoint.CacheHash, &checkpoint.CacheSizeBytes, &checkpoint.OriginKey,
+		&checkpoint.Locality, &checkpoint.Accelerator, &checkpoint.Runtime, &checkpoint.CompatibilityKey,
+	); err != nil {
+		return nil, err
+	}
+	checkpoint.ExposedPorts = make([]uint32, len(exposedPortsInt32))
+	for i, port := range exposedPortsInt32 {
+		checkpoint.ExposedPorts[i] = uint32(port)
+	}
+	return &checkpoint, nil
+}
+
+func scanCheckpointRows(rows *sqlx.Rows) ([]types.Checkpoint, error) {
+	defer rows.Close()
+
+	var checkpoints []types.Checkpoint
+	for rows.Next() {
+		checkpoint, err := scanCheckpoint(rows)
+		if err != nil {
+			return nil, err
+		}
+		checkpoints = append(checkpoints, *checkpoint)
+	}
+	return checkpoints, rows.Err()
+}

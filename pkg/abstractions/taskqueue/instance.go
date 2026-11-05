@@ -1,0 +1,261 @@
+package taskqueue
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"time"
+
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/beam-cloud/beta9/pkg/common"
+	taskdispatcher "github.com/beam-cloud/beta9/pkg/task"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog/log"
+)
+
+func withAutoscaler(constructor func(i *taskQueueInstance) *abstractions.Autoscaler[*taskQueueInstance, *taskQueueAutoscalerSample]) func(*taskQueueInstance) {
+	return func(i *taskQueueInstance) {
+		i.Autoscaler = constructor(i)
+	}
+}
+
+func withEntryPoint(entryPoint func(instance *taskQueueInstance) []string) func(*taskQueueInstance) {
+	return func(i *taskQueueInstance) {
+		i.EntryPoint = entryPoint(i)
+	}
+}
+
+type taskQueueInstance struct {
+	*abstractions.AutoscaledInstance
+	client *taskQueueClient
+}
+
+func (i *taskQueueInstance) startContainers(containersToRun int) error {
+	secrets, err := abstractions.ConfigureContainerRequestSecrets(i.Ctx, i.BackendRepo, i.Workspace, *i.StubConfig, false)
+	if err != nil {
+		return err
+	}
+
+	env := []string{}
+	env = append(i.StubConfig.Env, env...)
+	env = append(secrets.Env, env...)
+	env = append(env, []string{
+		fmt.Sprintf("BETA9_TOKEN=%s", i.Token.Key),
+		fmt.Sprintf("HANDLER=%s", i.StubConfig.Handler),
+		fmt.Sprintf("ON_START=%s", i.StubConfig.OnStart),
+		fmt.Sprintf("STUB_ID=%s", i.Stub.ExternalId),
+		fmt.Sprintf("STUB_TYPE=%s", i.Stub.Type),
+		fmt.Sprintf("WORKERS=%d", i.StubConfig.Workers),
+		fmt.Sprintf("KEEP_WARM_SECONDS=%d", i.StubConfig.KeepWarmSeconds),
+		fmt.Sprintf("PYTHON_VERSION=%s", i.StubConfig.PythonVersion),
+		fmt.Sprintf("CALLBACK_URL=%s", i.StubConfig.CallbackUrl),
+		fmt.Sprintf("TIMEOUT=%d", i.StubConfig.TaskPolicy.Timeout),
+		fmt.Sprintf("BETA9_INPUTS=%s", i.StubConfig.Inputs.ToString()),
+		fmt.Sprintf("BETA9_OUTPUTS=%s", i.StubConfig.Outputs.ToString()),
+	}...)
+
+	gpuRequest := types.GpuTypesToStrings(i.StubConfig.Runtime.Gpus)
+	if i.StubConfig.Runtime.Gpu != "" {
+		gpuRequest = append(gpuRequest, i.StubConfig.Runtime.Gpu.String())
+	}
+
+	gpuCount := i.StubConfig.Runtime.GpuCount
+	if i.StubConfig.RequiresGPU() && gpuCount == 0 {
+		gpuCount = 1
+	}
+
+	checkpointEnabled := i.StubConfig.CheckpointEnabled
+	if gpuCount > 1 {
+		checkpointEnabled = false
+	}
+
+	for c := 0; c < containersToRun; c++ {
+		if err := i.CheckConcurrencyLimit(); err != nil {
+			return err
+		}
+
+		containerId := i.genContainerId()
+
+		mounts, err := abstractions.ConfigureContainerRequestMounts(
+			containerId,
+			i.Stub,
+			i.Workspace,
+			*i.StubConfig,
+		)
+		if err != nil {
+			return err
+		}
+
+		runRequest := &types.ContainerRequest{
+			ContainerId:       containerId,
+			Env:               env,
+			Cpu:               i.StubConfig.Runtime.Cpu,
+			Memory:            i.StubConfig.Runtime.Memory,
+			GpuRequest:        gpuRequest,
+			GpuCount:          uint32(gpuCount),
+			ImageId:           i.StubConfig.Runtime.ImageId,
+			StubId:            i.Stub.ExternalId,
+			AppId:             i.Stub.App.ExternalId,
+			WorkspaceId:       i.Workspace.ExternalId,
+			Workspace:         *i.Workspace,
+			EntryPoint:        i.EntryPoint,
+			Mounts:            mounts,
+			Stub:              *i.Stub,
+			CheckpointEnabled: checkpointEnabled,
+			CheckpointTrigger: i.StubConfig.CheckpointTrigger,
+			PoolSelector:      i.StubConfig.PoolSelector(),
+		}
+		if err := abstractions.ConfigureContainerRequestNetwork(runRequest, *i.StubConfig); err != nil {
+			return err
+		}
+
+		// Set initial keepwarm to prevent rapid spin-up/spin-down of containers
+		i.Rdb.SetEx(
+			context.Background(),
+			Keys.taskQueueKeepWarmLock(i.Workspace.Name, i.Stub.ExternalId, runRequest.ContainerId),
+			1,
+			time.Duration(i.StubConfig.KeepWarmSeconds)*time.Second,
+		)
+
+		err = i.Scheduler.Run(runRequest)
+		if err != nil {
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("unable to run container")
+			return err
+		}
+
+		continue
+	}
+
+	return nil
+}
+
+func (i *taskQueueInstance) stopContainers(containersToStop int) error {
+	src := rand.NewSource(time.Now().UnixNano())
+	rnd := rand.New(src)
+
+	containerIds, err := i.stoppableContainers()
+	if err != nil {
+		return err
+	}
+
+	for c := 0; c < containersToStop && len(containerIds) > 0; c++ {
+		idx := rnd.Intn(len(containerIds))
+		containerId := containerIds[idx]
+
+		err := i.Scheduler.Stop(&types.StopContainerArgs{ContainerId: containerId, Reason: types.StopContainerReasonScheduler})
+		if err != nil {
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("unable to stop container")
+			return err
+		}
+
+		// Remove the containerId from the containerIds slice to avoid
+		// sending multiple stop requests to the same container
+		containerIds = append(containerIds[:idx], containerIds[idx+1:]...)
+	}
+
+	return nil
+}
+
+func (i *taskQueueInstance) stoppableContainers() ([]string, error) {
+	containers, err := i.ContainerRepo.GetActiveContainersByStubId(i.Stub.ExternalId)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a slice to hold the keys
+	keys := make([]string, 0, len(containers))
+	for _, container := range containers {
+		if container.Status == types.ContainerStatusStopping || container.Status == types.ContainerStatusPending {
+			continue
+		}
+
+		// When deployment is stopped, all containers should be stopped even if they have keep warm
+		if !i.IsActive {
+			keys = append(keys, container.ContainerId)
+			continue
+		}
+
+		// Skip containers with keep warm locks (for taskqueue & taskqueue/deployment stubs) if it is not a serve
+		if !i.Stub.Type.IsServe() {
+			keepWarmVal, err := i.Rdb.Get(context.TODO(), Keys.taskQueueKeepWarmLock(i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)).Int()
+			if err != nil && err != redis.Nil {
+				log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting keep warm lock for container")
+				continue
+			}
+
+			keepWarm := keepWarmVal > 0
+			if keepWarm {
+				continue
+			}
+		}
+
+		// Check if a queue processing lock exists for the container and skip if it does
+		// This indicates the container is currently processing an item in the queue
+		_, err = i.Rdb.Get(context.TODO(), Keys.taskQueueProcessingLock(i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)).Result()
+		if err == nil || err != redis.Nil {
+			continue
+		}
+
+		containerTasks, err := i.Rdb.SMembers(context.TODO(), Keys.taskQueueTaskRunningLockIndex(i.Workspace.Name, i.Stub.ExternalId, container.ContainerId)).Result()
+		if err != nil && err != redis.Nil {
+			log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting task running locks for container")
+			continue
+		}
+
+		if len(containerTasks) == 0 {
+			keys = append(keys, container.ContainerId)
+			continue
+		}
+
+		tasksRunning := false
+
+		// Claims protect active tasks when gateway restarts expire monitor leases.
+		for _, taskId := range containerTasks {
+			meta := types.TaskMetadata{WorkspaceName: i.Workspace.Name, StubId: i.Stub.ExternalId, TaskId: taskId}
+			expired, err := taskdispatcher.CompletionExpired(context.TODO(), i.Rdb, meta)
+			if err != nil {
+				tasksRunning = true
+				break
+			}
+			if expired {
+				continue
+			}
+			_, err = i.Rdb.Get(context.TODO(), Keys.taskQueueTaskRunningLock(i.Workspace.Name, i.Stub.ExternalId, container.ContainerId, taskId)).Result()
+			if err != nil && err != redis.Nil {
+				log.Error().Str("instance_name", i.Name).Err(err).Msg("error getting task running locks for container")
+				continue
+			}
+			if err == nil {
+				tasksRunning = true
+				break
+			}
+			owner, err := i.Rdb.Get(context.TODO(), common.RedisKeys.TaskClaim(meta.WorkspaceName, meta.StubId, meta.TaskId)).Result()
+			if err != nil && err != redis.Nil {
+				log.Error().Err(err).Msg("error getting task claim for container")
+				tasksRunning = true
+				break
+			}
+			if owner == container.ContainerId {
+				tasksRunning = true
+				break
+			}
+			// Remove stale index entries left by expired or completed tasks.
+			i.Rdb.SRem(context.TODO(), Keys.taskQueueTaskRunningLockIndex(meta.WorkspaceName, meta.StubId, container.ContainerId), meta.TaskId)
+		}
+
+		// If any tasks are currently running, skip this container
+		if tasksRunning {
+			continue
+		}
+
+		keys = append(keys, container.ContainerId)
+	}
+
+	return keys, nil
+}
+
+func (i *taskQueueInstance) genContainerId() string {
+	return fmt.Sprintf("%s-%s-%s", taskQueueContainerPrefix, i.Stub.ExternalId, uuid.New().String()[:8])
+}

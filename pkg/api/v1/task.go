@@ -1,0 +1,491 @@
+package apiv1
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/aws/smithy-go"
+	"github.com/rs/zerolog/log"
+
+	"github.com/beam-cloud/beta9/pkg/abstractions/output"
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/clients"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/scheduler"
+	"github.com/beam-cloud/beta9/pkg/task"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/beam-cloud/beta9/pkg/types/serializer"
+	"github.com/labstack/echo/v4"
+)
+
+var (
+	DefaultTaskOutputExpirationS  uint32 = 3600
+	DefaultTaskSubscribeIntervalS uint32 = 1
+)
+
+type TaskGroup struct {
+	routerGroup        *echo.Group
+	config             types.AppConfig
+	backendRepo        repository.BackendRepository
+	taskRepo           repository.TaskRepository
+	containerRepo      repository.ContainerRepository
+	eventRepo          repository.EventRepository
+	redisClient        *common.RedisClient
+	taskDispatcher     *task.Dispatcher
+	scheduler          *scheduler.Scheduler
+	storageClientCache sync.Map
+}
+
+func NewTaskGroup(g *echo.Group, redisClient *common.RedisClient, taskRepo repository.TaskRepository, containerRepo repository.ContainerRepository, eventRepo repository.EventRepository, backendRepo repository.BackendRepository, taskDispatcher *task.Dispatcher, scheduler *scheduler.Scheduler, config types.AppConfig, streamMiddleware echo.MiddlewareFunc) *TaskGroup {
+	group := &TaskGroup{routerGroup: g,
+		backendRepo:        backendRepo,
+		taskRepo:           taskRepo,
+		containerRepo:      containerRepo,
+		eventRepo:          eventRepo,
+		config:             config,
+		redisClient:        redisClient,
+		taskDispatcher:     taskDispatcher,
+		scheduler:          scheduler,
+		storageClientCache: sync.Map{},
+	}
+
+	g.GET("/:workspaceId", auth.WithWorkspaceAuth(group.ListTasksPaginated))
+	g.GET("/:workspaceId/task-count-by-deployment", auth.WithWorkspaceAuth(group.GetTaskCountByDeployment))
+	g.GET("/:workspaceId/aggregate-by-time-window", auth.WithWorkspaceAuth(group.AggregateTasksByTimeWindow))
+	g.DELETE("/:workspaceId", auth.WithWorkspaceAuth(group.StopTasks))
+	g.GET("/:workspaceId/:taskId", auth.WithWorkspaceAuth(group.RetrieveTask))
+	g.GET("/:workspaceId/:taskId/subscribe", auth.WithWorkspaceAuth(group.SubscribeTask), streamMiddleware)
+	g.GET("/metrics", auth.WithClusterAdminAuth(group.GetClusterTaskMetrics))
+
+	return group
+}
+
+func (g *TaskGroup) GetTaskCountByDeployment(ctx echo.Context) error {
+	filters, err := g.preprocessFilters(ctx)
+	if err != nil {
+		return err
+	}
+
+	if tasks, err := g.backendRepo.GetTaskCountPerDeployment(ctx.Request().Context(), *filters); err != nil {
+		return HTTPInternalServerError("Failed to list tasks")
+	} else {
+		return ctx.JSON(http.StatusOK, tasks)
+	}
+}
+
+func (g *TaskGroup) AggregateTasksByTimeWindow(ctx echo.Context) error {
+	filters, err := g.preprocessFilters(ctx)
+	if err != nil {
+		return err
+	}
+
+	if tasks, err := g.backendRepo.AggregateTasksByTimeWindow(ctx.Request().Context(), *filters); err != nil {
+		if errors.Is(err, repository.ErrInvalidTaskInterval) {
+			return HTTPBadRequest(err.Error())
+		}
+		return HTTPInternalServerError("Failed to list tasks")
+	} else {
+		return ctx.JSON(http.StatusOK, tasks)
+	}
+}
+
+func (g *TaskGroup) ListTasksPaginated(ctx echo.Context) error {
+	cc, _ := ctx.(*auth.HttpAuthContext)
+	filters, err := g.preprocessFilters(ctx)
+	if err != nil {
+		return err
+	}
+	skipDetails, _ := strconv.ParseBool(ctx.QueryParam("skip_details"))
+	info := *cc.AuthInfo
+	if !skipDetails && filters.WorkspaceID != info.Workspace.Id {
+		info.Workspace, err = g.backendRepo.GetWorkspace(ctx.Request().Context(), filters.WorkspaceID)
+		if err != nil {
+			return HTTPInternalServerError("Failed to retrieve task workspace")
+		}
+	}
+
+	if tasks, err := g.backendRepo.ListTasksWithRelatedPaginated(ctx.Request().Context(), *filters); err != nil {
+		return HTTPInternalServerError("Failed to list tasks")
+	} else {
+
+		retrievalErrors := map[string]map[string]string{}
+		details := make([]map[string]string, len(tasks.Data))
+		limit := make(chan struct{}, 8)
+		var group sync.WaitGroup
+		requestCtx := ctx.Request().Context()
+		for i := range tasks.Data {
+			tasks.Data[i].Workspace = tasks.Data[i].Workspace.WithoutPrivateCredentials()
+			tasks.Data[i].Stub.SanitizeConfig()
+			if !skipDetails {
+				limit <- struct{}{}
+				group.Add(1)
+				go func(i int) {
+					defer group.Done()
+					defer func() { <-limit }()
+					details[i] = g.taskDetails(requestCtx, &info, &tasks.Data[i], false)
+				}(i)
+			}
+		}
+		group.Wait()
+		for i, failures := range details {
+			if len(failures) > 0 {
+				retrievalErrors[tasks.Data[i].ExternalId] = failures
+			}
+		}
+
+		serializedTasks, err := serializer.Serialize(tasks)
+		if err != nil {
+			return HTTPInternalServerError("Failed to serialize response")
+		}
+
+		response := serializedTasks.(map[string]interface{})
+		response["retrieval_complete"] = len(retrievalErrors) == 0
+		response["retrieval_errors"] = retrievalErrors
+		return ctx.JSON(http.StatusOK, response)
+	}
+}
+
+func (g *TaskGroup) SubscribeTask(ctx echo.Context) error {
+	cc, _ := ctx.(*auth.HttpAuthContext)
+
+	taskId := ctx.Param("taskId")
+	if taskId == "" {
+		return HTTPBadRequest("Missing task ID")
+	}
+
+	// Check if the task exists and the user has access to it first
+	task, err := g.backendRepo.GetTaskWithRelated(ctx.Request().Context(), taskId)
+	if err != nil {
+		return HTTPInternalServerError("Failed to retrieve task")
+	}
+
+	if task == nil {
+		return HTTPNotFound()
+	}
+
+	if task.WorkspaceId != cc.AuthInfo.Workspace.Id {
+		return HTTPNotFound()
+	}
+
+	ctx.Response().Header().Set(echo.HeaderContentType, "text/event-stream")
+	ctx.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
+	ctx.Response().Header().Set(echo.HeaderConnection, "keep-alive")
+	ctx.Response().WriteHeader(http.StatusOK)
+	flusher, ok := ctx.Response().Writer.(http.Flusher)
+	if !ok {
+		return HTTPInternalServerError("Streaming unsupported")
+	}
+
+	var lastStatus types.TaskStatus
+	for {
+		select {
+		case <-ctx.Request().Context().Done():
+			return nil
+		default:
+		}
+
+		status, err := g.backendRepo.GetTaskStatus(ctx.Request().Context(), taskId)
+		if err != nil {
+			return HTTPInternalServerError("Failed to retrieve task status")
+		}
+
+		if status != lastStatus {
+			task, err := g.backendRepo.GetTaskWithRelated(ctx.Request().Context(), taskId)
+			if err != nil {
+				return HTTPInternalServerError("Failed to retrieve task")
+			}
+
+			if task == nil {
+				return HTTPNotFound()
+			}
+
+			task.Workspace = cc.AuthInfo.Workspace.WithoutPrivateCredentials()
+			task.Stub.SanitizeConfig()
+
+			retrievalErrors := g.taskDetails(ctx.Request().Context(), cc.AuthInfo, task, true)
+
+			serializedTask, err := serializer.Serialize(task)
+			if err != nil {
+				return HTTPInternalServerError("Failed to serialize task")
+			}
+			response := serializedTask.(map[string]interface{})
+			response["retrieval_complete"] = len(retrievalErrors) == 0
+			response["retrieval_errors"] = retrievalErrors
+			response["result_available"] = len(task.Result) > 0
+			jsonBytes, err := json.Marshal(response)
+			if err != nil {
+				return HTTPInternalServerError("Failed to marshal task to JSON")
+			}
+
+			ctx.Response().Write([]byte("event: status\n"))
+			ctx.Response().Write([]byte("data: "))
+			ctx.Response().Write(jsonBytes)
+			ctx.Response().Write([]byte("\n\n"))
+			flusher.Flush()
+			lastStatus = status
+		}
+
+		if status.IsCompleted() {
+			break
+		}
+
+		time.Sleep(time.Duration(DefaultTaskSubscribeIntervalS) * time.Second)
+	}
+
+	return nil
+}
+
+func (g *TaskGroup) hasTaskAccess(task *types.TaskWithRelated, authInfo *auth.AuthInfo) bool {
+	return task.WorkspaceId == authInfo.Workspace.Id
+}
+
+func (g *TaskGroup) RetrieveTask(ctx echo.Context) error {
+	cc, _ := ctx.(*auth.HttpAuthContext)
+
+	taskId := ctx.Param("taskId")
+	if task, err := g.backendRepo.GetTaskWithRelated(ctx.Request().Context(), taskId); err != nil {
+		return HTTPInternalServerError("Failed to retrieve task")
+	} else {
+		if task == nil {
+			return HTTPNotFound()
+		}
+
+		if !g.hasTaskAccess(task, cc.AuthInfo) {
+			return HTTPNotFound()
+		}
+
+		task.Workspace = cc.AuthInfo.Workspace.WithoutPrivateCredentials()
+		task.Stub.SanitizeConfig()
+
+		retrievalErrors := g.taskDetails(ctx.Request().Context(), cc.AuthInfo, task, true)
+
+		serializedTask, err := serializer.Serialize(task)
+		if err != nil {
+			return err
+		}
+
+		response := serializedTask.(map[string]interface{})
+		response["retrieval_complete"] = len(retrievalErrors) == 0
+		response["retrieval_errors"] = retrievalErrors
+		response["result_available"] = len(task.Result) > 0
+		return ctx.JSON(http.StatusOK, response)
+	}
+}
+
+// taskDetails keeps partial task metadata usable while reporting failed reads.
+func (g *TaskGroup) taskDetails(ctx context.Context, authInfo *auth.AuthInfo, task *types.TaskWithRelated, includeResult bool) map[string]string {
+	failures := map[string]string{}
+	if err := g.addOutputsToTask(ctx, authInfo, task); err != nil {
+		failures["outputs"] = "Artifact retrieval failed; retry get_task."
+	}
+	if err := g.addStatsToTask(ctx, authInfo.Workspace.Name, task); err != nil {
+		failures["stats"] = "Live task statistics are unavailable; retry get_task."
+	}
+	if includeResult {
+		if err := g.addResultToTask(ctx, task, authInfo); err != nil {
+			failures["result"] = "Result retrieval failed; retry get_task."
+		}
+	}
+	return failures
+}
+
+func (g *TaskGroup) addOutputsToTask(ctx context.Context, authInfo *auth.AuthInfo, task *types.TaskWithRelated) error {
+	task.Outputs = []types.TaskOutput{}
+	outputFiles, discoveryErr := output.GetTaskOutputFiles(ctx, authInfo, task)
+
+	for outputId, fileName := range outputFiles {
+		url, err := output.SetPublicURL(ctx, g.config, g.backendRepo, authInfo, task.ExternalId, outputId, fileName, DefaultTaskOutputExpirationS)
+		if err != nil {
+			return err
+		}
+		task.Outputs = append(task.Outputs, types.TaskOutput{Name: fileName, URL: url, ExpiresIn: DefaultTaskOutputExpirationS})
+	}
+
+	return discoveryErr
+}
+
+func (g *TaskGroup) addStatsToTask(ctx context.Context, workspaceName string, task *types.TaskWithRelated) error {
+	tasksInFlight, err := g.taskRepo.TasksInFlight(ctx, workspaceName, task.Stub.ExternalId)
+	if err != nil {
+		return err
+	}
+	task.Stats.QueueDepth = uint32(tasksInFlight)
+
+	activeContainers, err := g.containerRepo.GetActiveContainersByStubId(task.Stub.ExternalId)
+	if err != nil {
+		return err
+	}
+	task.Stats.ActiveContainers = uint32(len(activeContainers))
+
+	return nil
+}
+
+func (g *TaskGroup) addResultToTask(ctx context.Context, t *types.TaskWithRelated, authInfo *auth.AuthInfo) error {
+	var storageClient *clients.WorkspaceStorageClient
+	var err error
+
+	if authInfo.Workspace.StorageAvailable() {
+		if cachedStorageClient, ok := g.storageClientCache.Load(authInfo.Workspace.Name); ok {
+			storageClient = cachedStorageClient.(*clients.WorkspaceStorageClient)
+		} else {
+			storageClient, err = clients.NewWorkspaceStorageClient(ctx, authInfo.Workspace.Name, authInfo.Workspace.Storage)
+			if err != nil {
+				return err
+			}
+
+			g.storageClientCache.Store(authInfo.Workspace.Name, storageClient)
+		}
+
+		fullPath := task.GetTaskResultPath(t.ExternalId)
+		result, err := storageClient.Download(ctx, fullPath)
+		if err != nil {
+			var apiError smithy.APIError
+			if errors.As(err, &apiError) && apiError.ErrorCode() == "NoSuchKey" {
+				return nil // One-off containers and pending tasks may have no return value.
+			}
+			return err
+		}
+
+		if len(result) > 0 {
+			err = json.Unmarshal(result, &t.Result)
+			if err != nil {
+				t.Result = json.RawMessage(fmt.Sprintf(`{"base64":"%s"}`, base64.StdEncoding.EncodeToString(result)))
+				return nil
+			}
+		}
+	}
+
+	return nil
+}
+
+type StopTasksRequest struct {
+	TaskIds types.StringSlice `query:"task_ids"`
+}
+
+func (g *TaskGroup) StopTasks(ctx echo.Context) error {
+	cc, ok := ctx.(*auth.HttpAuthContext)
+	if !ok || cc.AuthInfo == nil || cc.AuthInfo.Workspace == nil {
+		return echo.NewHTTPError(http.StatusUnauthorized)
+	}
+	var req StopTasksRequest
+	if err := ctx.Bind(&req); err != nil {
+		return HTTPBadRequest("Failed to decode task ids")
+	}
+
+	for _, taskId := range req.TaskIds {
+		task, err := g.backendRepo.GetTaskWithRelated(ctx.Request().Context(), taskId)
+		if err != nil {
+			continue
+		}
+
+		if !hasWorkspaceTaskAccess(task, cc.AuthInfo, ctx.Param("workspaceId")) {
+			continue
+		}
+
+		err = g.stopTask(ctx.Request().Context(), task)
+		if err != nil {
+			continue
+		}
+	}
+
+	return ctx.JSON(http.StatusOK, map[string]interface{}{})
+}
+
+func (g *TaskGroup) stopTask(ctx context.Context, task *types.TaskWithRelated) error {
+	if task.Status.IsCompleted() {
+		return nil
+	}
+
+	if g.eventRepo != nil {
+		g.eventRepo.PushTaskCancelRequested(task, types.EventSourceAPITaskStop, types.EventMessageHTTPTaskStopRequested)
+	}
+	err := g.taskDispatcher.Complete(ctx, task.Workspace.Name, task.Stub.ExternalId, task.ExternalId)
+	if err != nil {
+		return errors.New("failed to complete task")
+	}
+
+	err = g.redisClient.Publish(ctx, common.RedisKeys.TaskCancel(task.Workspace.Name, task.Stub.ExternalId, task.ExternalId), task.ExternalId).Err()
+	if err != nil {
+		return errors.New("failed to cancel task")
+	}
+
+	// If the stub runs one container per task (functions, pod runs) and we have
+	// the container id, force stop the container immediately
+	kind := task.Stub.Type.Kind()
+	if (kind == types.StubTypeFunction || kind == types.StubTypePod) && task.ContainerId != "" {
+		err = g.scheduler.Stop(&types.StopContainerArgs{
+			ContainerId: task.ContainerId,
+			Reason:      types.StopContainerReasonUser,
+			Force:       true,
+		})
+		if err != nil {
+			log.Error().Str("container_id", task.ContainerId).Msgf("failed to stop container: %v", err)
+		}
+	}
+
+	task.Status = types.TaskStatusCancelled
+	task.EndedAt = types.NullTime{}.Now()
+	if _, err := g.backendRepo.UpdateTask(ctx, task.ExternalId, task.Task); err != nil {
+		return errors.New("failed to update task")
+	}
+	if g.eventRepo != nil {
+		g.eventRepo.PushTaskCancelApplied(task, types.EventSourceAPITaskStop, types.EventMessageHTTPTaskCancellationApplied)
+	}
+
+	return nil
+}
+
+func (g *TaskGroup) preprocessFilters(ctx echo.Context) (*types.TaskFilter, error) {
+	var filters types.TaskFilter
+	workspaceId := ctx.Param("workspaceId")
+	workspace, err := g.backendRepo.GetWorkspaceByExternalId(ctx.Request().Context(), workspaceId)
+	if err != nil {
+		return nil, HTTPBadRequest("Invalid workspace ID")
+	}
+
+	if err := ctx.Bind(&filters); err != nil {
+		return nil, HTTPBadRequest("Failed to decode query parameters")
+	}
+
+	filters.WorkspaceID = workspace.Id
+
+	return &filters, nil
+}
+
+func (g *TaskGroup) GetClusterTaskMetrics(ctx echo.Context) error {
+	query := ctx.QueryParams()
+
+	startedAtTimestamp, err := strconv.ParseInt(query.Get("started_at"), 10, 64)
+	if err != nil {
+		return HTTPBadRequest("Invalid started_at")
+	}
+
+	startedAt := time.Unix(startedAtTimestamp, 0)
+	if err != nil {
+		return HTTPBadRequest("Invalid started_at")
+	}
+
+	endedAtTimestamp, err := strconv.ParseInt(query.Get("ended_at"), 10, 64)
+	if err != nil {
+		return HTTPBadRequest("Invalid ended_at")
+	}
+
+	endedAt := time.Unix(endedAtTimestamp, 0)
+	if err != nil {
+		return HTTPBadRequest("Invalid ended_at")
+	}
+
+	if metrics, err := g.backendRepo.GetTaskMetrics(ctx.Request().Context(), startedAt, endedAt); err != nil {
+		return HTTPInternalServerError("Failed to retrieve cluster task metrics")
+	} else {
+		return ctx.JSON(http.StatusOK, metrics)
+	}
+}

@@ -1,0 +1,57 @@
+bin/gateway
+bin/runner
+bin/worker
+tmp/*
+*.gob
+__pycache__
+*.tmp
+.secrets
+.k3d
+.venv
+venv
+.python-version
+.DS_Store
+.terraform*
+terraform.tfstate*
+terraform.tfvars
+sdk/src/build
+sdk/src/beta9.egg-info
+event.json
+config.yaml
+config.yaml.local
+config.local.yaml
+config.local.yaml.bak
+config.stage.yaml
+*.tgz
+test
+**/nvidia-device-plugin.yaml.skip
+manifests/**/charts/**
+build.sh
+.coverage
+.htmlcov
+okteto.yaml
+.vscode/launch.json
+pyrightconfig.json
+.go-version
+docs/*.md
+/docs/vm/kiosk.md
+.beta9ignore
+/benchmarks/runs/
+/benchmarks/kiosk/
+/artifacts/
+/metrics.jsonl
+/summary.json
+/summary.md
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/
+
+# staging okteto config: contains live credentials
+hack/stage/config.stage.yaml
+
+# Local evaluation reports and captures
+/docs/reports/
+*.local.md
+
+# Private staging configuration and seeded Go module cache
+hack/stage/

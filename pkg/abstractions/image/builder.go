@@ -1,0 +1,780 @@
+package image
+
+import (
+	"context"
+	_ "embed"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
+
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/network"
+	"github.com/beam-cloud/beta9/pkg/registry"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/scheduler"
+	"github.com/beam-cloud/beta9/pkg/types"
+)
+
+const (
+	defaultImageBuildGracefulShutdownS               = 5 * time.Second
+	defaultBuildContainerCpu           int64         = 1000
+	defaultBuildContainerMemory        int64         = 1024
+	defaultContainerSpinupTimeout      time.Duration = 600 * time.Second
+	dockerfileContainerSpinupTimeout   time.Duration = 1 * time.Hour
+
+	pipCommandType        string = "pip"
+	shellCommandType      string = "shell"
+	micromambaCommandType string = "micromamba"
+
+	dockerHubRegistry string = "docker.io"
+)
+
+var (
+	buildEnv []string = []string{"DEBIAN_FRONTEND=noninteractive", "PIP_ROOT_USER_ACTION=ignore", "UV_NO_CACHE=true", "UV_COMPILE_BYTECODE=true"}
+)
+
+type Builder struct {
+	config        types.AppConfig
+	scheduler     *scheduler.Scheduler
+	registry      *registry.ImageRegistry
+	containerRepo repository.ContainerRepository
+	backendRepo   repository.BackendRepository
+	tailscale     *network.Tailscale
+	eventBus      *common.EventBus
+	skopeoClient  common.SkopeoClient
+	rdb           *common.RedisClient
+	// existsOverride replaces the registry lookup in tests.
+	existsOverride func(context.Context, string) (bool, error)
+}
+
+func NewBuilder(config types.AppConfig, registry *registry.ImageRegistry, scheduler *scheduler.Scheduler, tailscale *network.Tailscale, containerRepo repository.ContainerRepository, rdb *common.RedisClient) (*Builder, error) {
+	return &Builder{
+		config:        config,
+		scheduler:     scheduler,
+		tailscale:     tailscale,
+		registry:      registry,
+		containerRepo: containerRepo,
+		eventBus:      common.NewEventBus(rdb),
+		skopeoClient:  common.NewSkopeoClient(config),
+		rdb:           rdb,
+	}, nil
+}
+
+var (
+	//go:embed base_requirements.txt
+	basePythonRequirements string
+)
+
+type BaseImage struct {
+	Registry string
+	Repo     string
+	Tag      string
+	Digest   string
+}
+
+func (i *BaseImage) String() string {
+	if i.Digest != "" {
+		return fmt.Sprintf("%s/%s@%s", i.Registry, i.Repo, i.Digest)
+	}
+	return fmt.Sprintf("%s/%s:%s", i.Registry, i.Repo, i.Tag)
+}
+
+// startBuildContainer is used to start the build container and wait for it to be ready
+func (b *Builder) startBuildContainer(ctx context.Context, build *Build) error {
+	if err := build.initializeBuildConfiguration(); err != nil {
+		return err
+	}
+
+	containerRequest, err := build.generateContainerRequest()
+	if err != nil {
+		build.log(true, "Error occured while generating container request: "+err.Error())
+		return err
+	}
+	if err := b.attachPlatformBuildStub(ctx, containerRequest); err != nil {
+		return err
+	}
+
+	if err := b.containerRepo.SetBuildContainerTTL(build.containerID, time.Duration(imageContainerTtlS)*time.Second); err != nil {
+		build.log(true, "Failed to connect to build container.\n")
+		return err
+	}
+
+	if err = b.scheduler.Run(containerRequest); err != nil {
+		build.log(true, err.Error()+"\n")
+		return err
+	}
+
+	hostname, err := b.containerRepo.GetWorkerAddress(ctx, build.containerID)
+	if err != nil {
+		build.log(true, "Failed to connect to build container.\n")
+		return err
+	}
+
+	go b.refreshBuildContainerTTL(ctx, build.containerID)
+
+	build.routeResolver = b.containerRepo
+	return build.connectToHost(hostname, b.tailscale)
+}
+
+// Platform builds need a durable billing identity as well as their admission
+// marker. Credit enforcement resolves stub types after the request is consumed.
+// Ordinary builds do not perform any additional database work here.
+func (b *Builder) attachPlatformBuildStub(ctx context.Context, request *types.ContainerRequest) error {
+	if !request.Stub.Type.IsPlatformWorkload() {
+		return nil
+	}
+	if b.backendRepo == nil {
+		return errors.New("platform build identity: backend unavailable")
+	}
+	// The controller creates this canonical object before minting a deployer
+	// token. Reuse its identity; build context mounts remain request-specific.
+	object, err := b.backendRepo.GetObjectByHash(ctx, abstractions.EmptyStubObjectHash(), request.Workspace.Id)
+	if err != nil {
+		return fmt.Errorf("platform build object: %w", err)
+	}
+	const name = "managed-endpoints-build"
+	app, err := b.backendRepo.GetOrCreateApp(ctx, request.Workspace.Id, name)
+	if err != nil {
+		return fmt.Errorf("platform build app: %w", err)
+	}
+	config := types.StubConfigV1{Runtime: types.Runtime{Cpu: request.Cpu, Memory: request.Memory, ImageId: request.ImageId}}
+	stub, err := b.backendRepo.GetOrCreateStub(ctx, name, types.StubTypePlatformDeployer, config, object.Id, request.Workspace.Id, false, app.Id)
+	if err != nil {
+		return fmt.Errorf("platform build stub: %w", err)
+	}
+	request.StubId = stub.ExternalId
+	request.Stub.Stub = stub
+	return nil
+}
+
+func (b *Builder) waitForBuildContainer(ctx context.Context, build *Build, logsDone <-chan error) error {
+	isV2Build := b.config.ImageService.ClipVersion == uint32(types.ClipVersion2)
+
+	// Set appropriate log message based on build version
+	if isV2Build {
+		build.log(false, fmt.Sprintf("Building image %s\n", build.imageID))
+	} else {
+		build.log(false, "Setting up build container...\n")
+	}
+
+	containerSpinupTimeout := b.calculateContainerSpinupTimeout(ctx, build.opts)
+	retryTicker := time.NewTicker(100 * time.Millisecond)
+	defer retryTicker.Stop()
+	timeoutTicker := time.NewTicker(containerSpinupTimeout)
+	defer timeoutTicker.Stop()
+
+	buildContainerRunning := false
+
+	for !buildContainerRunning {
+		select {
+		case <-ctx.Done():
+			log.Info().Str("container_id", build.containerID).Msg("build was aborted")
+			build.log(true, "Build was aborted.\n")
+			return ctx.Err()
+
+		case <-retryTicker.C:
+			// Check exit code for both v1 and v2 builds
+			exitCode, err := b.containerRepo.GetContainerExitCode(build.containerID)
+			if err == nil {
+				// For v2 builds, exit indicates completion (success or failure)
+				// For v1 builds, non-zero exit indicates premature failure
+				if isV2Build {
+					// Exit status can arrive before the worker's final log records.
+					select {
+					case err := <-logsDone:
+						if err != nil {
+							build.logWarning(fmt.Sprintf("Build log stream interrupted: %v\n", err))
+						}
+					case <-time.After(5 * time.Second):
+						build.logWarning("Timed out waiting for final build logs.\n")
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					if exitCode != 0 {
+						exitCodeMsg := getBuildExitCodeMsg(exitCode, build.opts)
+						build.log(true, fmt.Sprintf("Build failed: %s\n", exitCodeMsg))
+						return errors.New(fmt.Sprintf("build failed: %s", exitCodeMsg))
+					}
+					// Success: buildah build + index creation completed
+					return nil
+				} else if exitCode != 0 {
+					exitCodeMsg := getBuildExitCodeMsg(exitCode, build.opts)
+					time.Sleep(200 * time.Millisecond)
+					build.log(true, fmt.Sprintf("Container exited with error: %s\n", exitCodeMsg))
+					return errors.New(fmt.Sprintf("container exited with error: %s", exitCodeMsg))
+				}
+			}
+
+			// For v1 builds, check if container is running
+			if !isV2Build {
+				r, err := build.getContainerStatus()
+				if err != nil {
+					build.log(true, "Error occurred while checking container status: "+err.Error())
+					return err
+				}
+
+				if r.Running {
+					buildContainerRunning = true
+					continue
+				}
+			}
+
+		case <-timeoutTicker.C:
+			if err := b.stopBuild(build.containerID); err != nil {
+				log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to stop build")
+			}
+
+			timeoutMsg := "Timeout: container not running after %s.\n"
+			if isV2Build {
+				timeoutMsg = "Timeout: build did not complete after %s.\n"
+			}
+			build.log(true, fmt.Sprintf(timeoutMsg, containerSpinupTimeout))
+			return errors.New(fmt.Sprintf(strings.TrimSuffix(timeoutMsg, ".\n"), containerSpinupTimeout))
+		}
+	}
+
+	return nil
+}
+
+// Build user image
+func (b *Builder) Build(ctx context.Context, opts *BuildOpts, outputChan chan common.OutputMsg) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	build, err := NewBuild(ctx, opts, outputChan, b.config)
+	if err != nil {
+		return err
+	}
+
+	// Image ID is already calculated in verifyImage with the final Dockerfile
+	// Just use the imageID from opts (passed from verifyImage via BuildImage)
+	build.imageID, err = getImageID(build.opts)
+	if err != nil {
+		return err
+	}
+	if dockerfile, sourceImage, ok := b.reuseBuiltPrefix(ctx, opts); ok {
+		build.dockerfile, build.sourceImage = dockerfile, sourceImage
+	}
+
+	// Send a stop-build event to the worker if the user cancels the build
+	go b.handleBuildCancellation(ctx, build)
+	defer build.killContainer() // Kill and remove container after the build completes
+
+	build.log(false, fmt.Sprintf("Waiting for build worker (image %s)...\n", build.imageID))
+	err = b.startBuildContainer(ctx, build)
+	if err != nil {
+		build.log(true, "Failed to start build container: "+err.Error())
+		return err
+	}
+
+	logsDone := make(chan error, 1)
+	if build.containerClient != nil {
+		go func() {
+			logsDone <- build.containerClient.StreamLogs(ctx, build.containerID, outputChan)
+		}()
+	} else {
+		logsDone <- nil
+	}
+
+	// Wait for the build container lifecycle to complete
+	err = b.waitForBuildContainer(ctx, build, logsDone)
+	if err != nil {
+		return err
+	}
+
+	// V1: Execute commands in container and archive filesystem
+	// V2: Buildah already built the image
+	isV2 := b.config.ImageService.ClipVersion == uint32(types.ClipVersion2)
+	if !isV2 {
+		if err := build.prepareCommands(); err != nil {
+			return err
+		}
+
+		if err := build.executeCommands(); err != nil {
+			return err
+		}
+
+		if err := build.archive(); err != nil {
+			return err
+		}
+	}
+
+	if isV2 {
+		b.recordBuiltDockerfile(ctx, opts, build.imageID)
+	}
+
+	// Send final completion message with image ID
+	build.setSuccess(true)
+	build.logWithImageAndPythonVersion(true, "Build completed successfully")
+	return nil
+}
+
+// hasWorkToDo returns true if there are build steps that need a Dockerfile
+// This is exported so it can be called from verifyImage
+func (b *Builder) hasWorkToDo(opts *BuildOpts) bool {
+	return len(opts.Commands) > 0 ||
+		len(opts.BuildSteps) > 0 ||
+		len(opts.PythonPackages) > 0 ||
+		len(opts.EnvVars) > 0 ||
+		len(opts.BuildSecrets) > 0 ||
+		(opts.PythonVersion != "" && !opts.IgnorePython)
+}
+
+// dockerfileVarRef matches a $NAME or ${NAME...} reference inside an ENV value,
+// capturing the backslashes before it: an odd run escapes the dollar sign, and
+// the Dockerfile then carries it literally rather than as a reference.
+var dockerfileVarRef = regexp.MustCompile(`(\\*)\$\{?([A-Za-z_][A-Za-z0-9_]*)`)
+
+// referencesAny reports whether value substitutes any of the given variables.
+func referencesAny(value string, names map[string]bool) bool {
+	for _, ref := range dockerfileVarRef.FindAllStringSubmatch(value, -1) {
+		if len(ref[1])%2 == 0 && names[ref[2]] {
+			return true
+		}
+	}
+	return false
+}
+
+// renderEnvVarsAndSecrets adds ENV directives and ARG directives to a Dockerfile
+func renderEnvVarsAndSecrets(sb *strings.Builder, opts *BuildOpts) {
+	// Variables share one ENV instruction where they can: each instruction is
+	// a layer commit, and a commit snapshots the rootfs whatever the step
+	// changed. Substitution within an instruction only sees the environment
+	// before it, so a value that references a variable set earlier in the
+	// same instruction would resolve to the old value; such a variable starts
+	// a new instruction instead.
+	var batch []string
+	defined := map[string]bool{}
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		sb.WriteString("ENV ")
+		sb.WriteString(strings.Join(batch, " "))
+		sb.WriteString("\n")
+		batch = nil
+		clear(defined)
+	}
+	for _, envVar := range opts.EnvVars {
+		if envVar == "" {
+			continue
+		}
+		if name, value, ok := strings.Cut(envVar, "="); ok && name != "" {
+			if referencesAny(value, defined) {
+				flush()
+			}
+			defined[name] = true
+			envVar = name + "=" + quoteDockerfileValue(value)
+		}
+		batch = append(batch, envVar)
+	}
+	flush()
+
+	// Add build secrets as ARG directives
+	// Secrets are mounted at build time using buildah --build-arg flag
+	if len(opts.BuildSecrets) > 0 {
+		for _, secret := range opts.BuildSecrets {
+			if secret != "" {
+				// Extract the secret name (format: NAME=value)
+				parts := strings.SplitN(secret, "=", 2)
+				if len(parts) > 0 {
+					secretName := parts[0]
+					sb.WriteString(fmt.Sprintf("ARG %s\n", secretName))
+				}
+			}
+		}
+	}
+}
+
+// quoteDockerfileValue makes a value safe to sit among others on one ENV line:
+// bare values end at whitespace, so anything containing it or a quote is
+// double-quoted. Values are Dockerfile syntax, as they always were when each
+// had its own ENV line: $VAR expands and \$ is a literal dollar sign, inside
+// quotes as much as outside. Backslashes are therefore kept as written, and
+// only an unescaped double quote needs escaping.
+func quoteDockerfileValue(value string) string {
+	if !strings.ContainsAny(value, " \t\"'") {
+		return value
+	}
+	var quoted strings.Builder
+	quoted.WriteByte('"')
+	escaped := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '"' && !escaped {
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteByte(ch)
+		escaped = ch == '\\' && !escaped
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
+}
+
+// appendToDockerfile appends additional build steps to a custom Dockerfile
+// This is exported so it can be called from verifyImage
+func (b *Builder) appendToDockerfile(opts *BuildOpts) string {
+	var sb strings.Builder
+	sb.WriteString(opts.Dockerfile)
+
+	// Ensure Dockerfile ends with newline before appending
+	if !strings.HasSuffix(opts.Dockerfile, "\n") {
+		sb.WriteString("\n")
+	}
+
+	// Add environment variables and secrets
+	renderEnvVarsAndSecrets(&sb, opts)
+
+	// Determine Python version and environment type
+	pythonVersion := opts.PythonVersion
+	if pythonVersion == types.Python3.String() {
+		pythonVersion = b.config.ImageService.PythonVersion
+	}
+	isMicromamba := strings.Contains(opts.PythonVersion, "micromamba")
+
+	// Install Python if needed
+	// Match the behavior from RenderV2Dockerfile and setupPythonEnv:
+	// - If ignore_python=true AND no packages AND no pip/mamba BuildSteps -> skip Python entirely
+	// - If ignore_python=true BUT has packages OR pip/mamba BuildSteps -> install Python (packages need it)
+	// - If ignore_python=false -> install Python when version specified
+	shouldInstallPython := pythonVersion != "" && (!opts.IgnorePython || len(opts.PythonPackages) > 0 || hasPipOrMambaSteps(opts.BuildSteps))
+
+	if shouldInstallPython {
+		if isMicromamba {
+			sb.WriteString("RUN micromamba config set use_lockfiles False\n")
+		} else {
+			// Install the requested Python version
+			if installCmd, err := getPythonInstallCommand(b.config.ImageService.Runner.PythonStandalone, pythonVersion); err == nil {
+				sb.WriteString("RUN ")
+				sb.WriteString(installCmd)
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	// Install Python packages if specified
+	// Only install if we have packages and we're not in the "ignore Python with no packages" state
+	if len(opts.PythonPackages) > 0 && pythonVersion != "" && (!opts.IgnorePython || len(opts.PythonPackages) > 0) {
+		if pipCmd := generateStandardPipInstallCommand(opts.PythonPackages, pythonVersion, isMicromamba); pipCmd != "" {
+			sb.WriteString("RUN ")
+			sb.WriteString(pipCmd)
+			sb.WriteString("\n")
+		}
+	}
+
+	// Add build steps
+	if len(opts.BuildSteps) > 0 {
+		steps := parseBuildStepsForDockerfile(opts.BuildSteps, pythonVersion, isMicromamba)
+		for _, cmd := range steps {
+			if cmd != "" {
+				sb.WriteString("RUN ")
+				sb.WriteString(cmd)
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	// Add explicit shell commands
+	b.renderCommands(&sb, opts)
+
+	return sb.String()
+}
+
+// hasPipOrMambaSteps checks if there are any pip or micromamba commands in BuildSteps
+func hasPipOrMambaSteps(buildSteps []BuildStep) bool {
+	for _, step := range buildSteps {
+		if step.Type == pipCommandType || step.Type == micromambaCommandType {
+			return true
+		}
+	}
+	return false
+}
+
+// RenderV2Dockerfile converts build options into a Dockerfile that can be built by buildah.
+// The logic mirrors v1's runtime Python detection, but uses static analysis since we can't probe at runtime.
+func (b *Builder) RenderV2Dockerfile(opts *BuildOpts) (string, error) {
+	var sb strings.Builder
+	sb.WriteString("FROM ")
+	sb.WriteString(getSourceImage(opts))
+	sb.WriteString("\n")
+
+	// Add environment variables and secrets
+	renderEnvVarsAndSecrets(&sb, opts)
+
+	// Skip Python setup if explicitly ignored, no packages requested, AND no pip/mamba BuildSteps
+	// This matches v1 behavior in setupPythonEnv()
+	if opts.IgnorePython && len(opts.PythonPackages) == 0 && !hasPipOrMambaSteps(opts.BuildSteps) {
+		// Still need to render shell commands from BuildSteps (from add_commands())
+		if len(opts.BuildSteps) > 0 {
+			steps := parseBuildStepsForDockerfile(opts.BuildSteps, "", false)
+			for _, cmd := range steps {
+				if cmd != "" {
+					sb.WriteString("RUN ")
+					sb.WriteString(cmd)
+					sb.WriteString("\n")
+				}
+			}
+		}
+		b.renderCommands(&sb, opts)
+		return sb.String(), nil
+	}
+
+	// Determine Python version and environment type
+	pythonVersion := opts.PythonVersion
+	if pythonVersion == types.Python3.String() {
+		pythonVersion = b.config.ImageService.PythonVersion
+	}
+	isMicromamba := strings.Contains(opts.PythonVersion, "micromamba")
+
+	// Check if this is a beta9 base image (which already has Python installed)
+	// This mimics v1's runtime check: if python exists in the container, skip installation
+	isBeta9BaseImage := opts.BaseImageName == b.config.ImageService.Runner.BaseImageName &&
+		opts.BaseImageRegistry == b.config.ImageService.Runner.BaseImageRegistry
+
+	// Python environment setup
+	if isMicromamba {
+		sb.WriteString("RUN micromamba config set use_lockfiles False\n")
+	} else if pythonVersion != "" && !isBeta9BaseImage {
+		// Only install Python if NOT a beta9 base image
+		// Beta9 images already have Python, similar to how v1 skips if python probe succeeds
+		if installCmd, err := getPythonInstallCommand(b.config.ImageService.Runner.PythonStandalone, pythonVersion); err != nil {
+			return "", err
+		} else {
+			sb.WriteString("RUN ")
+			sb.WriteString(installCmd)
+			sb.WriteString("\n")
+		}
+	}
+
+	// Install Python packages (works with or without prior Python installation)
+	if len(opts.PythonPackages) > 0 && pythonVersion != "" {
+		if pipCmd := generateStandardPipInstallCommand(opts.PythonPackages, pythonVersion, isMicromamba); pipCmd != "" {
+			sb.WriteString("RUN ")
+			sb.WriteString(pipCmd)
+			sb.WriteString("\n")
+		}
+	}
+
+	// Add build steps (coalesced pip/mamba commands)
+	if len(opts.BuildSteps) > 0 {
+		steps := parseBuildStepsForDockerfile(opts.BuildSteps, pythonVersion, isMicromamba)
+		for _, cmd := range steps {
+			if cmd != "" {
+				sb.WriteString("RUN ")
+				sb.WriteString(cmd)
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	// Add explicit shell commands
+	b.renderCommands(&sb, opts)
+	return sb.String(), nil
+}
+
+// renderCommands adds RUN commands for each non-empty command
+func (b *Builder) renderCommands(sb *strings.Builder, opts *BuildOpts) {
+	for _, cmd := range opts.Commands {
+		if cmd != "" {
+			sb.WriteString("RUN ")
+			sb.WriteString(cmd)
+			sb.WriteString("\n")
+		}
+	}
+}
+
+// Check if an image already exists in the registry
+func (b *Builder) Exists(ctx context.Context, imageId string) (bool, error) {
+	return b.registry.Exists(ctx, imageId)
+}
+
+func (b *Builder) refreshBuildContainerTTL(ctx context.Context, containerId string) {
+	ticker := time.NewTicker(time.Duration(buildContainerKeepAliveIntervalS) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshed, err := b.containerRepo.RefreshBuildContainerTTL(containerId, time.Duration(imageContainerTtlS)*time.Second)
+			if err != nil {
+				log.Error().Str("container_id", containerId).Err(err).Msg("failed to refresh build container ttl")
+				continue
+			}
+			if !refreshed {
+				return
+			}
+		}
+	}
+}
+
+var imageNamePattern = regexp.MustCompile(
+	`^` + // Assert position at the start of the string
+		`(?:(?P<Registry>(?:(?:localhost|[\w.-]+(?:\.[\w.-]+)+)(?::\d+)?)|[\w]+:\d+)\/)?` + // Optional registry, which can be localhost, a domain with optional port, or a simple registry with port
+		`(?P<Repo>(?:[\w][\w.-]*(?:/[\w][\w.-]*)*))?` + // Full repository path including namespace
+		`(?::(?P<Tag>[\w][\w.-]{0,127}))?` + // Optional tag, which starts with a word character and can contain word characters, dots, and hyphens
+		`(?:@(?P<Digest>[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9A-Fa-f]{32,}))?` + // Optional digest, which is a hash algorithm followed by a colon and a hexadecimal hash
+		`$`, // Assert position at the end of the string
+)
+
+func ExtractImageNameAndTag(imageRef string) (BaseImage, error) {
+	if imageRef == "" {
+		return BaseImage{}, errors.New("invalid image URI format")
+	}
+
+	matches := imageNamePattern.FindStringSubmatch(imageRef)
+	if matches == nil {
+		return BaseImage{}, errors.New("invalid image URI format")
+	}
+
+	result := make(map[string]string)
+	for i, name := range imageNamePattern.SubexpNames() {
+		if i > 0 && name != "" {
+			result[name] = matches[i]
+		}
+	}
+
+	registry := result["Registry"]
+	if registry == "" {
+		registry = dockerHubRegistry
+	}
+
+	repo := result["Repo"]
+	if repo == "" {
+		return BaseImage{}, errors.New("invalid image URI format")
+	}
+
+	tag, digest := result["Tag"], result["Digest"]
+	if tag == "" && digest == "" {
+		tag = "latest"
+	}
+
+	return BaseImage{
+		Registry: registry,
+		Repo:     repo,
+		Tag:      tag,
+		Digest:   digest,
+	}, nil
+}
+
+func (b *Builder) stopBuild(containerId string) error {
+	events := []struct {
+		eventType common.EventType
+		errorMsg  string
+	}{
+		{eventType: common.EventTypeStopBuild, errorMsg: "failed to send stop build event"},
+		{eventType: common.StopBuildEventType(containerId), errorMsg: "failed to send legacy stop build event"},
+	}
+
+	for _, event := range events {
+		_, err := b.eventBus.Send(&common.Event{
+			Type:          event.eventType,
+			Args:          map[string]any{"container_id": containerId},
+			LockAndDelete: false,
+		})
+		if err != nil {
+			log.Error().Err(err).Msg(event.errorMsg)
+			return err
+		}
+	}
+
+	log.Info().Str("container_id", containerId).Msg("sent stop build event")
+	return nil
+}
+
+func (b *Builder) handleBuildCancellation(ctx context.Context, build *Build) {
+	<-ctx.Done()
+	if build.success.Load() {
+		return
+	}
+	err := b.stopBuild(build.containerID)
+	if err != nil {
+		log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to stop build")
+	}
+
+	if build.containerClient == nil {
+		if err := b.containerRepo.DeleteContainerState(build.containerID); err != nil {
+			log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to delete pending build container state")
+		}
+		return
+	}
+
+	err = b.containerRepo.UpdateContainerStatus(build.containerID, types.ContainerStatusStopping, types.ContainerStateTtlSWhileStopping)
+	if err != nil {
+		log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to update container status")
+	}
+
+	if err := build.killContainer(); err != nil {
+		log.Error().Str("container_id", build.containerID).Err(err).Msg("failed to kill build container")
+	}
+}
+
+func (b *Builder) calculateContainerSpinupTimeout(ctx context.Context, opts *BuildOpts) time.Duration {
+	switch {
+	case opts.Dockerfile != "":
+		return dockerfileContainerSpinupTimeout
+	case opts.ExistingImageUri != "":
+		sourceImage := getSourceImage(opts)
+		imageMetadata, err := b.skopeoClient.Inspect(ctx, sourceImage, opts.BaseImageCreds, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to inspect image")
+			return defaultContainerSpinupTimeout
+		}
+
+		imageSizeBytes := 0
+		for _, layer := range imageMetadata.LayersData {
+			imageSizeBytes += layer.Size
+		}
+
+		timePerByte := time.Duration(b.config.ImageService.ArchiveNanosecondsPerByte) * time.Nanosecond
+		timeLimit := timePerByte * time.Duration(imageSizeBytes) * 10
+		log.Info().Int("image_size", imageSizeBytes).Msgf("estimated time to prepare new base image: %s", timeLimit.String())
+		return timeLimit
+	default:
+		return defaultContainerSpinupTimeout
+	}
+}
+
+func getSourceImage(opts *BuildOpts) string {
+	var sourceImage string
+	switch {
+	case opts.BaseImageDigest != "":
+		sourceImage = fmt.Sprintf("%s/%s@%s", opts.BaseImageRegistry, opts.BaseImageName, opts.BaseImageDigest)
+	default:
+		sourceImage = fmt.Sprintf("%s/%s:%s", opts.BaseImageRegistry, opts.BaseImageName, opts.BaseImageTag)
+	}
+	return sourceImage
+}
+
+func getImageTagOrDigest(digest string, tag string) string {
+	if tag != "" {
+		return tag
+	}
+	return digest
+}
+
+func getBuildExitCodeMsg(exitCode int, opts *BuildOpts) string {
+	if exitCode == int(types.ContainerExitCodeInvalidCustomImage) && opts != nil && opts.ExistingImageUri != "" {
+		return fmt.Sprintf(
+			"InvalidCustomImage: %s was not found, or its registry requires credentials. Check the image name and tag; for a private image, pass registry credentials.",
+			getSourceImage(opts),
+		)
+	}
+	return getExitCodeMsg(exitCode)
+}
+
+func getExitCodeMsg(exitCode int) string {
+	msg, ok := types.WorkerContainerExitCodes[types.ContainerExitCode(exitCode)]
+	if !ok || exitCode == int(types.ContainerExitCodeUnknownError) {
+		return fmt.Sprintf("build container exited with code %d", exitCode)
+	}
+	return msg
+}

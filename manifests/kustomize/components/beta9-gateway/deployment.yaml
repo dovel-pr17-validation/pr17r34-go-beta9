@@ -1,0 +1,96 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: gateway
+  name: beta9-gateway
+  namespace: beta9
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: gateway
+      app.kubernetes.io/name: beta9
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: gateway
+        app.kubernetes.io/name: beta9
+    spec:
+      automountServiceAccountToken: true
+      # 180s gateway shutdownTimeout + 10s readiness propagation + 5s buffer.
+      terminationGracePeriodSeconds: 195
+      initContainers:
+      - name: wait-on-backends
+        image: busybox:1.37.0
+        command:
+        - sh
+        - -c
+        - |
+          until nc -z postgresql 5432; do echo "Waiting on PostgreSQL..."; sleep 2; done;
+          until nc -z redis-master 6379; do echo "Waiting on Redis..."; sleep 2; done;
+          echo "All systems ready!"
+      containers:
+      - command:
+        - /usr/local/bin/gateway
+        env:
+        - name: CONFIG_PATH
+          value: /etc/beta9/.config.yaml
+        image: registry.localhost:5000/beta9-gateway:latest
+        name: main
+        readinessProbe:
+          initialDelaySeconds: 5
+          successThreshold: 2
+          failureThreshold: 2
+          periodSeconds: 3
+          timeoutSeconds: 1
+          grpc:
+            port: 1993
+            service: readiness
+        livenessProbe:
+          initialDelaySeconds: 10
+          successThreshold: 1
+          failureThreshold: 10
+          periodSeconds: 3
+          timeoutSeconds: 1
+          grpc:
+            port: 1993
+            service: liveness
+        startupProbe:
+          periodSeconds: 3
+          timeoutSeconds: 1
+          failureThreshold: 100
+          grpc:
+            port: 1993
+            service: liveness
+        resources:
+          limits:
+            cpu: 4000m
+            memory: 4Gi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /etc/beta9
+          name: config
+        - mountPath: /images
+          name: images
+      dnsPolicy: ClusterFirst
+      enableServiceLinks: true
+      hostIPC: false
+      hostNetwork: false
+      hostPID: false
+      serviceAccountName: gateway
+      volumes:
+      - name: config
+        secret:
+          secretName: beta9-config
+      - name: images
+        persistentVolumeClaim:
+          claimName: beta9-images

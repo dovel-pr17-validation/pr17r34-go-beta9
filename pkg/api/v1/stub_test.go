@@ -1,0 +1,1444 @@
+package apiv1
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"bytes"
+	"io"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/common"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	repocommon "github.com/beam-cloud/beta9/pkg/repository/common"
+	"github.com/beam-cloud/beta9/pkg/types"
+	"github.com/labstack/echo/v4"
+	"k8s.io/utils/ptr"
+)
+
+type sandboxRowsEventRepo struct {
+	repository.EventRepository
+	history          *types.EventHistoryResponse
+	workspaceHistory *types.EventHistoryResponse
+	historiesByStub  map[string]*types.EventHistoryResponse
+	containers       map[string]*types.ContainerEventsResponse
+	queries          []types.EventQuery
+	containerQueries []types.EventQuery
+	mu               sync.Mutex
+}
+
+type sandboxHistoryBackendRepo struct {
+	repository.BackendRepository
+	stubs []types.StubWithRelated
+}
+
+func (r sandboxHistoryBackendRepo) ListStubs(context.Context, types.StubFilter) ([]types.StubWithRelated, error) {
+	return r.stubs, nil
+}
+
+func (r sandboxHistoryBackendRepo) ListStubsPaginated(context.Context, types.StubFilter) (repocommon.CursorPaginationInfo[types.StubWithRelated], error) {
+	return repocommon.CursorPaginationInfo[types.StubWithRelated]{Data: r.stubs}, nil
+}
+
+type unexpectedSandboxRealtimeRepo struct {
+	repository.EventRepository
+	repository.ContainerRepository
+	calls int
+}
+
+func (r *unexpectedSandboxRealtimeRepo) GetEventHistory(context.Context, types.EventQuery) (*types.EventHistoryResponse, error) {
+	r.calls++
+	return nil, errors.New("unexpected sandbox event history query")
+}
+
+func (r *unexpectedSandboxRealtimeRepo) GetContainerEvents(context.Context, string, types.EventQuery) (*types.ContainerEventsResponse, error) {
+	r.calls++
+	return nil, errors.New("unexpected sandbox container event query")
+}
+
+func (r *unexpectedSandboxRealtimeRepo) GetActiveContainersByWorkspaceId(string) ([]types.ContainerState, error) {
+	r.calls++
+	return nil, errors.New("unexpected active container query")
+}
+
+func (r *sandboxRowsEventRepo) GetEventHistory(_ context.Context, query types.EventQuery) (*types.EventHistoryResponse, error) {
+	r.mu.Lock()
+	r.queries = append(r.queries, query)
+	r.mu.Unlock()
+	if r.historiesByStub != nil && query.StubID != "" {
+		return r.historiesByStub[query.StubID], nil
+	}
+	if query.AppID == "" && query.StubID == "" && r.workspaceHistory != nil {
+		return r.workspaceHistory, nil
+	}
+	return r.history, nil
+}
+
+func (r *sandboxRowsEventRepo) GetContainerEvents(_ context.Context, containerID string, query types.EventQuery) (*types.ContainerEventsResponse, error) {
+	query.ContainerID = containerID
+	r.containerQueries = append(r.containerQueries, query)
+	return r.containers[containerID], nil
+}
+
+func NewStubGroupForTest() *StubGroup {
+	backendRepo, _ := repository.NewBackendPostgresRepositoryForTest()
+
+	config := types.AppConfig{
+		GatewayService: types.GatewayServiceConfig{
+			StubLimits: types.StubLimits{
+				Cpu:         128000,
+				Memory:      40000,
+				MaxGpuCount: 2,
+			},
+		},
+	}
+
+	e := echo.New()
+
+	return NewStubGroup(
+		e.Group("/stubs"),
+		backendRepo,
+		nil,
+		repository.NewEventClientRepo(config),
+		nil,
+		config,
+	)
+}
+
+type stubConfigBackendRepo struct {
+	repository.BackendRepository
+	stub types.StubWithRelated
+}
+
+func (r *stubConfigBackendRepo) GetStubByExternalId(context.Context, string, ...types.QueryFilter) (*types.StubWithRelated, error) {
+	stub := r.stub
+	return &stub, nil
+}
+
+func TestGetStubConfigPublicAccessAndOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		public    bool
+		workspace uint
+		status    int
+	}{
+		{"anonymous public", true, 0, http.StatusOK},
+		{"anonymous private", false, 0, http.StatusNotFound},
+		{"owner private", false, 1, http.StatusOK},
+		{"foreign private", false, 2, http.StatusNotFound},
+		{"foreign public", true, 2, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := echo.New()
+			if tc.workspace != 0 {
+				e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+					return func(ctx echo.Context) error {
+						return next(&auth.HttpAuthContext{Context: ctx, AuthInfo: &auth.AuthInfo{Workspace: &types.Workspace{Id: tc.workspace}}})
+					}
+				})
+			}
+			repo := &stubConfigBackendRepo{stub: types.StubWithRelated{Stub: types.Stub{
+				ExternalId: "stub", WorkspaceId: 1, Public: tc.public,
+				Config: `{"python_version":"python3.11","runtime":{"cpu":1000},"env":["HIDDEN=value"],"secrets":[{"name":"secret-name","value":"secret-value"}]}`,
+			}}}
+			NewStubGroup(e.Group("/stub"), repo, nil, nil, nil, types.AppConfig{})
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/stub/stub/config", nil))
+			if response.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", response.Code, tc.status, response.Body.String())
+			}
+			if response.Code == http.StatusOK && !strings.Contains(response.Body.String(), `"python_version":"python3.11"`) {
+				t.Fatalf("limited config missing: %s", response.Body.String())
+			}
+			for _, hidden := range []string{"HIDDEN", "secret-name", "secret-value"} {
+				if strings.Contains(response.Body.String(), hidden) {
+					t.Fatalf("config response exposed %q", hidden)
+				}
+			}
+		})
+	}
+}
+
+func TestSandboxHistoryQueryKeyDoesNotAliasDelimitedInput(t *testing.T) {
+	left, err := sandboxHistoryQueryKey(types.EventQuery{WorkspaceID: "workspace", AppID: "app\x00stub", StubID: "container"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := sandboxHistoryQueryKey(types.EventQuery{WorkspaceID: "workspace", AppID: "app", StubID: "stub\x00container"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left == right {
+		t.Fatal("distinct sandbox history queries produced the same coalescing key")
+	}
+	if len(left) != sha256.Size {
+		t.Fatalf("coalescing key length = %d, want %d", len(left), sha256.Size)
+	}
+}
+
+func TestAcquireSandboxHistoryQuerySlotBoundsConcurrencyAndHonorsCancellation(t *testing.T) {
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{}
+	if err := acquireSandboxHistoryQuerySlot(context.Background(), slots, 0); !errors.Is(err, errSandboxHistoryBusy) {
+		t.Fatalf("slot acquisition error = %v, want capacity exhausted", err)
+	}
+	if len(slots) != 1 {
+		t.Fatalf("slot count = %d, want the original holder only", len(slots))
+	}
+
+	available := make(chan struct{}, 1)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := acquireSandboxHistoryQuerySlot(canceled, available, time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled slot acquisition error = %v, want context canceled", err)
+	}
+	if len(available) != 0 {
+		t.Fatal("pre-canceled acquisition consumed an available slot")
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- acquireSandboxHistoryQuerySlot(context.Background(), slots, time.Second)
+	}()
+	<-slots
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("bounded admission did not accept a released slot: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded admission did not complete")
+	}
+	<-slots
+}
+
+func TestSandboxHistoryCapacityReturnsRetryableError(t *testing.T) {
+	previousSlots := sandboxHistoryQuerySlots
+	sandboxHistoryQuerySlots = make(chan struct{}, 1)
+	sandboxHistoryQuerySlots <- struct{}{}
+	t.Cleanup(func() { sandboxHistoryQuerySlots = previousSlots })
+
+	handlers := map[string]func(*StubGroup, echo.Context) error{
+		"list":  func(group *StubGroup, ctx echo.Context) error { return group.ListSandboxes(ctx) },
+		"stats": func(group *StubGroup, ctx echo.Context) error { return group.GetSandboxStats(ctx) },
+	}
+	for name, handler := range handlers {
+		t.Run(name, func(t *testing.T) {
+			group := &StubGroup{
+				backendRepo: sandboxHistoryBackendRepo{stubs: []types.StubWithRelated{{Stub: types.Stub{ExternalId: "sandbox-stub"}}}},
+				eventRepo:   &sandboxRowsEventRepo{history: &types.EventHistoryResponse{}},
+			}
+			e := echo.New()
+			recorder := httptest.NewRecorder()
+			ctx := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), recorder)
+			ctx.SetParamNames("workspaceId")
+			ctx.SetParamValues("workspace")
+
+			err := handler(group, ctx)
+			var httpErr *echo.HTTPError
+			if !errors.As(err, &httpErr) || httpErr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("handler error = %v, want HTTP 503", err)
+			}
+			if got := recorder.Header().Get("Retry-After"); got != "1" {
+				t.Fatalf("Retry-After = %q, want 1", got)
+			}
+		})
+	}
+}
+
+func TestEmptySandboxHandlersSkipRealtimeRepositories(t *testing.T) {
+	run := func(t *testing.T, url string, handler func(*StubGroup, echo.Context) error) *httptest.ResponseRecorder {
+		t.Helper()
+		realtimeRepo := &unexpectedSandboxRealtimeRepo{}
+		group := &StubGroup{
+			backendRepo:   sandboxHistoryBackendRepo{},
+			eventRepo:     realtimeRepo,
+			containerRepo: realtimeRepo,
+		}
+		recorder := httptest.NewRecorder()
+		ctx := echo.New().NewContext(httptest.NewRequest(http.MethodGet, url, nil), recorder)
+		ctx.SetParamNames("workspaceId")
+		ctx.SetParamValues("workspace")
+		if err := handler(group, ctx); err != nil {
+			t.Fatalf("handler returned error: %v", err)
+		}
+		if recorder.Code != http.StatusOK || realtimeRepo.calls != 0 {
+			t.Fatalf("status = %d, realtime calls = %d; want 200 and 0", recorder.Code, realtimeRepo.calls)
+		}
+		return recorder
+	}
+
+	t.Run("list", func(t *testing.T) {
+		recorder := run(t, "/?app_id=app-1", func(group *StubGroup, ctx echo.Context) error { return group.ListSandboxes(ctx) })
+		if got := recorder.Body.String(); got != "{\"data\":[],\"next\":\"\"}\n" {
+			t.Fatalf("response = %q, want an empty data array", got)
+		}
+	})
+
+	t.Run("stats", func(t *testing.T) {
+		recorder := run(t, "/?app_id=app-1&chart_range=last_day", func(group *StubGroup, ctx echo.Context) error { return group.GetSandboxStats(ctx) })
+		var response SandboxStatsResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if response.Concurrent != 0 || response.TotalCreated != 0 || response.RatePerSecond != 0 {
+			t.Fatalf("non-zero empty stats response: %#v", response)
+		}
+		if len(response.StatusCounts) != 5 || len(response.CreatedBuckets) != 60 {
+			t.Fatalf("empty stats shape = %d statuses, %d buckets; want 5 and 60", len(response.StatusCounts), len(response.CreatedBuckets))
+		}
+		for _, bucket := range response.CreatedBuckets {
+			if bucket.Timestamp.IsZero() || bucket.Count != 0 {
+				t.Fatalf("invalid empty bucket: %#v", bucket)
+			}
+		}
+	})
+}
+
+func TestBuildSandboxRowsDoesNotReloadPreloadedEmptyHistory(t *testing.T) {
+	repo := &sandboxRowsEventRepo{history: &types.EventHistoryResponse{}}
+	group := &StubGroup{eventRepo: repo}
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		ExternalId: "sandbox-stub",
+		Name:       "sandbox",
+		CreatedAt:  types.Time{Time: time.Now().UTC()},
+	}}
+
+	rows := group.buildSandboxRowsWithPreloadedSummaries(context.Background(), "workspace", stub, nil, 50, []sandboxContainerSummary{})
+	if len(rows) != 1 || rows[0].Status != SandboxStatusStopped {
+		t.Fatalf("rows = %+v, want one stopped fallback", rows)
+	}
+	repo.mu.Lock()
+	queryCount := len(repo.queries)
+	repo.mu.Unlock()
+	if queryCount != 0 {
+		t.Fatalf("event history queries = %d, want 0 after preload", queryCount)
+	}
+}
+
+// NewStubGroupWithMockForTest creates a StubGroup with a mock repository for testing
+func NewStubGroupWithMockForTest() (*StubGroup, sqlmock.Sqlmock, *echo.Echo) {
+	backendRepo, mock := repository.NewBackendPostgresRepositoryForTest()
+
+	config := types.AppConfig{
+		GatewayService: types.GatewayServiceConfig{
+			StubLimits: types.StubLimits{
+				Cpu:         128000,
+				Memory:      40000,
+				MaxGpuCount: 2,
+			},
+		},
+	}
+
+	e := echo.New()
+
+	stubGroup := NewStubGroup(
+		e.Group("/stubs"),
+		backendRepo,
+		nil,
+		repository.NewEventClientRepo(config),
+		nil,
+		config,
+	)
+
+	return stubGroup, mock, e
+}
+
+func generateDefaultStubWithConfig() *types.Stub {
+	return &types.Stub{
+		Name:   "Test Stub",
+		Config: `{"runtime":{"cpu":1000,"gpu":"","gpu_count":0,"memory":1000,"image_id":"","gpus":[]},"handler":"","on_start":"","on_deploy":"","on_deploy_stub_id":"","python_version":"python3","keep_warm_seconds":600,"max_pending_tasks":100,"callback_url":"","task_policy":{"max_retries":3,"timeout":3600,"expires":"0001-01-01T00:00:00Z","ttl":0},"workers":1,"concurrent_requests":1,"authorized":false,"volumes":null,"autoscaler":{"type":"queue_depth","max_containers":1,"tasks_per_container":1,"min_containers":0},"extra":{},"checkpoint_enabled":false,"work_dir":"","entry_point":["sleep 100"],"ports":[]}`,
+	}
+}
+
+func TestBuildSandboxRowsReturnsOneRowPerRecentContainer(t *testing.T) {
+	base := time.Date(2026, 6, 16, 20, 1, 0, 0, time.UTC)
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		ExternalId: "sandbox-stub",
+		Name:       "sandbox",
+		CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+	}}
+
+	group := &StubGroup{eventRepo: &sandboxRowsEventRepo{
+		history: &types.EventHistoryResponse{Events: []types.ContainerEventRecord{
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(1 * time.Second)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", StubID: "sandbox-stub", StartTime: base.Add(1 * time.Second), EndTime: base.Add(1044 * time.Millisecond)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(1250 * time.Millisecond)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(2 * time.Second)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", StartTime: base.Add(2 * time.Second), EndTime: base.Add(2044 * time.Millisecond)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(2250 * time.Millisecond)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-33333333", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(3 * time.Second)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-33333333", WorkspaceID: "workspace", StubID: "sandbox-stub", StartTime: base.Add(3 * time.Second), EndTime: base.Add(3044 * time.Millisecond)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-33333333", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(3250 * time.Millisecond)},
+		}},
+	}}
+
+	rows := group.buildSandboxRows(context.Background(), "workspace", stub, nil, 0)
+	if got, want := len(rows), 3; got != want {
+		t.Fatalf("expected %d sandbox rows, got %d", want, got)
+	}
+
+	expectedContainerIDs := []string{"sandbox-stub-33333333", "sandbox-stub-22222222", "sandbox-stub-11111111"}
+	for i, expectedContainerID := range expectedContainerIDs {
+		row := rows[i]
+		if row.Id != expectedContainerID {
+			t.Fatalf("row %d id = %q, want container id %q", i, row.Id, expectedContainerID)
+		}
+		if row.StubId != "sandbox-stub" {
+			t.Fatalf("row %d stub_id = %q, want stub id", i, row.StubId)
+		}
+		if row.ContainerId != expectedContainerID {
+			t.Fatalf("row %d container_id = %q, want %q", i, row.ContainerId, expectedContainerID)
+		}
+		if row.Status != SandboxStatusStopped {
+			t.Fatalf("row %d status = %q, want %q", i, row.Status, SandboxStatusStopped)
+		}
+		if row.TimeToStartedMs == nil || *row.TimeToStartedMs != 44 {
+			t.Fatalf("row %d time_to_started_ms = %v, want 44", i, row.TimeToStartedMs)
+		}
+		if row.TimeToInteractiveMs == nil || *row.TimeToInteractiveMs != 44 {
+			t.Fatalf("row %d time_to_interactive_ms = %v, want 44", i, row.TimeToInteractiveMs)
+		}
+	}
+}
+
+func TestBuildSandboxRowsAppliesMaxRows(t *testing.T) {
+	base := time.Date(2026, 6, 16, 20, 1, 0, 0, time.UTC)
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		ExternalId: "sandbox-stub",
+		Name:       "sandbox",
+		CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+	}}
+
+	group := &StubGroup{eventRepo: &sandboxRowsEventRepo{
+		history: &types.EventHistoryResponse{Events: []types.ContainerEventRecord{
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(1 * time.Second)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(2 * time.Second)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-33333333", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(3 * time.Second)},
+		}},
+	}}
+
+	rows := group.buildSandboxRows(context.Background(), "workspace", stub, nil, 2)
+	if got, want := len(rows), 2; got != want {
+		t.Fatalf("expected %d sandbox rows, got %d", want, got)
+	}
+	if rows[0].ContainerId != "sandbox-stub-33333333" || rows[1].ContainerId != "sandbox-stub-22222222" {
+		t.Fatalf("unexpected limited rows: %#v", rows)
+	}
+}
+
+func TestBuildSandboxRowsReturnsEveryActiveContainer(t *testing.T) {
+	base := time.Date(2026, 6, 16, 20, 1, 0, 0, time.UTC)
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		ExternalId: "sandbox-stub",
+		Name:       "sandbox",
+		CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+	}}
+
+	group := &StubGroup{}
+	rows := group.buildSandboxRows(context.Background(), "workspace", stub, []types.ContainerState{
+		{
+			ContainerId: "sandbox-stub-11111111",
+			StubId:      "sandbox-stub",
+			Status:      types.ContainerStatusRunning,
+			ScheduledAt: base.Add(1 * time.Second).Unix(),
+			StartedAt:   base.Add(2 * time.Second).Unix(),
+		},
+		{
+			ContainerId: "sandbox-stub-22222222",
+			StubId:      "sandbox-stub",
+			Status:      types.ContainerStatusPending,
+			ScheduledAt: base.Add(3 * time.Second).Unix(),
+		},
+	}, 0)
+	if got, want := len(rows), 2; got != want {
+		t.Fatalf("expected %d sandbox rows, got %d", want, got)
+	}
+	if rows[0].ContainerId != "sandbox-stub-22222222" || rows[1].ContainerId != "sandbox-stub-11111111" {
+		t.Fatalf("unexpected container ordering: %#v", rows)
+	}
+	if rows[0].Id != rows[0].ContainerId || rows[1].Id != rows[1].ContainerId {
+		t.Fatalf("expected active sandbox ids to match container ids: %#v", rows)
+	}
+	if rows[0].StubId != "sandbox-stub" || rows[1].StubId != "sandbox-stub" {
+		t.Fatalf("expected active sandbox stub ids to be preserved: %#v", rows)
+	}
+	if rows[0].Status != SandboxStatusPending {
+		t.Fatalf("pending row status = %q, want %q", rows[0].Status, SandboxStatusPending)
+	}
+	if rows[1].Status != SandboxStatusRunning {
+		t.Fatalf("running row status = %q, want %q", rows[1].Status, SandboxStatusRunning)
+	}
+}
+
+func TestBuildSandboxRowsEnrichesActiveTimingFromHistory(t *testing.T) {
+	base := time.Now().Add(-2 * time.Minute).UTC().Truncate(time.Millisecond)
+	stub := &types.StubWithRelated{Stub: types.Stub{
+		ExternalId: "sandbox-stub",
+		Name:       "sandbox",
+		CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+	}}
+
+	eventRepo := &sandboxRowsEventRepo{
+		history: &types.EventHistoryResponse{Events: []types.ContainerEventRecord{
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", StubID: "sandbox-stub", StartTime: base.Add(100 * time.Millisecond), EndTime: base.Add(1500 * time.Millisecond)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSandboxProcessManagerReady), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", StubID: "sandbox-stub", StartTime: base.Add(1500 * time.Millisecond), EndTime: base.Add(2500 * time.Millisecond)},
+		}},
+	}
+	group := &StubGroup{eventRepo: eventRepo}
+
+	rows := group.buildSandboxRows(context.Background(), "workspace", stub, []types.ContainerState{
+		{
+			ContainerId: "sandbox-stub-11111111",
+			StubId:      "sandbox-stub",
+			Status:      types.ContainerStatusRunning,
+			ScheduledAt: base.Unix(),
+			StartedAt:   base.Add(time.Second).Unix(),
+		},
+	}, 1)
+	if got, want := len(rows), 1; got != want {
+		t.Fatalf("expected %d sandbox rows, got %d", want, got)
+	}
+	if got := len(eventRepo.queries); got != 1 {
+		t.Fatalf("expected active row timing to query history despite full page, got %d queries", got)
+	}
+
+	row := rows[0]
+	if !row.CreatedAt.Equal(base) {
+		t.Fatalf("created_at = %s, want lifecycle created_at %s", row.CreatedAt, base)
+	}
+	if row.TimeToStartedMs == nil || *row.TimeToStartedMs != 1500 {
+		t.Fatalf("time_to_started_ms = %v, want 1500", row.TimeToStartedMs)
+	}
+	if row.TimeToInteractiveMs == nil || *row.TimeToInteractiveMs != 2500 {
+		t.Fatalf("time_to_interactive_ms = %v, want 2500", row.TimeToInteractiveMs)
+	}
+	wantStartedAtMs := base.Add(1500 * time.Millisecond).UnixMilli()
+	if row.StartedAtMs == nil || *row.StartedAtMs != wantStartedAtMs {
+		t.Fatalf("started_at_ms = %v, want %d", row.StartedAtMs, wantStartedAtMs)
+	}
+	wantInteractiveAtMs := base.Add(2500 * time.Millisecond).UnixMilli()
+	if row.InteractiveAtMs == nil || *row.InteractiveAtMs != wantInteractiveAtMs {
+		t.Fatalf("interactive_at_ms = %v, want %d", row.InteractiveAtMs, wantInteractiveAtMs)
+	}
+	if row.LifetimeMs == nil || *row.LifetimeMs <= 0 {
+		t.Fatalf("lifetime_ms = %v, want a positive running lifetime", row.LifetimeMs)
+	}
+}
+
+func TestBuildSandboxStatsRowsUsesAppHistoryForAppNamespaceStats(t *testing.T) {
+	base := time.Date(2026, 6, 16, 20, 1, 0, 0, time.UTC)
+	stubs := []types.StubWithRelated{{
+		Stub: types.Stub{
+			ExternalId: "sandbox-stub",
+			Name:       "sandbox",
+			CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+		},
+	}}
+
+	eventRepo := &sandboxRowsEventRepo{
+		history: &types.EventHistoryResponse{Events: []types.ContainerEventRecord{
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(1 * time.Second)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(1250 * time.Millisecond)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(2 * time.Second)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(2250 * time.Millisecond)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-33333333", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(3 * time.Second)},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-33333333", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(3250 * time.Millisecond)},
+		}},
+	}
+	group := &StubGroup{eventRepo: eventRepo}
+
+	rows := group.buildSandboxStatsRows(context.Background(), "workspace", "app-1", stubs, nil)
+	if got, want := len(rows), 3; got != want {
+		t.Fatalf("expected %d sandbox stats rows, got %d", want, got)
+	}
+	if got := len(eventRepo.queries); got != 2 {
+		t.Fatalf("expected app and bounded stub fallback history queries, got %d", got)
+	}
+	var foundAppQuery, foundStubQuery bool
+	for _, query := range eventRepo.queries {
+		if query.AppID == "app-1" && query.StubID == "" {
+			foundAppQuery = true
+		}
+		if query.AppID == "" && query.StubID == "sandbox-stub" {
+			foundStubQuery = true
+		}
+	}
+	if !foundAppQuery || !foundStubQuery {
+		t.Fatalf("expected app and stub fallback queries, got %#v", eventRepo.queries)
+	}
+}
+
+func TestBuildSandboxStatsRowsMergesStubFallbackForPartialAppHistory(t *testing.T) {
+	base := time.Date(2026, 6, 16, 20, 1, 0, 0, time.UTC)
+	stubs := []types.StubWithRelated{{
+		Stub: types.Stub{
+			ExternalId: "sandbox-stub",
+			Name:       "sandbox",
+			CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+		},
+	}}
+
+	appHistory := []types.ContainerEventRecord{
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base},
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(100 * time.Millisecond), EndTime: base.Add(900 * time.Millisecond)},
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSandboxProcessManagerReady), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(900 * time.Millisecond), EndTime: base.Add(1200 * time.Millisecond)},
+		{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(2 * time.Second)},
+	}
+	stubHistory := append([]types.ContainerEventRecord{}, appHistory...)
+	stubHistory = append(stubHistory,
+		types.ContainerEventRecord{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(10 * time.Second)},
+		types.ContainerEventRecord{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", StartTime: base.Add(10*time.Second + 100*time.Millisecond), EndTime: base.Add(11 * time.Second)},
+		types.ContainerEventRecord{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSandboxProcessManagerReady), ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", StartTime: base.Add(11 * time.Second), EndTime: base.Add(12 * time.Second)},
+		types.ContainerEventRecord{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-22222222", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(13 * time.Second)},
+	)
+
+	eventRepo := &sandboxRowsEventRepo{
+		history: &types.EventHistoryResponse{Events: appHistory},
+		historiesByStub: map[string]*types.EventHistoryResponse{
+			"sandbox-stub": {Events: stubHistory},
+		},
+	}
+	group := &StubGroup{eventRepo: eventRepo}
+
+	rows := group.buildSandboxStatsRows(context.Background(), "workspace", "app-1", stubs, nil)
+	if got, want := len(rows), 2; got != want {
+		t.Fatalf("expected %d sandbox stats rows, got %d", want, got)
+	}
+
+	rowsByContainer := map[string]SandboxRow{}
+	for _, row := range rows {
+		rowsByContainer[row.ContainerId] = row
+	}
+	if _, ok := rowsByContainer["sandbox-stub-11111111"]; !ok {
+		t.Fatalf("missing app-history row: %#v", rows)
+	}
+	fallback := rowsByContainer["sandbox-stub-22222222"]
+	if fallback.TimeToInteractiveMs == nil || *fallback.TimeToInteractiveMs != 2000 {
+		t.Fatalf("fallback time_to_interactive_ms = %v, want 2000", fallback.TimeToInteractiveMs)
+	}
+	if fallback.LifetimeMs == nil || *fallback.LifetimeMs != 2000 {
+		t.Fatalf("fallback lifetime_ms = %v, want 2000", fallback.LifetimeMs)
+	}
+	for _, query := range eventRepo.queries {
+		if query.AppID == "" && query.StubID == "" {
+			t.Fatalf("unexpected workspace-wide history query when scoped history was available: %#v", query)
+		}
+	}
+}
+
+func TestSandboxStatsContainerSummariesUsesWorkspaceFallbackOnlyWhenScopedHistoryIsEmpty(t *testing.T) {
+	base := time.Date(2026, 6, 16, 20, 1, 0, 0, time.UTC)
+	stubs := []types.StubWithRelated{{
+		Stub: types.Stub{
+			ExternalId: "sandbox-stub",
+			Name:       "sandbox",
+			CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+		},
+	}}
+
+	eventRepo := &sandboxRowsEventRepo{
+		historiesByStub: map[string]*types.EventHistoryResponse{
+			"sandbox-stub": nil,
+		},
+		workspaceHistory: &types.EventHistoryResponse{Events: []types.ContainerEventRecord{
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-legacy", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base},
+			{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-legacy", WorkspaceID: "workspace", StubID: "sandbox-stub", Timestamp: base.Add(time.Second)},
+		}},
+	}
+	group := &StubGroup{eventRepo: eventRepo}
+
+	summaries := group.sandboxStatsContainerSummaries(context.Background(), "workspace", "app-1", stubs)
+	if got, want := len(summaries), 1; got != want {
+		t.Fatalf("expected %d legacy sandbox summary, got %d", want, got)
+	}
+	if got, want := summaries[0].ContainerID, "sandbox-stub-legacy"; got != want {
+		t.Fatalf("container_id = %q, want %q", got, want)
+	}
+	if got := len(eventRepo.queries); got != 3 {
+		t.Fatalf("expected app, stub, then workspace fallback queries, got %d", got)
+	}
+	var foundLegacy bool
+	for _, query := range eventRepo.queries {
+		if query.AppID == "" && query.StubID == "" {
+			foundLegacy = true
+			break
+		}
+	}
+	if !foundLegacy {
+		t.Fatalf("expected unscoped workspace fallback query, got %#v", eventRepo.queries)
+	}
+}
+
+func TestBuildSandboxStatsRowsEnrichesActiveTimingFromHistory(t *testing.T) {
+	base := time.Now().Add(-2 * time.Minute).UTC().Truncate(time.Millisecond)
+	stubs := []types.StubWithRelated{{
+		Stub: types.Stub{
+			ExternalId: "sandbox-stub",
+			Name:       "sandbox",
+			CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+		},
+	}}
+	eventRepo := &sandboxRowsEventRepo{
+		history: &types.EventHistoryResponse{Events: []types.ContainerEventRecord{
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(100 * time.Millisecond), EndTime: base.Add(1500 * time.Millisecond)},
+			{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSandboxProcessManagerReady), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(1500 * time.Millisecond), EndTime: base.Add(2500 * time.Millisecond)},
+		}},
+	}
+	group := &StubGroup{eventRepo: eventRepo}
+
+	rows := group.buildSandboxStatsRows(context.Background(), "workspace", "app-1", stubs, map[string][]types.ContainerState{
+		"sandbox-stub": {
+			{
+				ContainerId: "sandbox-stub-11111111",
+				StubId:      "sandbox-stub",
+				Status:      types.ContainerStatusRunning,
+				ScheduledAt: base.Unix(),
+				StartedAt:   base.Add(time.Second).Unix(),
+			},
+		},
+	})
+	if got, want := len(rows), 1; got != want {
+		t.Fatalf("expected %d sandbox stats rows, got %d", want, got)
+	}
+
+	row := rows[0]
+	if row.TimeToStartedMs == nil || *row.TimeToStartedMs != 1500 {
+		t.Fatalf("time_to_started_ms = %v, want 1500", row.TimeToStartedMs)
+	}
+	if row.TimeToInteractiveMs == nil || *row.TimeToInteractiveMs != 2500 {
+		t.Fatalf("time_to_interactive_ms = %v, want 2500", row.TimeToInteractiveMs)
+	}
+	wantStartedAtMs := base.Add(1500 * time.Millisecond).UnixMilli()
+	if row.StartedAtMs == nil || *row.StartedAtMs != wantStartedAtMs {
+		t.Fatalf("started_at_ms = %v, want %d", row.StartedAtMs, wantStartedAtMs)
+	}
+	wantInteractiveAtMs := base.Add(2500 * time.Millisecond).UnixMilli()
+	if row.InteractiveAtMs == nil || *row.InteractiveAtMs != wantInteractiveAtMs {
+		t.Fatalf("interactive_at_ms = %v, want %d", row.InteractiveAtMs, wantInteractiveAtMs)
+	}
+	if row.LifetimeMs == nil || *row.LifetimeMs <= 0 {
+		t.Fatalf("lifetime_ms = %v, want a positive running lifetime", row.LifetimeMs)
+	}
+}
+
+func TestBuildSandboxRowsHydratesMissingTimingFromContainerStream(t *testing.T) {
+	base := time.Date(2026, 6, 16, 20, 1, 0, 0, time.UTC)
+	stub := types.StubWithRelated{
+		Stub: types.Stub{
+			ExternalId: "sandbox-stub",
+			Name:       "sandbox",
+			CreatedAt:  types.Time{Time: base.Add(-time.Hour)},
+		},
+	}
+
+	containerID := "sandbox-stub-22222222"
+	historyEvents := []types.ContainerEventRecord{
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base},
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(100 * time.Millisecond), EndTime: base.Add(1500 * time.Millisecond)},
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSandboxProcessManagerReady), ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(1500 * time.Millisecond), EndTime: base.Add(2500 * time.Millisecond)},
+		{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: "sandbox-stub-11111111", WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(3 * time.Second)},
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: containerID, WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(10 * time.Second)},
+		{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: containerID, WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(13 * time.Second)},
+	}
+	canonicalEvents := []types.ContainerEventRecord{
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSchedulerQueuePush), ContainerID: containerID, WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(10 * time.Second)},
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleStartup), ContainerID: containerID, WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(10*time.Second + 100*time.Millisecond), EndTime: base.Add(11 * time.Second)},
+		{Type: types.EventContainerLifecycle, EventID: string(types.ContainerLifecycleSandboxProcessManagerReady), ContainerID: containerID, WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", StartTime: base.Add(11 * time.Second), EndTime: base.Add(12 * time.Second)},
+		{Type: types.EventContainerEvent, EventID: "runtime.exited", ContainerID: containerID, WorkspaceID: "workspace", AppID: "app-1", StubID: "sandbox-stub", Timestamp: base.Add(13 * time.Second)},
+	}
+
+	eventRepo := &sandboxRowsEventRepo{
+		containers: map[string]*types.ContainerEventsResponse{
+			containerID: {ContainerID: containerID, Events: canonicalEvents},
+		},
+	}
+	group := &StubGroup{eventRepo: eventRepo}
+
+	rows := group.buildSandboxRowsWithPreloadedSummaries(
+		context.Background(),
+		"workspace",
+		&stub,
+		nil,
+		50,
+		sandboxContainerSummariesFromHistory(historyEvents, 0),
+	)
+	if got, want := len(rows), 2; got != want {
+		t.Fatalf("expected %d sandbox rows, got %d", want, got)
+	}
+
+	var hydrated *SandboxRow
+	for i := range rows {
+		if rows[i].ContainerId == containerID {
+			hydrated = &rows[i]
+			break
+		}
+	}
+	if hydrated == nil {
+		t.Fatalf("expected row for %s, got %#v", containerID, rows)
+	}
+	if hydrated.TimeToStartedMs == nil || *hydrated.TimeToStartedMs != 1000 {
+		t.Fatalf("time_to_started_ms = %v, want 1000", hydrated.TimeToStartedMs)
+	}
+	if hydrated.TimeToInteractiveMs == nil || *hydrated.TimeToInteractiveMs != 2000 {
+		t.Fatalf("time_to_interactive_ms = %v, want 2000", hydrated.TimeToInteractiveMs)
+	}
+	if hydrated.LifetimeMs == nil || *hydrated.LifetimeMs != 2000 {
+		t.Fatalf("lifetime_ms = %v, want 2000", hydrated.LifetimeMs)
+	}
+	if got := len(eventRepo.containerQueries); got != 1 {
+		t.Fatalf("expected one canonical container lookup, got %d", got)
+	}
+	query := eventRepo.containerQueries[0]
+	if query.ContainerID != containerID || query.StubID != "sandbox-stub" || query.WorkspaceID != "workspace" {
+		t.Fatalf("unexpected container lookup query: %#v", query)
+	}
+	if query.Limit != sandboxContainerHistoryLimit {
+		t.Fatalf("container lookup limit = %d, want %d", query.Limit, sandboxContainerHistoryLimit)
+	}
+}
+
+// generateMockStubRows creates mock database rows for stub queries
+func generateMockStubRows(id uint, externalID, name, config string, workspaceID uint) *sqlmock.Rows {
+	return generateMockStubRowsWithType(id, externalID, name, "deployment", config, workspaceID)
+}
+
+func generateMockStubRowsWithType(id uint, externalID, name, stubType, config string, workspaceID uint) *sqlmock.Rows {
+	now := time.Now()
+	return sqlmock.NewRows([]string{"id", "external_id", "name", "type", "config", "config_version", "object_id", "workspace_id", "created_at", "updated_at", "public", "app_id", "workspace.id", "workspace.external_id", "workspace.name", "workspace.created_at", "workspace.updated_at", "workspace.signing_key", "workspace.volume_cache_enabled", "workspace.multi_gpu_enabled", "object.id", "object.external_id", "object.hash", "object.size", "object.workspace_id", "object.created_at", "app.id", "app.external_id", "app.name", "workspace.storage.id", "workspace.storage.external_id", "workspace.storage.bucket_name", "workspace.storage.access_key", "workspace.storage.secret_key", "workspace.storage.endpoint_url", "workspace.storage.region", "workspace.storage.created_at", "workspace.storage.updated_at"}).
+		AddRow(id, externalID, name, stubType, config, 1, 1, workspaceID, now, now, false, 1, workspaceID, fmt.Sprintf("workspace-%d", workspaceID), "Test Workspace", now, now, nil, false, false, 1, fmt.Sprintf("obj-%d", id), fmt.Sprintf("hash%d", id), 1000, workspaceID, now, 1, fmt.Sprintf("app-%d", id), "Test App", nil, nil, nil, nil, nil, nil, nil, nil, nil)
+}
+
+type stubConfigJSONArg struct {
+	check func(*types.StubConfigV1) bool
+}
+
+func (a stubConfigJSONArg) Match(value driver.Value) bool {
+	var raw string
+	switch v := value.(type) {
+	case string:
+		raw = v
+	case []byte:
+		raw = string(v)
+	default:
+		return false
+	}
+
+	var config types.StubConfigV1
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		return false
+	}
+	return a.check(&config)
+}
+
+func TestScaleStubEnablesScaleToZeroAndReloads(t *testing.T) {
+	stubGroup, mock, e := NewStubGroupWithMockForTest()
+	rdb, err := repository.NewRedisClientForTest()
+	if err != nil {
+		t.Fatalf("failed to create test redis: %v", err)
+	}
+	stubGroup.redisClient = rdb
+
+	stubID := "pod-service-stub"
+	config := `{"runtime":{"cpu":1000,"memory":1000},"autoscaler":{"type":"queue_depth","max_containers":2,"tasks_per_container":1,"min_containers":1}}`
+	rows := generateMockStubRowsWithType(11, stubID, "Pod Service", types.StubTypePodDeployment, config, 1)
+	mock.ExpectQuery("SELECT").WithArgs(stubID).WillReturnRows(rows)
+	mock.ExpectExec("UPDATE stub").WithArgs(stubConfigJSONArg{check: func(config *types.StubConfigV1) bool {
+		return config.Autoscaler != nil &&
+			config.Autoscaler.MinContainers == 0 &&
+			config.Autoscaler.MaxContainers == 2
+	}}, 11).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	body, _ := json.Marshal(ScaleStubRequest{Containers: 0})
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("stubId")
+	c.SetParamValues(stubID)
+
+	authCtx := &auth.HttpAuthContext{
+		Context: c,
+		AuthInfo: &auth.AuthInfo{
+			Workspace: &types.Workspace{Id: 1},
+		},
+	}
+
+	if err := stubGroup.ScaleStub(authCtx); err != nil {
+		t.Fatalf("ScaleStub() error = %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations were not met: %v", err)
+	}
+
+	keys, err := rdb.Scan(context.Background(), "event:*")
+	if err != nil {
+		t.Fatalf("failed to scan redis events: %v", err)
+	}
+	for _, key := range keys {
+		raw, err := rdb.Get(context.Background(), key).Bytes()
+		if err != nil {
+			continue
+		}
+		var event common.Event
+		if err := json.Unmarshal(raw, &event); err != nil {
+			continue
+		}
+		if event.Type == common.EventTypeReloadInstance && event.Args["stub_id"] == stubID {
+			return
+		}
+	}
+	t.Fatalf("missing reload event for stub %s; redis keys=%v", stubID, keys)
+}
+
+func TestProcessStubOverrides(t *testing.T) {
+	stubGroup := NewStubGroupForTest()
+
+	tests := []struct {
+		name     string
+		cpu      *int64
+		memory   *int64
+		gpu      *string
+		gpuCount *uint32
+		error    bool
+	}{
+		{
+			name: "Test with CPU override",
+			cpu:  ptr.To(int64(2000)),
+		},
+		{
+			name:   "Test with Memory override",
+			memory: ptr.To(int64(4096)),
+		},
+		{
+			name: "Test with GPU override",
+			gpu:  ptr.To(string(types.GPU_A10G)),
+		},
+		{
+			name:     "Test with GPU Count override",
+			gpuCount: ptr.To(uint32(2)),
+		},
+		{
+			name:     "Test with all overrides",
+			cpu:      ptr.To(int64(2000)),
+			memory:   ptr.To(int64(4096)),
+			gpu:      ptr.To(string(types.GPU_A10G)),
+			gpuCount: ptr.To(uint32(2)),
+		},
+		{
+			name: "Test with no overrides",
+		},
+		{
+			name:  "Test with invalid GPU",
+			gpu:   ptr.To("invalid-gpu"),
+			error: true,
+		},
+		{
+			name:     "Test with invalid GPU Count",
+			gpuCount: ptr.To(uint32(3)),
+			error:    true,
+		},
+		{
+			name:   "Test with invalid Memory",
+			memory: ptr.To(int64(50000)),
+			error:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &types.StubWithRelated{Stub: *generateDefaultStubWithConfig()}
+
+			err := stubGroup.processStubOverrides(OverrideStubConfig{
+				Cpu:      tt.cpu,
+				Memory:   tt.memory,
+				Gpu:      tt.gpu,
+				GpuCount: tt.gpuCount,
+			}, stub)
+			if err != nil {
+				if !tt.error {
+					t.Errorf("Unexpected error: %v", err)
+				}
+				return
+			} else {
+				if tt.error {
+					t.Errorf("Expected error but got none")
+					return
+				}
+			}
+
+			var stubConfig types.StubConfigV1
+			err = json.Unmarshal([]byte(stub.Config), &stubConfig)
+			if err != nil {
+				t.Errorf("Failed to unmarshal stub config: %v", err)
+			}
+			if tt.cpu != nil && *tt.cpu != stubConfig.Runtime.Cpu {
+				t.Errorf("Expected CPU %d, got %d", *tt.cpu, stubConfig.Runtime.Cpu)
+			}
+			if tt.memory != nil && *tt.memory != stubConfig.Runtime.Memory {
+				t.Errorf("Expected Memory %d, got %d", *tt.memory, stubConfig.Runtime.Memory)
+			}
+			if tt.gpu != nil && (len(stubConfig.Runtime.Gpus) == 0 || *tt.gpu != string(stubConfig.Runtime.Gpus[0])) {
+				t.Errorf("Expected GPU %s, got %s", *tt.gpu, stubConfig.Runtime.Gpu)
+			}
+			if tt.gpuCount != nil && *tt.gpuCount != stubConfig.Runtime.GpuCount {
+				t.Errorf("Expected GPU Count %d, got %d", *tt.gpuCount, stubConfig.Runtime.GpuCount)
+			}
+		})
+	}
+
+}
+
+func TestUpdateConfig(t *testing.T) {
+	tests := []struct {
+		name           string
+		stubID         string
+		workspaceID    uint
+		requestBody    UpdateConfigRequest
+		setupMock      func(*sqlmock.Sqlmock)
+		expectedStatus int
+		expectedError  bool
+		expectedFields []string
+	}{
+		{
+			name:        "Test successful config update with multiple fields",
+			stubID:      "test-stub-123",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu":    2000,
+					"runtime.memory": 4096,
+					"python_version": "python3.9",
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(1, "test-stub-123", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000},"python_version":"python3"}`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-123").WillReturnRows(rows)
+
+				(*mock).ExpectExec("UPDATE stub").WithArgs(sqlmock.AnyArg(), 1).WillReturnResult(sqlmock.NewResult(1, 1))
+			},
+			expectedStatus: http.StatusOK,
+			expectedFields: []string{"runtime.cpu", "runtime.memory", "python_version"},
+		},
+		{
+			name:        "Test successful config update with single field",
+			stubID:      "test-stub-456",
+			workspaceID: 2,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu": 1500,
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(2, "test-stub-456", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000}}`, 2)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-456").WillReturnRows(rows)
+				(*mock).ExpectExec("UPDATE stub").WithArgs(sqlmock.AnyArg(), 2).WillReturnResult(sqlmock.NewResult(1, 1))
+			},
+			expectedStatus: http.StatusOK,
+			expectedFields: []string{"runtime.cpu"},
+		},
+		{
+			name:        "Test successful config update with gpu field",
+			stubID:      "test-stub-456",
+			workspaceID: 2,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu": 1500,
+					"runtime.gpu": "H100",
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(2, "test-stub-456", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000, "gpu": "T4"}}`, 2)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-456").WillReturnRows(rows)
+				(*mock).ExpectExec("UPDATE stub").WithArgs(sqlmock.AnyArg(), 2).WillReturnResult(sqlmock.NewResult(1, 1))
+			},
+			expectedStatus: http.StatusOK,
+			expectedFields: []string{"runtime.cpu", "runtime.gpu"},
+		},
+		{
+			name:        "Test stub not found",
+			stubID:      "non-existent-stub",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu": 1500,
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				(*mock).ExpectQuery("SELECT").WithArgs("non-existent-stub").WillReturnError(sql.ErrNoRows)
+			},
+			expectedStatus: http.StatusNotFound,
+			expectedError:  true,
+		},
+		{
+			name:        "Test workspace mismatch",
+			stubID:      "test-stub-789",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu": 1500,
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(3, "test-stub-789", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000}}`, 999) // Different workspace
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-789").WillReturnRows(rows)
+			},
+			expectedStatus: http.StatusNotFound,
+			expectedError:  true,
+		},
+		{
+			name:        "Test empty fields",
+			stubID:      "test-stub-empty",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(4, "test-stub-empty", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000}}`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-empty").WillReturnRows(rows)
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  true,
+		},
+		{
+			name:        "Test invalid field path",
+			stubID:      "test-stub-invalid",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"invalid.field": "value",
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(5, "test-stub-invalid", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000}}`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-invalid").WillReturnRows(rows)
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  true,
+		},
+		{
+			name:        "Test invalid config JSON",
+			stubID:      "test-stub-bad-config",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu": 1500,
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(6, "test-stub-bad-config", "Test Stub", `invalid json`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-bad-config").WillReturnRows(rows)
+			},
+			expectedStatus: http.StatusInternalServerError,
+			expectedError:  true,
+		},
+		{
+			name:        "Test CPU and memory validation failure",
+			stubID:      "test-stub-limits",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu":    200000, // Exceeds limit
+					"runtime.memory": 50000,  // Exceeds limit
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(7, "test-stub-limits", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000}}`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-limits").WillReturnRows(rows)
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  true,
+		},
+		{
+			name:        "Test database update failure",
+			stubID:      "test-stub-db-error",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"runtime.cpu": 1500,
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(8, "test-stub-db-error", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000}}`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-db-error").WillReturnRows(rows)
+				(*mock).ExpectExec("UPDATE stub").WithArgs(sqlmock.AnyArg(), 8).WillReturnError(sql.ErrConnDone)
+			},
+			expectedStatus: http.StatusInternalServerError,
+			expectedError:  true,
+		},
+		{
+			name:        "Test empty field path",
+			stubID:      "test-stub-empty-path",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"": "value",
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(9, "test-stub-empty-path", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000}}`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-empty-path").WillReturnRows(rows)
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  true,
+		},
+		{
+			name:        "Test nested field update",
+			stubID:      "test-stub-nested",
+			workspaceID: 1,
+			requestBody: UpdateConfigRequest{
+				Fields: map[string]interface{}{
+					"task_policy.max_retries": 5,
+					"task_policy.timeout":     7200,
+				},
+			},
+			setupMock: func(mock *sqlmock.Sqlmock) {
+				rows := generateMockStubRows(10, "test-stub-nested", "Test Stub", `{"runtime":{"cpu":1000,"memory":1000},"task_policy":{"max_retries":3,"timeout":3600}}`, 1)
+				(*mock).ExpectQuery("SELECT").WithArgs("test-stub-nested").WillReturnRows(rows)
+				(*mock).ExpectExec("UPDATE stub").WithArgs(sqlmock.AnyArg(), 10).WillReturnResult(sqlmock.NewResult(1, 1))
+			},
+			expectedStatus: http.StatusOK,
+			expectedFields: []string{"task_policy.max_retries", "task_policy.timeout"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubGroup, mock, e := NewStubGroupWithMockForTest()
+
+			if tt.setupMock != nil {
+				tt.setupMock(&mock)
+			}
+
+			jsonBody, _ := json.Marshal(tt.requestBody)
+			req := httptest.NewRequest(http.MethodPatch, "/", nil)
+			req.Body = io.NopCloser(bytes.NewReader(jsonBody))
+			req.ContentLength = int64(len(jsonBody))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			rec := httptest.NewRecorder()
+			c := e.NewContext(req, rec)
+
+			c.SetParamNames("stubId")
+			c.SetParamValues(tt.stubID)
+
+			authCtx := &auth.HttpAuthContext{
+				Context: c,
+				AuthInfo: &auth.AuthInfo{
+					Workspace: &types.Workspace{Id: tt.workspaceID},
+				},
+			}
+
+			err := stubGroup.UpdateConfig(authCtx)
+
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("Mock expectations were not met: %v", err)
+			}
+
+			if tt.expectedError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+				if httpErr, ok := err.(*echo.HTTPError); ok {
+					if httpErr.Code != tt.expectedStatus {
+						t.Errorf("Expected status %d, got %d", tt.expectedStatus, httpErr.Code)
+					}
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+				if rec.Code != tt.expectedStatus {
+					t.Errorf("Expected status %d, got %d", tt.expectedStatus, rec.Code)
+				}
+
+				if tt.expectedStatus == http.StatusOK {
+					var response map[string]interface{}
+					if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+						t.Errorf("Failed to unmarshal response: %v", err)
+					}
+
+					if message, ok := response["message"].(string); !ok {
+						t.Error("Response missing message field")
+					} else if !strings.Contains(message, "Stub config updated successfully") {
+						t.Errorf("Unexpected message: %s", message)
+					}
+
+					if updatedFields, ok := response["updated_fields"].([]interface{}); ok {
+						if len(updatedFields) != len(tt.expectedFields) {
+							t.Errorf("Expected %d updated fields, got %d", len(tt.expectedFields), len(updatedFields))
+						}
+
+						for _, expectedField := range tt.expectedFields {
+							found := false
+							for _, field := range updatedFields {
+								if field == expectedField {
+									found = true
+									break
+								}
+							}
+							if !found {
+								t.Errorf("Expected field %s not found in response", expectedField)
+							}
+						}
+					} else {
+						t.Error("Response missing updated_fields")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSetConfigField(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      *types.StubConfigV1
+		fieldPath   string
+		value       interface{}
+		expectedErr bool
+		checkResult func(*types.StubConfigV1) bool
+	}{
+		{
+			name: "Test updating runtime.cpu",
+			config: &types.StubConfigV1{
+				Runtime: types.Runtime{Cpu: 1000, Memory: 1000},
+			},
+			fieldPath: "runtime.cpu",
+			value:     2000,
+			checkResult: func(config *types.StubConfigV1) bool {
+				return config.Runtime.Cpu == 2000
+			},
+		},
+		{
+			name: "Test updating runtime.memory",
+			config: &types.StubConfigV1{
+				Runtime: types.Runtime{Cpu: 1000, Memory: 1000},
+			},
+			fieldPath: "runtime.memory",
+			value:     4096,
+			checkResult: func(config *types.StubConfigV1) bool {
+				return config.Runtime.Memory == 4096
+			},
+		},
+		{
+			name: "Test updating python_version",
+			config: &types.StubConfigV1{
+				PythonVersion: "python3",
+			},
+			fieldPath: "python_version",
+			value:     "python3.9",
+			checkResult: func(config *types.StubConfigV1) bool {
+				return config.PythonVersion == "python3.9"
+			},
+		},
+		{
+			name: "Test updating nested field",
+			config: &types.StubConfigV1{
+				TaskPolicy: types.TaskPolicy{MaxRetries: 3, Timeout: 3600},
+			},
+			fieldPath: "task_policy.max_retries",
+			value:     5,
+			checkResult: func(config *types.StubConfigV1) bool {
+				return config.TaskPolicy.MaxRetries == 5
+			},
+		},
+		{
+			name: "Test updating boolean field",
+			config: &types.StubConfigV1{
+				Authorized: false,
+			},
+			fieldPath: "authorized",
+			value:     true,
+			checkResult: func(config *types.StubConfigV1) bool {
+				return config.Authorized == true
+			},
+		},
+		{
+			name: "Test updating with string value for int field",
+			config: &types.StubConfigV1{
+				Runtime: types.Runtime{Cpu: 1000},
+			},
+			fieldPath: "runtime.cpu",
+			value:     "1500",
+			checkResult: func(config *types.StubConfigV1) bool {
+				return config.Runtime.Cpu == 1500
+			},
+		},
+		{
+			name: "Test updating with float value for int field",
+			config: &types.StubConfigV1{
+				Runtime: types.Runtime{Cpu: 1000},
+			},
+			fieldPath: "runtime.cpu",
+			value:     2500.0,
+			checkResult: func(config *types.StubConfigV1) bool {
+				return config.Runtime.Cpu == 2500
+			},
+		},
+		{
+			name: "Test invalid field path",
+			config: &types.StubConfigV1{
+				Runtime: types.Runtime{Cpu: 1000},
+			},
+			fieldPath:   "invalid.field",
+			value:       "value",
+			expectedErr: true,
+		},
+		{
+			name: "Test empty field path",
+			config: &types.StubConfigV1{
+				Runtime: types.Runtime{Cpu: 1000},
+			},
+			fieldPath:   "",
+			value:       "value",
+			expectedErr: true,
+		},
+		{
+			name: "Test empty field name in path",
+			config: &types.StubConfigV1{
+				Runtime: types.Runtime{Cpu: 1000},
+			},
+			fieldPath:   "runtime..cpu",
+			value:       2000,
+			expectedErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configCopy := *tt.config
+
+			err := SetConfigField(&configCopy, tt.fieldPath, tt.value)
+
+			if tt.expectedErr {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+				if tt.checkResult != nil && !tt.checkResult(&configCopy) {
+					t.Errorf("Field update did not produce expected result")
+				}
+			}
+		})
+	}
+}

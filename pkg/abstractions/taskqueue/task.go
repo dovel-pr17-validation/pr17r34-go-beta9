@@ -1,0 +1,121 @@
+package taskqueue
+
+import (
+	"context"
+
+	taskdispatcher "github.com/beam-cloud/beta9/pkg/task"
+	"github.com/beam-cloud/beta9/pkg/types"
+)
+
+type TaskQueueTask struct {
+	msg *types.TaskMessage
+	tq  *RedisTaskQueue
+}
+
+func (t *TaskQueueTask) Execute(ctx context.Context, options ...interface{}) error {
+	instance, err := t.tq.getOrCreateQueueInstance(t.msg.StubId)
+	if err != nil {
+		return err
+	}
+
+	_, err = t.tq.backendRepo.CreateTask(ctx, &types.TaskParams{
+		TaskId:      t.msg.TaskId,
+		StubId:      instance.Stub.Id,
+		WorkspaceId: instance.Stub.WorkspaceId,
+	})
+	if err != nil {
+		return err
+	}
+
+	err = t.tq.queueClient.Push(ctx, t.msg)
+	if err != nil {
+		t.tq.backendRepo.DeleteTask(context.TODO(), t.msg.TaskId)
+		return err
+	}
+
+	return nil
+}
+
+func (t *TaskQueueTask) Retry(ctx context.Context) error {
+	task, err := t.tq.backendRepo.GetTask(ctx, t.msg.TaskId)
+	if err != nil {
+		return err
+	}
+
+	// A completion whose Redis cleanup failed must not execute user code again.
+	if task.Status.IsCompleted() {
+		return t.tq.taskDispatcher.Complete(ctx, t.msg.WorkspaceName, t.msg.StubId, t.msg.TaskId)
+	}
+
+	_, err = t.tq.getOrCreateQueueInstance(t.msg.StubId)
+	if err != nil {
+		return err
+	}
+
+	task.Status = types.TaskStatusRetry
+	_, err = t.tq.backendRepo.UpdateTask(ctx, t.msg.TaskId, *task)
+	if err != nil {
+		return err
+	}
+
+	return t.tq.queueClient.Push(ctx, t.msg)
+}
+
+func (t *TaskQueueTask) HeartBeat(ctx context.Context) (bool, error) {
+	expired, err := taskdispatcher.CompletionExpired(ctx, t.tq.rdb, t.Metadata())
+	if err != nil || expired {
+		return false, err
+	}
+	res, err := t.tq.rdb.Exists(ctx, Keys.taskQueueTaskHeartbeat(t.msg.WorkspaceName, t.msg.StubId, t.msg.TaskId)).Result()
+	if err != nil || res > 0 {
+		return res > 0, err
+	}
+
+	// A missing gateway monitor is not evidence that user code stopped. Match
+	// function recovery: only retry a running task after its container is gone.
+	task, err := t.tq.backendRepo.GetTask(ctx, t.msg.TaskId)
+	if err != nil || task.Status != types.TaskStatusRunning {
+		return false, err
+	}
+	return taskdispatcher.ContainerIsRunning(t.tq.containerRepo, task.ContainerId)
+}
+
+func (t *TaskQueueTask) Cancel(ctx context.Context, reason types.TaskCancellationReason) error {
+	task, err := t.tq.backendRepo.GetTask(context.Background(), t.msg.TaskId)
+	if err != nil {
+		return err
+	}
+
+	// Don't update tasks that are already in a terminal state
+	if task.Status.IsCompleted() {
+		return nil
+	}
+
+	switch reason {
+	case types.TaskExpired:
+		task.Status = types.TaskStatusExpired
+	case types.TaskExceededRetryLimit:
+		task.Status = types.TaskStatusError
+	default:
+		task.Status = types.TaskStatusError
+	}
+
+	_, err = t.tq.backendRepo.UpdateTask(context.Background(), t.msg.TaskId, *task)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *TaskQueueTask) Metadata() types.TaskMetadata {
+	return types.TaskMetadata{
+		TaskId:        t.msg.TaskId,
+		StubId:        t.msg.StubId,
+		WorkspaceName: t.msg.WorkspaceName,
+	}
+}
+
+func (t *TaskQueueTask) Message() *types.TaskMessage {
+	return t.msg
+}

@@ -1,0 +1,367 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog/log"
+)
+
+const (
+	containerPortProxyReadyPollInterval = 100 * time.Millisecond
+	containerPortProxyReadyPollCeiling  = 1 * time.Second
+	containerPortProxyDialTimeout       = 250 * time.Millisecond
+	containerPortProxyConnectTimeout    = 2 * time.Second
+)
+
+type containerPortExposure struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	containerID   string
+	hostPort      int
+	containerPort int
+	proxyMu       sync.Mutex
+	proxy         *containerPortProxy
+	// listener is the socket bound when the host port was reserved. It is
+	// handed to the proxy, or released once kernel forwarding serves the port.
+	listener net.Listener
+}
+
+type containerPortProxy struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	containerID   string
+	hostPort      int
+	containerPort int
+	listener      net.Listener
+	targets       []string
+	ready         chan struct{}
+	readyOnce     sync.Once
+}
+
+func newContainerPortExposure(parent context.Context, containerID string, binding PortBinding) *containerPortExposure {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &containerPortExposure{
+		ctx:           ctx,
+		cancel:        cancel,
+		containerID:   containerID,
+		hostPort:      binding.HostPort,
+		containerPort: binding.ContainerPort,
+	}
+}
+
+func (e *containerPortExposure) startProxy(family addressFamily, targets []string) {
+	if len(targets) == 0 {
+		return
+	}
+
+	e.proxyMu.Lock()
+	defer e.proxyMu.Unlock()
+	if e.ctx.Err() != nil || e.proxy != nil {
+		return
+	}
+
+	listener := e.listener
+	e.listener = nil
+	if listener == nil {
+		var err error
+		listener, err = net.Listen(containerPortProxyListenConfig(e.hostPort, family))
+		if err != nil {
+			log.Warn().
+				Err(err).
+				Str("container_id", e.containerID).
+				Int("host_port", e.hostPort).
+				Int("container_port", e.containerPort).
+				Msg("failed to start container port proxy")
+			return
+		}
+	}
+
+	e.proxy = newContainerPortProxy(e.ctx, e.containerID, PortBinding{
+		HostPort:      e.hostPort,
+		ContainerPort: e.containerPort,
+	}, listener, targets)
+	go e.proxy.run()
+}
+
+// releaseListener drops the reserved socket when no proxy will use it.
+func (e *containerPortExposure) releaseListener() {
+	e.proxyMu.Lock()
+	listener := e.listener
+	e.listener = nil
+	e.proxyMu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
+}
+
+func (e *containerPortExposure) close() {
+	e.cancel()
+	e.proxyMu.Lock()
+	proxy := e.proxy
+	e.proxy = nil
+	e.proxyMu.Unlock()
+	if proxy != nil {
+		proxy.close()
+	}
+	e.releaseListener()
+}
+
+func newContainerPortProxy(parent context.Context, containerID string, binding PortBinding, listener net.Listener, targets []string) *containerPortProxy {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &containerPortProxy{
+		ctx:           ctx,
+		cancel:        cancel,
+		containerID:   containerID,
+		hostPort:      binding.HostPort,
+		containerPort: binding.ContainerPort,
+		listener:      listener,
+		targets:       append([]string(nil), targets...),
+		ready:         make(chan struct{}),
+	}
+}
+
+type addressFamily int
+
+const (
+	addressFamilyUnknown addressFamily = iota
+	addressFamilyIPv4
+	addressFamilyIPv6
+)
+
+func addressFamilyForHost(host string) addressFamily {
+	host = strings.TrimSpace(host)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return addressFamilyUnknown
+	}
+	if ip.To4() != nil {
+		return addressFamilyIPv4
+	}
+	return addressFamilyIPv6
+}
+
+func containerPortTargets(info *containerNetworkInfo, containerPort int, family addressFamily) (native, fallback string) {
+	if info == nil {
+		return "", ""
+	}
+
+	port := strconv.Itoa(containerPort)
+	ipv4 := ""
+	if info.ContainerIp != "" {
+		ipv4 = net.JoinHostPort(info.ContainerIp, port)
+	}
+	ipv6 := ""
+	if info.ContainerIpv6 != "" {
+		ipv6 = net.JoinHostPort(info.ContainerIpv6, port)
+	}
+
+	switch family {
+	case addressFamilyIPv6:
+		return ipv6, ipv4
+	case addressFamilyIPv4:
+		return ipv4, ipv6
+	default:
+		return ipv4, ipv6
+	}
+}
+
+func containerPortProxyListenConfig(hostPort int, family addressFamily) (network, address string) {
+	port := strconv.Itoa(hostPort)
+	switch family {
+	case addressFamilyIPv6:
+		return "tcp6", net.JoinHostPort("::", port)
+	case addressFamilyIPv4:
+		return "tcp4", net.JoinHostPort("0.0.0.0", port)
+	default:
+		return "tcp", net.JoinHostPort("", port)
+	}
+}
+
+func (p *containerPortProxy) run() {
+	if err := p.waitForBackend(); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			log.Debug().
+				Err(err).
+				Str("container_id", p.containerID).
+				Int("host_port", p.hostPort).
+				Int("container_port", p.containerPort).
+				Msg("container port proxy stopped before backend became reachable")
+		}
+		return
+	}
+
+	p.readyOnce.Do(func() { close(p.ready) })
+	log.Debug().
+		Str("container_id", p.containerID).
+		Int("host_port", p.hostPort).
+		Int("container_port", p.containerPort).
+		Str("listen_address", p.listener.Addr().String()).
+		Strs("targets", p.targets).
+		Msg("container port proxy started")
+
+	for {
+		conn, err := p.listener.Accept()
+		if err != nil {
+			select {
+			case <-p.ctx.Done():
+				return
+			default:
+				log.Debug().
+					Err(err).
+					Str("container_id", p.containerID).
+					Int("host_port", p.hostPort).
+					Msg("container port proxy accept failed")
+				return
+			}
+		}
+		go p.handle(conn)
+	}
+}
+
+func containerPortTargetReachable(ctx context.Context, target string, timeout time.Duration) bool {
+	if target == "" {
+		return false
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", target)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func (p *containerPortProxy) waitForBackend() error {
+	ticker := time.NewTicker(containerPortProxyReadyPollInterval)
+	defer ticker.Stop()
+
+	for {
+		conn, err := p.dialBackend(containerPortProxyDialTimeout)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+
+		select {
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *containerPortProxy) handle(client net.Conn) {
+	defer client.Close()
+
+	backend, err := p.dialBackendWithin(containerPortProxyConnectTimeout)
+	if err != nil {
+		log.Debug().
+			Err(err).
+			Str("container_id", p.containerID).
+			Int("host_port", p.hostPort).
+			Int("container_port", p.containerPort).
+			Msg("container port proxy backend dial failed")
+		return
+	}
+	defer backend.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go proxyConnHalf(&wg, backend, client)
+	go proxyConnHalf(&wg, client, backend)
+	wg.Wait()
+}
+
+func proxyConnHalf(wg *sync.WaitGroup, dst, src net.Conn) {
+	defer wg.Done()
+	_, _ = io.Copy(dst, src)
+	if tcp, ok := dst.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+}
+
+// dialBackendWithin keeps dialing until timeout, so a connection that arrives
+// while the app restarts waits for it instead of being dropped.
+func (p *containerPortProxy) dialBackendWithin(timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		conn, err := p.dialBackend(time.Until(deadline))
+		if err == nil || time.Until(deadline) < 2*containerPortProxyReadyPollInterval {
+			return conn, err
+		}
+		select {
+		case <-p.ctx.Done():
+			return nil, err
+		case <-time.After(containerPortProxyReadyPollInterval):
+		}
+	}
+}
+
+func (p *containerPortProxy) dialBackend(timeout time.Duration) (net.Conn, error) {
+	if len(p.targets) == 0 {
+		return nil, fmt.Errorf("container port proxy has no backend targets")
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, timeout)
+	defer cancel()
+
+	type dialResult struct {
+		target string
+		conn   net.Conn
+		err    error
+	}
+
+	results := make(chan dialResult, len(p.targets))
+	for _, target := range p.targets {
+		target := target
+		go func() {
+			dialer := &net.Dialer{}
+			conn, err := dialer.DialContext(ctx, "tcp", target)
+			select {
+			case results <- dialResult{target: target, conn: conn, err: err}:
+			case <-ctx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+	}
+
+	var errs []error
+	for range p.targets {
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(append(errs, ctx.Err())...)
+		case result := <-results:
+			if result.err == nil {
+				cancel()
+				return result.conn, nil
+			}
+			errs = append(errs, fmt.Errorf("%s: %w", result.target, result.err))
+		}
+	}
+	return nil, errors.Join(errs...)
+}
+
+func (p *containerPortProxy) close() {
+	p.cancel()
+	_ = p.listener.Close()
+}

@@ -1,0 +1,919 @@
+package pod
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
+	"github.com/beam-cloud/beta9/pkg/auth"
+	"github.com/beam-cloud/beta9/pkg/common"
+	computemodel "github.com/beam-cloud/beta9/pkg/compute"
+	"github.com/beam-cloud/beta9/pkg/network"
+	"github.com/beam-cloud/beta9/pkg/repository"
+	"github.com/beam-cloud/beta9/pkg/scheduler"
+	"github.com/beam-cloud/beta9/pkg/task"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/singleflight"
+	"google.golang.org/grpc/metadata"
+)
+
+type PodServiceOpts struct {
+	Config         types.AppConfig
+	BackendRepo    repository.BackendRepository
+	ContainerRepo  repository.ContainerRepository
+	ComputeRepo    repository.ComputeRepository
+	WorkspaceRepo  repository.WorkspaceRepository
+	WorkerRepo     repository.WorkerRepository
+	WorkerPoolRepo repository.WorkerPoolRepository
+	Tailscale      *network.Tailscale
+	Scheduler      *scheduler.Scheduler
+	RedisClient    *common.RedisClient
+	EventRepo      repository.EventRepository
+	RouteGroup     *echo.Group
+	TaskDispatcher *task.Dispatcher
+	DrainContext   context.Context
+}
+
+const (
+	podContainerPrefix string = types.StubTypePod
+	podRoutePrefix     string = "/pod"
+	sandboxRoutePrefix string = "/sandbox"
+	podProxyBufferSize        = 10000
+	podStubLoadTimeout        = 5 * time.Second
+)
+
+type PodService interface {
+	pb.PodServiceServer
+	CreatePod(ctx context.Context, in *pb.CreatePodRequest) (*pb.CreatePodResponse, error)
+}
+
+type GenericPodService struct {
+	pb.PodServiceServer
+	ctx             context.Context
+	mu              sync.Mutex
+	config          types.AppConfig
+	backendRepo     repository.BackendRepository
+	containerRepo   repository.ContainerRepository
+	computeRepo     repository.ComputeRepository
+	workspaceRepo   repository.WorkspaceRepository
+	workerRepo      repository.WorkerRepository
+	workerPoolRepo  repository.WorkerPoolRepository
+	scheduler       *scheduler.Scheduler
+	taskDispatcher  *task.Dispatcher
+	keyEventManager *common.KeyEventManager
+	rdb             *common.RedisClient
+	tailscale       *network.Tailscale
+	eventRepo       repository.EventRepository
+	controller      *abstractions.InstanceController
+	podInstances    *common.SafeMap[*podInstance]
+	instanceLoads   singleflight.Group
+	stubLoadGroup   singleflight.Group
+	clientCache     sync.Map
+	clientDialGroup singleflight.Group
+	tcpServer       *PodTCPServer
+	drainCtx        context.Context
+}
+
+func NewPodService(
+	ctx context.Context,
+	opts PodServiceOpts,
+) (PodService, error) {
+	keyEventManager := common.NewKeyEventManager(opts.RedisClient)
+
+	ps := &GenericPodService{
+		ctx:             ctx,
+		mu:              sync.Mutex{},
+		backendRepo:     opts.BackendRepo,
+		containerRepo:   opts.ContainerRepo,
+		computeRepo:     opts.ComputeRepo,
+		workspaceRepo:   opts.WorkspaceRepo,
+		workerRepo:      opts.WorkerRepo,
+		workerPoolRepo:  opts.WorkerPoolRepo,
+		scheduler:       opts.Scheduler,
+		rdb:             opts.RedisClient,
+		keyEventManager: keyEventManager,
+		tailscale:       opts.Tailscale,
+		config:          opts.Config,
+		eventRepo:       opts.EventRepo,
+		podInstances:    common.NewSafeMap[*podInstance](),
+		drainCtx:        opts.DrainContext,
+	}
+	if ps.drainCtx == nil {
+		ps.drainCtx = context.Background()
+	}
+
+	// Listen for container events with a certain prefix
+	// For example if a container is created, destroyed, or updated
+	eventManager, err := abstractions.NewContainerEventManager(ctx, []string{types.StubTypePod, types.StubTypeSandbox, types.StubTypeVM}, keyEventManager, ps.InstanceFactory)
+	if err != nil {
+		return nil, err
+	}
+	eventManager.Listen()
+
+	// Register the pod run task executor so `pod/run` containers are tracked as
+	// tasks, and watch container lifecycle events to drive task state.
+	if opts.TaskDispatcher != nil {
+		ps.taskDispatcher = opts.TaskDispatcher
+		ps.taskDispatcher.Register(string(types.ExecutorContainer), ps.podTaskFactory)
+		go ps.watchPodRunTaskContainers()
+	}
+
+	// Initialize deployment manager
+	ps.controller = abstractions.NewInstanceController(
+		ctx,
+		ps.InstanceFactory,
+		ps.GetInstance,
+		[]string{types.StubTypePodDeployment},
+		opts.BackendRepo,
+		opts.ContainerRepo,
+		opts.RedisClient,
+	)
+	err = ps.controller.Init()
+	if err != nil {
+		return nil, err
+	}
+
+	authMiddleware := auth.AuthMiddleware(ps.backendRepo, ps.workspaceRepo)
+
+	registerPodGroup(opts.RouteGroup.Group(podRoutePrefix, authMiddleware), ps)
+	registerPodGroup(opts.RouteGroup.Group(sandboxRoutePrefix, authMiddleware), ps)
+
+	// If TCP is enabled and we have TLS configured, start the raw TCP proxy server
+	if opts.Config.Abstractions.Pod.TCP.Enabled {
+		// Construction only assigns fields, allowing the ICE handler to attach
+		// synchronously. Certificate loading and listening remain in Start.
+		server := NewPodTCPServer(ctx, ps, opts.Config, opts.BackendRepo, opts.ContainerRepo, opts.RedisClient, opts.Tailscale)
+		ps.tcpServer = server
+		go func() {
+			err := server.Start()
+			if err != nil {
+				log.Warn().Err(err).Msg("failed to start pod tcp server")
+			}
+		}()
+	}
+
+	return ps, nil
+}
+
+func (ps *GenericPodService) InstanceFactory(ctx context.Context, stubId string, options ...func(abstractions.IAutoscaledInstance)) (abstractions.IAutoscaledInstance, error) {
+	return ps.getOrCreatePodInstance(stubId)
+}
+
+func (ps *GenericPodService) GetInstance(stubId string) (abstractions.IAutoscaledInstance, bool) {
+	instance, exists := ps.podInstances.Get(stubId)
+	if !exists {
+		return nil, false
+	}
+	return instance, true
+}
+
+func (ps *GenericPodService) IsPublic(stubId string) (*types.Workspace, error) {
+	instance, err := ps.getOrCreatePodInstance(stubId)
+	if err != nil {
+		return nil, err
+	}
+
+	if instance.StubConfig.Authorized {
+		return nil, errors.New("unauthorized")
+	}
+
+	return instance.Workspace, nil
+}
+
+func (ps *GenericPodService) isDraining() bool {
+	if ps == nil || ps.drainCtx == nil {
+		return false
+	}
+	select {
+	case <-ps.drainCtx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (ps *GenericPodService) rejectDrainingRequest(ctx echo.Context) error {
+	ctx.Response().Header().Set(echo.HeaderConnection, "close")
+	return ctx.String(http.StatusServiceUnavailable, "Service is draining")
+}
+
+func (ps *GenericPodService) durableDiskPlacementRepos() abstractions.DurableDiskPlacementRepos {
+	if ps == nil {
+		return abstractions.DurableDiskPlacementRepos{}
+	}
+	return abstractions.DurableDiskPlacementRepos{
+		BackendRepo:    ps.backendRepo,
+		ComputeRepo:    ps.computeRepo,
+		WorkerRepo:     ps.workerRepo,
+		WorkerPoolRepo: ps.workerPoolRepo,
+	}
+}
+
+func (ps *GenericPodService) prepareDurableDiskPlacement(ctx context.Context, workspace *types.Workspace, stubConfig *types.StubConfigV1) error {
+	return abstractions.ConfigureDurableDiskPlacement(ctx, ps.durableDiskPlacementRepos(), workspace, stubConfig)
+}
+
+func (ps *GenericPodService) forwardRequest(ctx echo.Context, stubId string) error {
+	if ps.isDraining() {
+		return ps.rejectDrainingRequest(ctx)
+	}
+
+	instance, err := ps.getOrCreatePodInstance(stubId)
+	if err != nil {
+		return err
+	}
+
+	if !instance.buffer.hasAvailableContainers() {
+		// Fail fast instead of queueing until timeout; requests succeed as soon
+		// as capacity joins or the cooldown ends.
+		var unavailable errUnavailable
+		if err := instance.ensureReadyForRequest(); errors.As(err, &unavailable) {
+			return ctx.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+				"error": err.Error(),
+			})
+		} else if err != nil {
+			return err
+		}
+	}
+
+	return instance.buffer.ForwardRequest(ctx)
+}
+
+func (ps *GenericPodService) forwardContainerRequest(ctx echo.Context, stubId, containerId string) error {
+	if ps.isDraining() {
+		return ps.rejectDrainingRequest(ctx)
+	}
+
+	instance, err := ps.getOrCreatePodInstance(stubId)
+	if err != nil {
+		return err
+	}
+
+	return instance.buffer.ForwardContainerRequest(ctx, containerId)
+}
+
+func (ps *GenericPodService) forwardTCPRequest(tc *tcpConnection, stubId string) error {
+	if ps.isDraining() {
+		tc.Conn.Close()
+		return nil
+	}
+
+	instance, err := ps.getOrCreatePodInstance(stubId)
+	if err != nil {
+		return err
+	}
+
+	if !instance.buffer.hasAvailableContainers() {
+		var unavailable errUnavailable
+		if err := instance.ensureReadyForRequest(); errors.As(err, &unavailable) {
+			tc.Conn.Close()
+			return nil
+		} else if err != nil {
+			return err
+		}
+	}
+
+	return instance.buffer.ForwardTCPRequest(tc)
+}
+
+func (ps *GenericPodService) getOrCreatePodInstance(stubId string, options ...func(*podInstance)) (*podInstance, error) {
+	instance, exists := ps.podInstances.Get(stubId)
+	if exists && instance.Ctx.Err() == nil {
+		return instance, nil
+	}
+
+	// Join creation for this stub without serializing unrelated VMs behind its
+	// database reads and controller setup.
+	loaded, err, _ := ps.instanceLoads.Do(stubId, func() (any, error) {
+		return ps.createPodInstance(stubId, options...)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return loaded.(*podInstance), nil
+}
+
+func (ps *GenericPodService) createPodInstance(stubId string, options ...func(*podInstance)) (*podInstance, error) {
+	ps.mu.Lock()
+	instance, exists := ps.podInstances.Get(stubId)
+	if exists && instance.Ctx.Err() == nil {
+		ps.mu.Unlock()
+		return instance, nil
+	}
+	if exists {
+		ps.podInstances.Delete(stubId)
+	}
+	ps.mu.Unlock()
+
+	stub, err := ps.backendRepo.GetStubByExternalId(ps.ctx, stubId)
+	if err != nil {
+		return nil, errors.New("invalid stub id")
+	}
+
+	stubConfig := &types.StubConfigV1{}
+	if err := json.Unmarshal([]byte(stub.Config), stubConfig); err != nil {
+		return nil, err
+	}
+
+	token, err := ps.backendRepo.RetrieveActiveToken(ps.ctx, stub.Workspace.Id, types.TokenTypeWorkspacePrimary)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create queue instance to hold taskqueue specific methods/fields
+	instance = &podInstance{}
+	instance.durableDiskPlacementRepos = ps.durableDiskPlacementRepos()
+
+	// Create base autoscaled instance
+	autoscaledInstance, err := abstractions.NewAutoscaledInstance(ps.ctx, &abstractions.AutoscaledInstanceConfig{
+		Name:                fmt.Sprintf("%s-%s", stub.Name, stub.ExternalId),
+		AppConfig:           ps.config,
+		Rdb:                 ps.rdb,
+		Stub:                stub,
+		StubConfig:          stubConfig,
+		Object:              &stub.Object,
+		Workspace:           &stub.Workspace,
+		Token:               token,
+		Scheduler:           ps.scheduler,
+		ContainerRepo:       ps.containerRepo,
+		BackendRepo:         ps.backendRepo,
+		EventRepo:           ps.eventRepo,
+		InstanceLockKey:     Keys.podInstanceLock(stub.Workspace.Name, stubId),
+		StartContainersFunc: instance.startContainers,
+		StopContainersFunc:  instance.stopContainers,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	instance.buffer = NewPodProxyBuffer(autoscaledInstance.Ctx, ps.drainCtx, ps.rdb, &stub.Workspace, stubId, podProxyBufferSize, ps.containerRepo, ps.keyEventManager, stubConfig, string(stub.Type), stub.App.ExternalId, ps.tailscale, ps.config.Tailscale)
+
+	// Embed autoscaled instance struct
+	instance.AutoscaledInstance = autoscaledInstance
+
+	// Set all options on the instance
+	for _, o := range options {
+		o(instance)
+	}
+
+	if instance.Autoscaler == nil {
+		instance.Autoscaler = abstractions.NewAutoscaler(instance, podAutoscalerSampleFunc, podScaleFunc)
+	}
+	instance.buffer.onBackendUnavailable = func() error {
+		err := instance.ensureReadyForRequest()
+		instance.Autoscaler.Trigger()
+		return err
+	}
+
+	if len(instance.EntryPoint) == 0 {
+		instance.EntryPoint = instance.StubConfig.EntryPoint
+	}
+
+	ps.mu.Lock()
+	ps.podInstances.Set(stubId, instance)
+	ps.mu.Unlock()
+
+	// Monitor and then clean up the instance once it's done
+	go instance.Monitor()
+	go func(i *podInstance) {
+		<-i.Ctx.Done()
+		ps.deletePodInstance(stubId, i)
+	}(instance)
+
+	return instance, nil
+}
+
+func (ps *GenericPodService) deletePodInstance(stubId string, instance *podInstance) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if current, exists := ps.podInstances.Get(stubId); exists && current == instance {
+		ps.podInstances.Delete(stubId)
+	}
+}
+
+// runOptions carries the optional inputs for scheduling a pod container.
+// taskId/containerId are set when the run is tracked as a task (pod/run stubs),
+// in which case the container id is pre-generated so the task record can
+// reference it before scheduling.
+type runOptions struct {
+	imageId             *string
+	checkpoint          *types.Checkpoint
+	machineId           string
+	forceResourceLimits bool
+	taskId              string
+	containerId         string
+}
+
+func createPodRunOptions(ctx context.Context, in *pb.CreatePodRequest, checkpoint *types.Checkpoint) runOptions {
+	return runOptions{
+		imageId:             in.ImageId,
+		checkpoint:          checkpoint,
+		machineId:           in.GetMachineId(),
+		forceResourceLimits: forceResourceLimitsRequested(ctx),
+	}
+}
+
+func forceResourceLimitsRequested(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+	for _, value := range md.Get(types.ForceResourceLimitsMetadata) {
+		enabled, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err == nil && enabled {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *GenericPodService) run(ctx context.Context, authInfo *auth.AuthInfo, stub *types.StubWithRelated, opts runOptions) (string, error) {
+	if !podRunnableStub(stub.Type) {
+		return "", fmt.Errorf("stub type <%s> cannot be run through pods", stub.Type)
+	}
+	workspace, err := podRunWorkspace(authInfo, stub)
+	if err != nil {
+		return "", err
+	}
+
+	imageId := opts.imageId
+	checkpoint := opts.checkpoint
+
+	stubConfig := types.StubConfigV1{}
+	if err := json.Unmarshal([]byte(stub.Config), &stubConfig); err != nil {
+		return "", err
+	}
+	if err := s.configureMachinePlacement(ctx, workspace.ExternalId, opts.machineId, &stubConfig); err != nil {
+		return "", err
+	}
+	if err := s.prepareDurableDiskPlacement(ctx, workspace, &stubConfig); err != nil {
+		return "", err
+	}
+
+	secrets, err := abstractions.ConfigureContainerRequestSecrets(ctx, s.backendRepo, workspace, stubConfig, stub.Type.IsSandbox())
+	if err != nil {
+		return "", err
+	}
+
+	containerId := opts.containerId
+	if containerId == "" {
+		containerId = s.generateContainerId(stub.ExternalId, stub.Type)
+	}
+
+	mounts, err := abstractions.ConfigureContainerRequestMounts(
+		containerId,
+		stub,
+		workspace,
+		stubConfig,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	env := []string{}
+	env = append(stubConfig.Env, env...)
+	env = append(secrets.Env, env...)
+	if !stub.Type.IsSandbox() {
+		env = append(env, fmt.Sprintf("BETA9_TOKEN=%s", authInfo.Token.Key))
+	}
+	env = append(env, []string{
+		fmt.Sprintf("STUB_ID=%s", stub.ExternalId),
+		fmt.Sprintf("STUB_TYPE=%s", stub.Type),
+		fmt.Sprintf("KEEP_WARM_SECONDS=%d", stubConfig.KeepWarmSeconds),
+	}...)
+	if opts.taskId != "" {
+		env = append(env, fmt.Sprintf("TASK_ID=%s", opts.taskId))
+	}
+
+	gpuRequest := types.GpuTypesToStrings(stubConfig.Runtime.Gpus)
+	if stubConfig.Runtime.Gpu != "" {
+		gpuRequest = append(gpuRequest, stubConfig.Runtime.Gpu.String())
+	}
+
+	gpuCount := stubConfig.Runtime.GpuCount
+	if stubConfig.RequiresGPU() && gpuCount == 0 {
+		gpuCount = 1
+	}
+
+	checkpointEnabled := stubConfig.CheckpointEnabled
+	if gpuCount > 1 {
+		checkpointEnabled = false
+	}
+
+	ports := []uint32{}
+	if len(stubConfig.Ports) > 0 {
+		ports = stubConfig.Ports
+	}
+
+	setPodKeepWarmLock(
+		context.Background(),
+		s.containerRepo,
+		workspace.Name,
+		stub.ExternalId,
+		containerId,
+		stubConfig.KeepWarmSeconds,
+	)
+
+	if imageId == nil {
+		imageId = &stubConfig.Runtime.ImageId
+	}
+	appId := ""
+	if stub.App != nil {
+		appId = stub.App.ExternalId
+	}
+	requestStub := *stub
+	if opts.forceResourceLimits {
+		requestStub.Config, err = types.StubConfigWithForcedResourceLimits(stub.Config)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	runRequest := &types.ContainerRequest{
+		ContainerId:       containerId,
+		StubId:            stub.ExternalId,
+		TaskId:            opts.taskId,
+		AppId:             appId,
+		Env:               env,
+		SecretBindings:    secrets.Bindings,
+		Cpu:               stubConfig.Runtime.Cpu,
+		Memory:            stubConfig.Runtime.Memory,
+		GpuRequest:        gpuRequest,
+		GpuCount:          uint32(gpuCount),
+		Mounts:            mounts,
+		Stub:              requestStub,
+		ImageId:           *imageId,
+		WorkspaceId:       workspace.ExternalId,
+		Workspace:         *workspace,
+		EntryPoint:        stubConfig.EntryPoint,
+		Ports:             ports,
+		CheckpointEnabled: checkpointEnabled,
+		CheckpointTrigger: stubConfig.CheckpointTrigger,
+		Checkpoint:        checkpoint,
+		PoolSelector:      stubConfig.PoolSelector(),
+		MachineId:         stubConfig.MachineID,
+		Hostname:          stubConfig.Hostname,
+	}
+	if err := abstractions.ConfigureContainerRequestNetwork(runRequest, stubConfig); err != nil {
+		return "", err
+	}
+
+	err = s.scheduler.Run(runRequest)
+	if err != nil {
+		setPodKeepWarmLock(
+			context.Background(),
+			s.containerRepo,
+			workspace.Name,
+			stub.ExternalId,
+			containerId,
+			0,
+		)
+		return "", err
+	}
+
+	go s.eventRepo.PushRunStubEvent(workspace.ExternalId, &stub.Stub, authInfo.Actor)
+
+	// Sandboxes never create task records, so the dashboard's 24h activity
+	// strip reads this O(1) hourly counter instead of replaying event history.
+	if stub.Type == types.StubType(types.StubTypeSandbox) && appId != "" && s.containerRepo != nil {
+		if err := s.containerRepo.RecordSandboxCreated(workspace.ExternalId, appId, time.Now()); err != nil {
+			log.Warn().Err(err).Str("app_id", appId).Msg("failed to record sandbox activity")
+		}
+	}
+
+	return containerId, nil
+}
+
+func (s *GenericPodService) configureMachinePlacement(ctx context.Context, workspaceID, machineID string, stubConfig *types.StubConfigV1) error {
+	machineID = strings.TrimSpace(machineID)
+	if machineID == "" {
+		return nil
+	}
+	if s.computeRepo == nil {
+		return fmt.Errorf("machine targeting is unavailable")
+	}
+
+	machine, err := s.computeRepo.GetAgentMachineStateForWorkspace(ctx, workspaceID, machineID)
+	if err != nil {
+		return err
+	}
+	if machine == nil {
+		return fmt.Errorf("machine not found")
+	}
+	if !computemodel.AgentMachineConnected(machine, time.Now()) {
+		return fmt.Errorf("machine is not connected")
+	}
+
+	if selector := stubConfig.PoolSelector(); selector != "" && selector != machine.PoolName {
+		return fmt.Errorf("machine %s does not belong to pool %s", machineID, selector)
+	}
+	stubConfig.Pool = &types.PoolConfig{Name: machine.PoolName, Selector: machine.PoolName}
+	stubConfig.MachineID = machineID
+	return nil
+}
+
+func podRunWorkspace(authInfo *auth.AuthInfo, stub *types.StubWithRelated) (*types.Workspace, error) {
+	if authInfo == nil || authInfo.Workspace == nil {
+		return nil, fmt.Errorf("missing workspace auth")
+	}
+	if stub == nil {
+		return nil, fmt.Errorf("missing stub")
+	}
+	if stub.Workspace.ExternalId != "" && stub.Workspace.ExternalId != authInfo.Workspace.ExternalId {
+		return nil, fmt.Errorf("stub does not belong to workspace")
+	}
+	if stub.Workspace.ExternalId != "" {
+		return &stub.Workspace, nil
+	}
+	return authInfo.Workspace, nil
+}
+
+func podRunnableStub(stubType types.StubType) bool {
+	switch stubType.Kind() {
+	case types.StubTypePod, types.StubTypeSandbox, types.StubTypeVM:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *GenericPodService) CreatePod(ctx context.Context, in *pb.CreatePodRequest) (*pb.CreatePodResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+	var err error = nil
+	var checkpoint *types.Checkpoint = nil
+	var stub *types.StubWithRelated = nil
+
+	if in.ImageId != nil {
+		if err := repository.AuthorizeImage(ctx, s.backendRepo, authInfo.Workspace.ExternalId, *in.ImageId); err != nil {
+			return &pb.CreatePodResponse{Ok: false, ErrorMsg: err.Error()}, nil
+		}
+	}
+
+	if in.CheckpointId != nil {
+		checkpoint, err = s.backendRepo.GetCheckpointById(ctx, *in.CheckpointId)
+		if err != nil || checkpoint.WorkspaceId != authInfo.Workspace.Id {
+			return &pb.CreatePodResponse{
+				Ok: false,
+			}, nil
+		}
+
+		originalStub, err := s.backendRepo.GetStubById(ctx, checkpoint.StubId)
+		if err != nil {
+			return &pb.CreatePodResponse{
+				Ok: false,
+			}, nil
+		}
+
+		if in.StubId != "" && in.StubId != originalStub.ExternalId {
+			stub, err = s.loadStub(ctx, in.StubId)
+			if err != nil || authInfo == nil || authInfo.Workspace == nil || stub == nil || stub.WorkspaceId != authInfo.Workspace.Id {
+				return &pb.CreatePodResponse{Ok: false}, nil
+			}
+		} else {
+			stub, err = s.cloneStub(ctx, authInfo.Workspace, originalStub)
+			if err != nil {
+				return &pb.CreatePodResponse{
+					Ok: false,
+				}, nil
+			}
+		}
+	}
+
+	if stub == nil {
+		if in.StubId == "" {
+			in.StubId = s.preparedStubID(ctx, authInfo.Workspace.ExternalId)
+		}
+		stub, err = s.loadStub(ctx, in.StubId)
+		if err != nil {
+			return &pb.CreatePodResponse{
+				Ok:       false,
+				ErrorMsg: fmt.Sprintf("load stub %s: %v", in.StubId, err),
+			}, nil
+		}
+	}
+
+	opts := createPodRunOptions(ctx, in, checkpoint)
+
+	var containerId, taskId string
+	if s.trackRunAsTask(stub) {
+		// Track this run as a task: the dispatcher creates the task record and
+		// PodTask.Execute schedules the container.
+		podTask, err := s.taskDispatcher.SendAndExecute(ctx, string(types.ExecutorContainer), authInfo, stub.ExternalId, &types.TaskPayload{}, podRunTaskPolicy(), authInfo, stub, opts)
+		if err != nil {
+			return &pb.CreatePodResponse{
+				Ok:       false,
+				ErrorMsg: err.Error(),
+				StubId:   stub.ExternalId,
+			}, nil
+		}
+
+		metadata := podTask.Metadata()
+		containerId = metadata.ContainerId
+		taskId = metadata.TaskId
+	} else {
+		containerId, err = s.run(ctx, authInfo, stub, opts)
+		if err != nil {
+			return &pb.CreatePodResponse{
+				Ok:       false,
+				ErrorMsg: err.Error(),
+				StubId:   stub.ExternalId,
+			}, nil
+		}
+	}
+
+	appId := ""
+	if stub.App != nil {
+		appId = stub.App.ExternalId
+	}
+
+	return &pb.CreatePodResponse{
+		Ok:          true,
+		ContainerId: containerId,
+		StubId:      stub.ExternalId,
+		TaskId:      taskId,
+		AppId:       appId,
+	}, nil
+}
+
+func (s *GenericPodService) preparedStubID(ctx context.Context, workspaceID string) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	cacheKeys := md.Get(common.PreparedStubCacheMetadata)
+	if len(cacheKeys) == 0 || cacheKeys[0] == "" {
+		return ""
+	}
+	cacheKey := cacheKeys[0]
+
+	if s.rdb != nil {
+		stubID, _ := s.rdb.GetEx(
+			ctx,
+			common.RedisKeys.GatewayPreparedStub(workspaceID, cacheKey),
+			common.PreparedStubCacheTTL,
+		).Result()
+		if stubID != "" {
+			return stubID
+		}
+	}
+
+	if s.backendRepo == nil {
+		return ""
+	}
+	stubs, err := s.backendRepo.ListStubs(ctx, types.StubFilter{
+		WorkspaceID:         workspaceID,
+		StubTypes:           types.StringSlice{string(types.StubTypeSandbox)},
+		PreparationCacheKey: cacheKey,
+	})
+	if err != nil || len(stubs) == 0 {
+		return ""
+	}
+
+	stubID := stubs[0].ExternalId
+	if s.rdb != nil {
+		_ = s.rdb.SetEx(
+			ctx,
+			common.RedisKeys.GatewayPreparedStub(workspaceID, cacheKey),
+			stubID,
+			common.PreparedStubCacheTTL,
+		).Err()
+	}
+	return stubID
+}
+
+func (s *GenericPodService) loadStub(ctx context.Context, stubId string) (*types.StubWithRelated, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case loaded := <-s.stubLoadGroup.DoChan(stubId, func() (interface{}, error) {
+		loadCtx, cancel := context.WithTimeout(context.Background(), podStubLoadTimeout)
+		defer cancel()
+		return s.backendRepo.GetStubByExternalId(loadCtx, stubId)
+	}):
+		stub, _ := loaded.Val.(*types.StubWithRelated)
+		return stub, loaded.Err
+	}
+}
+
+// trackRunAsTask reports whether a stub's containers should be tracked with
+// task records. Only one-shot `pod/run` stubs qualify -- deployments are
+// long-running services, and sandboxes/shells are interactive sessions.
+func (s *GenericPodService) trackRunAsTask(stub *types.StubWithRelated) bool {
+	return string(stub.Type) == types.StubTypePodRun && s.taskDispatcher != nil
+}
+
+func (s *GenericPodService) generateContainerId(stubId string, stubType types.StubType) string {
+	prefix := types.StubTypePod
+	if stubType.IsSandbox() {
+		prefix = stubType.Kind()
+	}
+	return fmt.Sprintf("%s-%s-%s", prefix, stubId, uuid.New().String()[:8])
+}
+
+// TODO: consolidate this logic with the logic in api/v1/stub.go - for now just clone the object without cloning the object (does not matter for sandboxes/pods)
+func (s *GenericPodService) cloneStub(ctx context.Context, workspace *types.Workspace, stub *types.StubWithRelated) (*types.StubWithRelated, error) {
+	stubConfig := &types.StubConfigV1{}
+	if err := json.Unmarshal([]byte(stub.Config), &stubConfig); err != nil {
+		return nil, err
+	}
+
+	parentSecrets := stubConfig.Secrets
+	stubConfig.Secrets = []types.Secret{}
+
+	if stubConfig.RequiresGPU() {
+		concurrencyLimit, err := s.backendRepo.GetConcurrencyLimitByWorkspaceId(ctx, workspace.ExternalId)
+		if err != nil && concurrencyLimit != nil && concurrencyLimit.GPULimit <= 0 {
+			return nil, err
+		}
+	}
+
+	for _, secret := range parentSecrets {
+		secret, err := s.backendRepo.GetSecretByName(ctx, workspace, secret.Name)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+
+			return nil, err
+		}
+
+		stubConfig.Secrets = append(stubConfig.Secrets, types.Secret{
+			Name:      secret.Name,
+			Value:     secret.Value,
+			CreatedAt: secret.CreatedAt,
+			UpdatedAt: secret.UpdatedAt,
+		})
+	}
+
+	for _, volumeConfig := range stubConfig.Volumes {
+		parentVolume, err := s.backendRepo.GetVolumeByExternalId(ctx, stub.WorkspaceId, volumeConfig.Id)
+		if err != nil {
+			return nil, err
+		}
+
+		childVolume, err := s.backendRepo.GetOrCreateVolume(ctx, workspace.Id, parentVolume.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		volumeConfig.Id = childVolume.ExternalId
+	}
+
+	err := s.configureVolumes(ctx, stubConfig.Volumes, workspace)
+	if err != nil {
+		return nil, err
+	}
+
+	app, err := s.backendRepo.GetOrCreateApp(ctx, workspace.Id, stub.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	newStub, err := s.backendRepo.GetOrCreateStub(ctx, stub.Name, string(stub.Type), *stubConfig, stub.ObjectId, workspace.Id, true, app.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	stub.Stub = newStub
+	return stub, nil
+}
+
+func (s *GenericPodService) configureVolumes(ctx context.Context, volumes []*pb.Volume, workspace *types.Workspace) error {
+	for i, volume := range volumes {
+
+		if volume.Config != nil {
+			// De-reference secrets
+			accessKey, err := s.backendRepo.GetSecretByName(ctx, workspace, volume.Config.AccessKey)
+			if err != nil {
+				return fmt.Errorf("Failed to get secret: %s", volume.Config.AccessKey)
+			}
+			volumes[i].Config.AccessKey = accessKey.Value
+
+			secretKey, err := s.backendRepo.GetSecretByName(ctx, workspace, volume.Config.SecretKey)
+			if err != nil {
+				return fmt.Errorf("Failed to get secret: %s", volume.Config.SecretKey)
+			}
+
+			volumes[i].Config.SecretKey = secretKey.Value
+		}
+	}
+
+	return nil
+}

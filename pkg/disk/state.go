@@ -1,0 +1,192 @@
+package disk
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// Volume directory layout: layer files under layersSubdir, the durability
+// record beside them.
+const (
+	stateFileName = "state.json"
+	layersSubdir  = "layers"
+)
+
+// headLayerPath names the writable head created by pivot number n. The
+// counter keeps names unique so a sealed layer is never overwritten.
+func headLayerPath(layersDir string, pivot int) string {
+	return filepath.Join(layersDir, fmt.Sprintf("head-%06d.qcow2", pivot))
+}
+
+// volumeState is the single per-volume durability record. It is written with
+// an atomic rename before and after every mutating step, and is all that
+// recovery needs to clean up or adopt a volume after a crash.
+type volumeState struct {
+	Key              string `json:"key"`
+	VirtualSizeBytes int64  `json:"virtual_size_bytes"`
+	ReadOnly         bool   `json:"read_only"`
+	Mountpoint       string `json:"mountpoint,omitempty"`
+	Attached         bool   `json:"attached"`
+	Journal          bool   `json:"journal,omitempty"`
+	// Owner is who attached the volume (see AttachSpec.Owner).
+	Owner string `json:"owner,omitempty"`
+	// Formatted records that mkfs ran on the base image; it prevents a reused
+	// but never-snapshotted disk from being wiped by a second mkfs.
+	Formatted bool `json:"formatted"`
+
+	// Chain is the published backing chain, base first. Every layer file is
+	// immutable once listed here.
+	Chain []stateLayer `json:"chain,omitempty"`
+	// Pending are sealed layers that have not been published yet. They sit
+	// between Chain and Head in backing order and must be published (oldest
+	// first) before any newer layer, or the remote chain would lose clusters.
+	Pending []stateLayer `json:"pending,omitempty"`
+	// HeadPath is the writable tip. Empty for read-only volumes.
+	HeadPath   string `json:"head_path,omitempty"`
+	PivotCount int    `json:"pivot_count"`
+	// Superseded holds generations a merge republished under new IDs, oldest
+	// first, so an attach naming one still reuses the local chain.
+	Superseded []supersededID `json:"superseded,omitempty"`
+
+	QSDPid    int    `json:"qsd_pid,omitempty"`
+	QMPSocket string `json:"qmp_socket,omitempty"`
+	NBDSocket string `json:"nbd_socket,omitempty"`
+	NBDDevice string `json:"nbd_device,omitempty"`
+
+	// Export is the ExportMode the volume was attached with ("" = NBD).
+	// For vhost-user-blk, ExportSocket is the socket the VM connects to.
+	Export       string `json:"export,omitempty"`
+	ExportSocket string `json:"export_socket,omitempty"`
+}
+
+func (s *volumeState) exportMode() ExportMode {
+	if s.Export == string(ExportVhostUser) {
+		return ExportVhostUser
+	}
+	return ExportNBD
+}
+
+type stateLayer struct {
+	// SnapshotID is the published DiskSnapshot external ID, empty while the
+	// layer is still pending.
+	SnapshotID      string `json:"snapshot_id,omitempty"`
+	JournalSequence uint64 `json:"journal_sequence,omitempty"`
+	Path            string `json:"path"`
+}
+
+type supersededID struct {
+	ID string `json:"id"`
+	By string `json:"by"`
+}
+
+// maxSuperseded bounds Superseded: an attach names the newest generation or
+// the one a memory checkpoint was paired with.
+const maxSuperseded = 64
+
+func (s *volumeState) publishedIDs() map[string]bool {
+	ids := make(map[string]bool, len(s.Chain))
+	for _, layer := range s.Chain {
+		if layer.SnapshotID != "" {
+			ids[layer.SnapshotID] = true
+		}
+	}
+	for _, superseded := range s.Superseded {
+		if ids[superseded.By] {
+			ids[superseded.ID] = true
+		}
+	}
+	return ids
+}
+
+// supersede records that a merge republished generation id as by.
+func (s *volumeState) supersede(id, by string) {
+	for i := range s.Superseded {
+		if s.Superseded[i].By == id {
+			s.Superseded[i].By = by
+		}
+	}
+	s.Superseded = append(s.Superseded, supersededID{ID: id, By: by})
+	s.Superseded = s.Superseded[max(0, len(s.Superseded)-maxSuperseded):]
+}
+
+// lastLayerPath returns the backing parent for a new head: the newest pending
+// layer, else the newest chain layer, else nothing.
+func (s *volumeState) lastLayerPath() string {
+	if n := len(s.Pending); n > 0 {
+		return s.Pending[n-1].Path
+	}
+	if n := len(s.Chain); n > 0 {
+		return s.Chain[n-1].Path
+	}
+	return ""
+}
+
+func (s *volumeState) depth() int {
+	depth := len(s.Chain) + len(s.Pending)
+	if s.HeadPath != "" {
+		depth++
+	}
+	return depth
+}
+
+func loadVolumeState(dir string) (*volumeState, error) {
+	data, err := os.ReadFile(filepath.Join(dir, stateFileName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	state := &volumeState{}
+	if err := json.Unmarshal(data, state); err != nil {
+		return nil, fmt.Errorf("parse volume state in %s: %w", dir, err)
+	}
+	return state, nil
+}
+
+func saveVolumeState(dir string, state *volumeState) error {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dir, stateFileName), data)
+}
+
+// writeFileAtomic replaces path with data through a synced temporary file and
+// a rename, so a crash mid-write never leaves a torn file behind.
+func writeFileAtomic(path string, data []byte) error {
+	tmpPath := path + ".tmp"
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	return replaceFileAtomic(file, path)
+}
+
+// replaceFileAtomic takes ownership of file and installs it after syncing its
+// contents. Syncing the destination directory makes the rename durable too.
+func replaceFileAtomic(file *os.File, path string) error {
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}

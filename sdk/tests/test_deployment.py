@@ -1,0 +1,242 @@
+from types import SimpleNamespace
+from unittest import TestCase, mock
+from unittest.mock import MagicMock
+
+from beta9 import Image, Pod, Service, asgi, endpoint, function, realtime, schedule, task_queue
+
+
+class GatewayStubMock:
+    def __init__(self, deployment_id):
+        self.deployment_id = deployment_id
+
+    def deploy_stub(self):
+        return MagicMock(deployment_id=self.deployment_id, ok=True)
+
+
+class TestDeployment(TestCase):
+    def test_init(self):
+        pass
+
+    @mock.patch(
+        "beta9.abstractions.function.Function.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.function.Function.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_function_deploy(self, gateway_stub_mock, prepare_runtime_mock):
+        @function(name="test-func", cpu=1, memory=128, image=Image(python_version="python3.8"))
+        def test_func():
+            return 1
+
+        resp, ok = test_func.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
+
+    @mock.patch(
+        "beta9.abstractions.function.DeployableMixin.deploy",
+        return_value=(MagicMock(), True),
+    )
+    @mock.patch(
+        "beta9.abstractions.function.FunctionServiceStub.function_schedule",
+        return_value=MagicMock(),
+    )
+    def test_schedule_deploy(
+        self,
+        function_schedule_mock,
+        deploy_mock,
+    ):
+        @schedule(
+            when="0 */6 * * *",
+            name="test-schedule",
+            cpu=1,
+            memory=128,
+            image=Image(python_version="python3.8"),
+        )
+        def test_schedule():
+            return 1
+
+        resp, ok = test_schedule.deploy()
+
+        self.assertEqual(ok, True)
+        self.assertEqual(
+            resp["scheduled_job_id"], function_schedule_mock.return_value.scheduled_job_id
+        )
+        self.assertEqual(resp["deployment_id"], deploy_mock.return_value[0]["deployment_id"])
+
+    @mock.patch(
+        "beta9.abstractions.endpoint.Endpoint.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.endpoint.Endpoint.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_endpoint_deploy(self, gateway_stub_mock, prepare_runtime_mock):
+        @endpoint(name="test-endpoint", cpu=1, memory=128, image=Image(python_version="python3.8"))
+        def test_endpoint():
+            return {"result": 1}
+
+        resp, ok = test_endpoint.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
+
+    @mock.patch(
+        "beta9.abstractions.endpoint.ASGI.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.endpoint.ASGI.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_asgi_deploy(self, gateway_stub_mock, prepare_runtime_mock):
+        @asgi(name="test-asgi", cpu=1, memory=128, image=Image(python_version="python3.8"))
+        def test_asgi_app(scope, receive, send):
+            pass
+
+        resp, ok = test_asgi_app.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
+
+    @mock.patch(
+        "beta9.abstractions.endpoint.ASGI.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.endpoint.ASGI.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_realtime_asgi_deploy(self, gateway_stub_mock, prepare_runtime_mock):
+        @realtime(name="test-realtime", cpu=1, memory=128, image=Image(python_version="python3.8"))
+        def test_realtime_app(scope, receive, send):
+            pass
+
+        resp, ok = test_realtime_app.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
+
+    @mock.patch(
+        "beta9.abstractions.taskqueue.TaskQueue.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.taskqueue.TaskQueue.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_task_queue_deploy(self, gateway_stub_mock, prepare_runtime_mock):
+        @task_queue(name="test-queue", cpu=1, memory=128, image=Image(python_version="python3.8"))
+        def test_task():
+            return 1
+
+        resp, ok = test_task.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
+
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_pod_deploy(self, gateway_stub_mock, prepare_runtime_mock):
+        test_pod = Pod(
+            name="test-pod",
+            cpu=1,
+            memory=128,
+            image=Image(python_version="python3.8"),
+            entrypoint=["python", "app.py"],
+        )
+
+        resp, ok = test_pod.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)
+
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.gateway_stub",
+        return_value=MagicMock(),
+    )
+    def test_pod_deploy_passes_rollout_mode(self, gateway_stub_mock, prepare_runtime_mock):
+        gateway_stub_mock.deploy_stub.return_value = SimpleNamespace(
+            deployment_id="test-deployment-id",
+            ok=True,
+            invoke_url="",
+            version=1,
+            warn_msg="",
+            rollout_action="replace",
+        )
+        test_pod = Pod(
+            name="test-pod",
+            cpu=1,
+            memory=128,
+            image=Image(python_version="python3.8"),
+            entrypoint=["python", "app.py"],
+        )
+
+        resp, ok = test_pod.deploy(rollout="replace")
+
+        self.assertTrue(ok)
+        self.assertEqual(resp["rollout_action"], "replace")
+        request = gateway_stub_mock.deploy_stub.call_args.args[0]
+        self.assertEqual(request.rollout, "replace")
+
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.prepare_runtime",
+        return_value=True,
+    )
+    @mock.patch(
+        "beta9.abstractions.pod.Pod.gateway_stub",
+        return_value=MagicMock(
+            deploy_stub=MagicMock(
+                return_value=MagicMock(deployment_id="test-deployment-id", ok=True)
+            )
+        ),
+    )
+    def test_service_deploy_with_image_entrypoint(self, gateway_stub_mock, prepare_runtime_mock):
+        test_service = Service(
+            name="test-service",
+            image=Image.from_id("img-123"),
+            ports=[8080],
+        )
+
+        with mock.patch.object(Service, "print_invocation_snippet"):
+            resp, ok = test_service.deploy()
+
+        self.assertEqual(ok, gateway_stub_mock.deploy_stub().ok)
+        self.assertEqual(resp["deployment_id"], gateway_stub_mock.deploy_stub().deployment_id)

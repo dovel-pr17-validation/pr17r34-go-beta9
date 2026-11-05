@@ -1,0 +1,270 @@
+package common
+
+import (
+	"context"
+	"io"
+	"net"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+func TestContainerClientWithDialerDoesNotBlockSharedCacheFill(t *testing.T) {
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	started := time.Now()
+	client, err := NewContainerClientWithDialer(context.Background(), "route://worker", dialer)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	require.Less(t, time.Since(started), 100*time.Millisecond)
+}
+
+func TestTerminalCheckpointWaitForReadyHonorsCallerDeadline(t *testing.T) {
+	client, err := NewContainerClientWithDialer(context.Background(), "route://unavailable-worker", func(ctx context.Context, _ string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = client.Checkpoint(ctx, "container", ContainerCheckpointOptions{TerminateAfterCheckpoint: true})
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+}
+
+type statusServer struct {
+	pb.UnimplementedContainerServiceServer
+}
+
+func (statusServer) ContainerSandboxStatus(context.Context, *pb.ContainerSandboxStatusRequest) (*pb.ContainerSandboxStatusResponse, error) {
+	return &pb.ContainerSandboxStatusResponse{Ok: true}, nil
+}
+
+// deadConn fails on its next use once cut, which is all a client learns of a
+// worker that died behind the tailnet.
+type deadConn struct {
+	net.Conn
+	cut *atomic.Bool
+}
+
+func (c *deadConn) Read(b []byte) (int, error) {
+	if c.cut.Load() {
+		_ = c.Conn.Close()
+		return 0, io.EOF
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *deadConn) Write(b []byte) (int, error) {
+	if c.cut.Load() {
+		_ = c.Conn.Close()
+		return 0, syscall.ECONNRESET
+	}
+	return c.Conn.Write(b)
+}
+
+// The cached channel to a worker survives its connection dying under it.
+func TestContainerClientWithDialerRetriesOnDeadConnection(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := grpc.NewServer()
+	pb.RegisterContainerServiceServer(srv, statusServer{})
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	var cut atomic.Bool
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", lis.Addr().String())
+		if err != nil || cut.Load() {
+			return conn, err
+		}
+		return &deadConn{Conn: conn, cut: &cut}, nil
+	}
+	client, err := NewContainerClientWithDialer(context.Background(), "route://worker", dialer)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	_, err = client.SandboxStatusContext(context.Background(), "c", 1)
+	require.NoError(t, err)
+
+	cut.Store(true)
+	_, err = client.SandboxStatusContext(context.Background(), "c", 1)
+	require.NoError(t, err)
+}
+
+func TestContainerClientUsesTLS(t *testing.T) {
+	if !containerClientUsesTLS("127.0.0.1:443") {
+		t.Fatal("port 443 should use TLS")
+	}
+	if !containerClientUsesTLS("[::1]:443") {
+		t.Fatal("IPv6 port 443 should use TLS")
+	}
+	if containerClientUsesTLS("127.0.0.1:51443") {
+		t.Fatal("port 51443 should not use TLS")
+	}
+}
+
+type attachmentClientStream struct {
+	pb.ContainerService_ContainerStreamLogsClient
+	attach <-chan struct{}
+}
+
+func (s *attachmentClientStream) Header() (metadata.MD, error) {
+	<-s.attach
+	return nil, nil
+}
+
+func (s *attachmentClientStream) Recv() (*pb.ContainerLogEntry, error) {
+	return nil, io.EOF
+}
+
+type attachmentContainerClient struct {
+	pb.ContainerServiceClient
+	stream pb.ContainerService_ContainerStreamLogsClient
+}
+
+func (c *attachmentContainerClient) ContainerStreamLogs(context.Context, *pb.ContainerStreamLogsRequest, ...grpc.CallOption) (pb.ContainerService_ContainerStreamLogsClient, error) {
+	return c.stream, nil
+}
+
+func TestStreamLogsReadyWaitsForWorkerAttachment(t *testing.T) {
+	attach := make(chan struct{})
+	ready := make(chan struct{})
+	client := &ContainerClient{client: &attachmentContainerClient{
+		stream: &attachmentClientStream{attach: attach},
+	}}
+	done := make(chan error, 1)
+	go func() {
+		done <- client.StreamLogsWithReady(context.Background(), "container-id", make(chan OutputMsg), func() { close(ready) })
+	}()
+
+	select {
+	case <-ready:
+		t.Fatal("reported ready before worker attachment")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(attach)
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("did not report worker attachment")
+	}
+	require.NoError(t, <-done)
+}
+
+// metadataServer echoes the headers a worker receives.
+type metadataServer struct {
+	pb.UnimplementedContainerServiceServer
+}
+
+func (metadataServer) ContainerStreamLogs(_ *pb.ContainerStreamLogsRequest, stream pb.ContainerService_ContainerStreamLogsServer) error {
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	return stream.Send(&pb.ContainerLogEntry{Msg: strings.Join(md.Get("authorization"), "") + ":" + strings.Join(md.Get(LogOffsetHeader), "")})
+}
+
+func (metadataServer) ContainerSandboxDownloadFile(ctx context.Context, _ *pb.ContainerSandboxDownloadFileRequest) (*pb.ContainerSandboxDownloadFileResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	return &pb.ContainerSandboxDownloadFileResponse{
+		Ok:       true,
+		ErrorMsg: strings.Join(md.Get("authorization"), "") + ":" + strings.Join(md.Get(RequestIDHeader), "") + ":" + strings.Join(md.Get(RequestAckHeader), ""),
+		Data:     make([]byte, 5<<20), // over gRPC's default 4 MiB receive limit
+	}, nil
+}
+
+func newMetadataServerClient(t *testing.T) *ContainerClient {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	pb.RegisterContainerServiceServer(server, metadataServer{})
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(server.Stop)
+
+	client, err := NewContainerClient(lis.Addr().String(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func TestContainerClientForwardsLogCursor(t *testing.T) {
+	client := newMetadataServerClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(LogOffsetHeader, "128", "authorization", "Bearer user-token"))
+	output := make(chan OutputMsg, 1)
+
+	require.NoError(t, client.StreamLogs(ctx, "container-id", output))
+	require.Equal(t, ":128", (<-output).Msg)
+}
+
+func TestContainerClientForwardsRequestIDWithoutCredentials(t *testing.T) {
+	client := newMetadataServerClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(RequestIDHeader, "request-1", RequestAckHeader, "ack-1", "authorization", "Bearer user-token"))
+
+	resp, err := client.SandboxDownloadFile(ctx, &pb.ContainerSandboxDownloadFileRequest{ContainerId: "container-id"})
+	require.NoError(t, err)
+	require.Equal(t, ":request-1:ack-1", resp.ErrorMsg)
+	require.Len(t, resp.Data, 5<<20)
+}
+
+// A relay may stop delivering bytes while TCP still reports a live connection.
+// This differs from a reset: only a transport heartbeat can discover the loss.
+type blackholeConn struct {
+	net.Conn
+	cut *atomic.Bool
+}
+
+func (c *blackholeConn) Write(b []byte) (int, error) {
+	if c.cut.Load() {
+		return len(b), nil
+	}
+	return c.Conn.Write(b)
+}
+
+func TestContainerClientRecoversSilentRelayLoss(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             10 * time.Second,
+		PermitWithoutStream: true,
+	}))
+	pb.RegisterContainerServiceServer(srv, statusServer{})
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	var cut atomic.Bool
+	var dials atomic.Int32
+	client, err := NewContainerClientWithDialer(context.Background(), "route://worker", func(ctx context.Context, _ string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", lis.Addr().String())
+		if err == nil && dials.Add(1) == 1 {
+			return &blackholeConn{Conn: conn, cut: &cut}, nil
+		}
+		return conn, err
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err = client.SandboxReadyContext(ctx, "c")
+	require.NoError(t, err)
+	cut.Store(true)
+	_, err = client.SandboxReadyContext(ctx, "c")
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, dials.Load(), int32(2))
+}

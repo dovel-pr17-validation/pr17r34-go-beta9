@@ -1,0 +1,1141 @@
+package worker
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/beam-cloud/beta9/pkg/cache"
+	"github.com/beam-cloud/beta9/pkg/clients"
+	"github.com/beam-cloud/beta9/pkg/disk"
+	"github.com/beam-cloud/beta9/pkg/runtime"
+	"github.com/beam-cloud/beta9/pkg/types"
+	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/google/uuid"
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/errgroup"
+)
+
+// The qcow driver keeps the durable-disk control plane (DiskSnapshot rows,
+// object layout, required-content sync) identical to the snapshot driver but
+// replaces the worker mechanism with qcow2 block volumes from pkg/disk.
+// Snapshots are near-instant pivots; a mount path of "/" turns the disk into
+// the machine root: the container's overlay upper layer lives on the volume,
+// so the entire root filesystem is preserved across snapshot and fork.
+
+func isQcowDurableDiskMount(mount *types.Mount) bool {
+	return mount != nil && mount.DurableDisk != nil &&
+		durableDiskDriver(mount.DurableDisk.Driver) == types.DurableDiskDriverQcow
+}
+
+func isQcowRootDiskMount(mount *types.Mount) bool {
+	return isQcowDurableDiskMount(mount) && mount.MountPath == types.DurableDiskRootMountPath
+}
+
+// qcowRootDiskMount returns the machine-root disk mount of a request, if any.
+func qcowRootDiskMount(request *types.ContainerRequest) *types.Mount {
+	if request == nil {
+		return nil
+	}
+	for i := range request.Mounts {
+		if isQcowRootDiskMount(&request.Mounts[i]) {
+			return &request.Mounts[i]
+		}
+	}
+	return nil
+}
+
+// checkpointFilesystemOnDisk reports whether the container's writable layer
+// lives on a disk the checkpoint already carries: a sealed qcow root disk,
+// or the scratch disk of a block-root runtime.
+func checkpointFilesystemOnDisk(request *types.ContainerRequest, rt runtime.Runtime) bool {
+	return qcowRootDiskMount(request) != nil || (rt != nil && rt.Capabilities().BlockRoot)
+}
+
+// qcowVolumeKey is stable across container restarts for writable volumes so
+// locally cached layers are reused. Read-only attachments get per-container
+// volumes since they may coexist on one host.
+func (s *Worker) qcowVolumeKey(request *types.ContainerRequest, mount *types.Mount) string {
+	key := fmt.Sprintf("%s-%s", cacheRequestWorkspaceID(request), types.SafeDurableDiskName(mount.DurableDisk.Name))
+	if mount.ReadOnly {
+		key = fmt.Sprintf("%s-ro-%s", key, request.ContainerId)
+	}
+	return key
+}
+
+func (s *Worker) prepareQcowDurableDiskMount(ctx context.Context, request *types.ContainerRequest, mount *types.Mount) error {
+	return s.prepareQcowDurableDiskMountAfterHead(ctx, request, mount, nil)
+}
+
+// afterHead can defer all writes until a pending delivery is accepted. The
+// caller retains the host disk lock from the authoritative read through attach.
+func (s *Worker) prepareQcowDurableDiskMountAfterHead(ctx context.Context, request *types.ContainerRequest, mount *types.Mount, afterHead func() error) (retErr error) {
+	if s.diskManager == nil {
+		return fmt.Errorf("qcow durable disks are not enabled on this worker")
+	}
+	sizeBytes, err := durableDiskSizeBytes(mount.DurableDisk.Size)
+	if err != nil {
+		return fmt.Errorf("qcow durable disk %q requires a valid size: %w", mount.DurableDisk.Name, err)
+	}
+	key := s.qcowVolumeKey(request, mount)
+	phaseStart := time.Now()
+
+	// Resolving a chain costs a round trip per generation. A worker that
+	// published or last restored this disk already holds the whole chain in
+	// memory, and a head that still matches means nothing was published since.
+	newest, err := s.restoreQcowSnapshotRow(ctx, request, mount)
+	if err != nil {
+		return err
+	}
+	if afterHead != nil {
+		if err := afterHead(); err != nil {
+			return err
+		}
+	}
+	journal, committed, err := s.openDatabaseDiskJournal(ctx, request, mount, newest, sizeBytes)
+	if err != nil {
+		return err
+	}
+	if journal != nil {
+		newest = committed
+		defer func() {
+			if retErr != nil {
+				_ = journal.Close()
+			}
+		}()
+	}
+	entries := s.qcowChain(key)
+	rows := make([]*types.DiskSnapshot, 0, len(entries))
+	if qcowChainHeadIs(entries, newest) {
+		for _, entry := range entries {
+			rows = append(rows, entry.row)
+		}
+	} else if rows, err = s.resolveQcowSnapshotChain(ctx, request, mount, newest); err != nil {
+		return err
+	}
+	resolveDuration := time.Since(phaseStart)
+	phaseStart = time.Now()
+
+	stores, err := s.qcowChainStores(ctx, request, rows)
+	if err != nil {
+		return err
+	}
+	if !qcowChainHeadIs(entries, newest) {
+		if entries, err = loadQcowChainManifests(ctx, s.durableDiskSnapshotCacheReader(), rows, stores); err != nil {
+			return err
+		}
+	}
+	chain := make([]disk.ChainLayer, 0, len(entries))
+	manifests := make([]*types.DiskSnapshotManifest, 0, len(entries))
+	for _, entry := range entries {
+		layer, err := qcowManifestLayer(entry.manifest)
+		if err != nil {
+			return fmt.Errorf("qcow snapshot %s: %w", entry.row.ExternalId, err)
+		}
+		chain = append(chain, disk.ChainLayer{SnapshotID: entry.row.ExternalId, Layer: layer})
+		manifests = append(manifests, entry.manifest)
+	}
+	manifestDuration := time.Since(phaseStart)
+	phaseStart = time.Now()
+
+	if publishedSize := qcowChainVirtualSize(manifests); sizeBytes < publishedSize {
+		return fmt.Errorf("durable disk %q cannot shrink from %d to %d bytes", mount.DurableDisk.Name, publishedSize, sizeBytes)
+	}
+	attachSpec := disk.AttachSpec{
+		Key:              key,
+		VirtualSizeBytes: sizeBytes,
+		ReadOnly:         mount.ReadOnly,
+		Mountpoint:       mount.LocalPath,
+		Chain:            chain,
+		Owner:            request.ContainerId,
+		Journal:          journal,
+		JournalLag:       requestStubConfig(request).EffectiveDatabaseConfig().CommitLag(),
+	}
+	if s.runtimeOwnsBlockRoot() {
+		// The guest consumes the volume as a block device; nothing is mounted
+		// on the host, and the pre-pivot freeze runs inside the guest.
+		attachSpec.Export = disk.ExportVhostUser
+		attachSpec.Freeze = s.guestDiskFreezer(request.ContainerId, mount)
+	}
+	volume, err := s.diskManager.Attach(ctx, attachSpec, &qcowChunkSource{cacheReader: s.durableDiskSnapshotCacheReader(), stores: stores})
+	if err != nil {
+		return fmt.Errorf("attach qcow durable disk %q: %w", mount.DurableDisk.Name, err)
+	}
+	log.Info().
+		Str("container_id", request.ContainerId).
+		Str("disk", mount.DurableDisk.Name).
+		Int("generations", len(entries)).
+		Dur("resolve", resolveDuration).
+		Dur("manifests", manifestDuration).
+		Dur("attach", time.Since(phaseStart)).
+		Msg("qcow durable disk prepared")
+
+	// The chain is rooted at its last parentless row, so its length is the
+	// generation count since the last flatten, which drives the merges and
+	// flattened publishes that bound restore chains.
+	s.qcowChains.Store(key, entries)
+	s.reportQcowChainContent(request, entries)
+	if journal != nil {
+		s.checkpointRecoveredJournal(ctx, request, mount, journal)
+		journal.Recovered()
+		go s.checkpointDatabaseDisk(request, mount, volume, journal)
+	}
+	return nil
+}
+
+// checkpointRecoveredJournal publishes the backlog a crash-looping database
+// carried forward in its journal (failed exits publish nothing) before the
+// container can write: a backlog at the journal's limit would hold the
+// database's first writes until the running checkpointer made room. If this
+// one fails, the container starts anyway and the running checkpointer retries.
+func (s *Worker) checkpointRecoveredJournal(ctx context.Context, request *types.ContainerRequest, mount *types.Mount, journal *disk.Journal) {
+	if !journal.NeedsCheckpoint() {
+		return
+	}
+	ctx, stopWatchdog := withDurableDiskInactivityWatchdog(ctx, durableDiskSnapshotInactivityTimeout)
+	defer stopWatchdog()
+	if _, err := s.snapshotQcowDurableDiskMount(ctx, request, mount, durableDiskSyncExplicit); err != nil {
+		log.Warn().Err(err).Str("container_id", request.ContainerId).Str("disk", mount.DurableDisk.Name).
+			Msg("failed to checkpoint the recovered disk journal before start; the running checkpointer retries")
+	}
+}
+
+// journaledDiskMount reports whether a mount is a database disk that commits
+// every flush to its journal.
+func journaledDiskMount(request *types.ContainerRequest, mount *types.Mount) bool {
+	if !isQcowDurableDiskMount(mount) || mount.ReadOnly {
+		return false
+	}
+	return requestStubConfig(request).EffectiveDatabaseConfig().IsJournaled()
+}
+
+// openDatabaseDiskJournal resolves the authoritative head before consulting
+// snapshot caches. Catalog rows published by an old owner cannot override it.
+func (s *Worker) openDatabaseDiskJournal(ctx context.Context, request *types.ContainerRequest, mount *types.Mount, newest *types.DiskSnapshot, size int64) (*disk.Journal, *types.DiskSnapshot, error) {
+	if !journaledDiskMount(request, mount) {
+		return nil, newest, nil
+	}
+	if s.runtimeOwnsBlockRoot() {
+		return nil, nil, fmt.Errorf("database flush durability requires a host-mounted disk on this worker")
+	}
+	if newest == nil && mount.DurableDisk.SourceSnapshotId != "" {
+		var err error
+		newest, err = s.seedDurableDiskSnapshot(ctx, request, mount)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	store, err := newDurableDiskSnapshotWriteStore(ctx, request)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.verifyJournalStore(ctx, store.client); err != nil {
+		return nil, nil, err
+	}
+	prefix := path.Join("durable-disks", types.SafeDurableDiskName(mount.DurableDisk.Name), "journal")
+	owner := request.ContainerId + "/" + uuid.NewString()
+	journal, err := disk.OpenJournal(ctx, store.client, prefix, owner, durableDiskSnapshotExternalID(newest), size)
+	if err != nil {
+		return nil, nil, err
+	}
+	snapshotID, _, _ := journal.State()
+	if snapshotID == "" {
+		return journal, nil, nil
+	}
+	if newest != nil && newest.ExternalId == snapshotID {
+		return journal, newest, nil
+	}
+	committed, err := s.diskSnapshotByID(ctx, request, snapshotID)
+	if err != nil {
+		_ = journal.Close()
+		return nil, nil, err
+	}
+	if committed == nil || committed.ManifestKey == "" {
+		_ = journal.Close()
+		return nil, nil, fmt.Errorf("committed database snapshot %s is unavailable", snapshotID)
+	}
+	return journal, committed, nil
+}
+
+// verifyJournalStore checks, once per store for the life of this worker,
+// that the store honours the conditional writes the journal's ownership
+// fence depends on. The probe is several conditional writes, so a store that
+// is merely slow to settle gets a few tries before the attach fails.
+func (s *Worker) verifyJournalStore(ctx context.Context, client *clients.WorkspaceStorageClient) error {
+	key := journalStoreKey(client.WorkspaceStorage)
+	if _, verified := s.verifiedJournalStores.Load(key); verified {
+		return nil
+	}
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = client.VerifyConditionalWrites(ctx); err == nil {
+			s.verifiedJournalStores.Store(key, struct{}{})
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("verify conditional writes on %s: %w", key, err)
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("verify conditional writes on %s: %w", key, err)
+}
+
+// journalStoreKey identifies the backend a probe result belongs to. Bucket
+// names repeat across endpoints, so the name alone would let one store's
+// pass vouch for another.
+func journalStoreKey(storage *types.WorkspaceStorage) string {
+	value := func(field *string) string {
+		if field == nil {
+			return ""
+		}
+		return *field
+	}
+	return value(storage.EndpointUrl) + "/" + value(storage.Region) + "/" + value(storage.BucketName)
+}
+
+// A database disk is checkpointed when its journal asks (recovery bounds) or
+// when it changed and it has been this long since the last published
+// generation, so forks and restores start from something recent. Every
+// publish is a generation in the disk's snapshot chain, so the floor is
+// deliberately coarse, and an idle disk publishes nothing. Failed
+// publishes retry with backoff capped well under the interval: the journal
+// keeps growing toward its limits until a checkpoint succeeds. Writes held at
+// the limits fail the disk unless a checkpoint makes room within the
+// journal's two-minute room wait, so while any are held, retries come at the
+// shortest backoff.
+const (
+	databaseCheckpointInterval = 15 * time.Minute
+	databaseCheckpointRetryMin = 30 * time.Second
+	databaseCheckpointRetryMax = 2 * time.Minute
+)
+
+func (s *Worker) checkpointDatabaseDisk(request *types.ContainerRequest, mount *types.Mount, volume *disk.Volume, journal *disk.Journal) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	key := s.qcowVolumeKey(request, mount)
+	lastCheckpoint := time.Now()
+	// Failures back off until the publish path recovers, and each retry
+	// publishes what the failed attempts sealed before sealing more.
+	var failedAt time.Time
+	backoff := databaseCheckpointRetryMin
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-journal.Checkpoints():
+		case <-ticker.C:
+		}
+		current, attached := s.diskManager.Volume(key)
+		if !attached || current != volume {
+			return
+		}
+		if err := journal.Check(); err != nil {
+			log.Error().Err(err).Str("disk", mount.DurableDisk.Name).Msg("stopping database after disk persistence failure")
+			if err := s.stopContainer(request.ContainerId, true); err != nil {
+				log.Error().Err(err).Str("container_id", request.ContainerId).Msg("failed to stop database")
+			}
+			return
+		}
+		_, _, pending := journal.State()
+		if pending == 0 {
+			continue
+		}
+		if !failedAt.IsZero() {
+			retry := backoff
+			if journal.Waiting() {
+				retry = databaseCheckpointRetryMin
+			}
+			if time.Since(failedAt) < retry {
+				continue
+			}
+		}
+		if !journal.NeedsCheckpoint() && (time.Since(lastCheckpoint) < databaseCheckpointInterval || !volume.Changed()) {
+			continue
+		}
+		// Writers wait on this checkpoint once the journal fills, so a large
+		// publish runs as long as it keeps making progress.
+		started := time.Now()
+		ctx, stopWatchdog := withDurableDiskInactivityWatchdog(s.ctx, durableDiskSnapshotInactivityTimeout)
+		err := withDurableDiskLock(ctx, mount, func() error {
+			_, err := s.snapshotQcowDurableDiskMount(ctx, request, mount, durableDiskSyncCheckpoint)
+			return err
+		})
+		stopWatchdog()
+		if err != nil {
+			if !failedAt.IsZero() {
+				backoff = min(backoff*2, databaseCheckpointRetryMax)
+			}
+			log.Error().Err(err).Str("disk", mount.DurableDisk.Name).Dur("retry_in", backoff).
+				Msg("database checkpoint failed; committed journal retained")
+			failedAt = time.Now()
+			continue
+		}
+		log.Info().Str("disk", mount.DurableDisk.Name).Int("journal_bytes", pending).
+			Dur("duration", time.Since(started)).Msg("database checkpoint published")
+		lastCheckpoint, failedAt, backoff = time.Now(), time.Time{}, databaseCheckpointRetryMin
+	}
+}
+
+// runtimeOwnsBlockRoot reports whether the pool runtime attaches qcow disks to
+// the guest as block devices instead of mounting them on the host.
+func (s *Worker) runtimeOwnsBlockRoot() bool {
+	return s.runtime != nil && s.runtime.Capabilities().BlockRoot
+}
+
+// guestDiskFreezer quiesces a qcow disk's filesystem inside the guest before
+// a seal pivots the chain. The root disk is frozen by default; other disks
+// by their guest mount path. A guest that has already exited has nothing to
+// flush, and the runtime reports that as a no-op.
+func (s *Worker) guestDiskFreezer(containerID string, mount *types.Mount) func(context.Context) (func(), error) {
+	mountPath := ""
+	if !isQcowRootDiskMount(mount) {
+		mountPath = mount.MountPath
+	}
+	return func(ctx context.Context) (func(), error) {
+		rt := s.runtime
+		if instance, exists := s.containerInstances.Get(containerID); exists && instance.Runtime != nil {
+			rt = instance.Runtime
+		}
+		freezer, ok := rt.(runtime.DiskFreezer)
+		if !ok {
+			return nil, fmt.Errorf("runtime %s cannot freeze guest disks", rt.Name())
+		}
+		return freezer.FreezeDisk(ctx, containerID, mountPath)
+	}
+}
+
+// annotateExportedDurableDisks tells a block-root runtime which vhost-user
+// sockets to attach and where the guest mounts them. The root disk is the
+// guest's writable layer; the rest are ordered so device names are stable.
+func (s *Worker) annotateExportedDurableDisks(request *types.ContainerRequest, spec *specs.Spec) error {
+	if s.diskManager == nil {
+		return nil
+	}
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	index := 0
+	for i := range request.Mounts {
+		mount := &request.Mounts[i]
+		if !isQcowDurableDiskMount(mount) {
+			continue
+		}
+		volume, ok := s.diskManager.Volume(s.qcowVolumeKey(request, mount))
+		if !ok || volume.ExportSocket() == "" {
+			return fmt.Errorf("qcow durable disk %q is not exported for the microvm", mount.DurableDisk.Name)
+		}
+		if isQcowRootDiskMount(mount) {
+			spec.Annotations[runtime.MicroVMRootDiskAnnotation] = volume.ExportSocket()
+			continue
+		}
+		value := volume.ExportSocket() + ":" + mount.MountPath
+		if mount.ReadOnly {
+			value += ":ro"
+		}
+		spec.Annotations[fmt.Sprintf("%s%03d", runtime.MicroVMDiskAnnotationPrefix, index)] = value
+		index++
+	}
+	return nil
+}
+
+// qcowChainHeadIs reports whether a remembered chain ends at the given
+// published head, i.e. whether it is still the disk's live chain.
+func qcowChainHeadIs(chain []qcowChainEntry, head *types.DiskSnapshot) bool {
+	if len(chain) == 0 || head == nil {
+		return false
+	}
+	return chain[len(chain)-1].row.ExternalId == head.ExternalId
+}
+
+// qcowChainStores returns a read store per generation. Private generations
+// all live in the workspace bucket, so they share one client and connection
+// pool however deep the chain is, rather than paying for AWS config loading
+// and a cold TLS handshake per layer.
+func (s *Worker) qcowChainStores(ctx context.Context, request *types.ContainerRequest, rows []*types.DiskSnapshot) ([]durableDiskSnapshotStore, error) {
+	stores := make([]durableDiskSnapshotStore, len(rows))
+	var private *clients.WorkspaceStorageClient
+	for i, row := range rows {
+		if row.Public {
+			store, err := newDurableDiskSnapshotReadStore(ctx, request, row, s.backendRepoClient)
+			if err != nil {
+				return nil, err
+			}
+			stores[i] = store
+			continue
+		}
+		if private == nil {
+			if err := s.ensureDurableDiskSnapshotStorage(ctx, request); err != nil {
+				return nil, err
+			}
+			client, err := newDurableDiskSnapshotStorageClient(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			private = client
+		}
+		bucket := row.BucketName
+		if bucket == "" {
+			bucket = private.BucketName()
+		}
+		stores[i] = &durableDiskSnapshotBucketStore{client: private, bucket: bucket}
+	}
+	return stores, nil
+}
+
+// loadQcowChainManifests fetches every generation's manifest concurrently:
+// they are independent objects and the chain can be sixteen deep.
+func loadQcowChainManifests(ctx context.Context, cacheReader durableDiskSnapshotCacheReader, rows []*types.DiskSnapshot, stores []durableDiskSnapshotStore) ([]qcowChainEntry, error) {
+	entries := make([]qcowChainEntry, len(rows))
+	loads, ctx := errgroup.WithContext(ctx)
+	for i, row := range rows {
+		loads.Go(func() error {
+			manifest, err := loadDurableDiskSnapshotManifest(ctx, stores[i], cacheReader, row)
+			if err != nil {
+				return fmt.Errorf("load qcow snapshot manifest %s: %w", row.ExternalId, err)
+			}
+			entries[i] = qcowChainEntry{row: row, manifest: manifest}
+			return nil
+		})
+	}
+	if err := loads.Wait(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// qcowChainEntry is one published generation of a volume's live chain.
+type qcowChainEntry struct {
+	row      *types.DiskSnapshot
+	manifest *types.DiskSnapshotManifest
+}
+
+func (s *Worker) qcowChain(key string) []qcowChainEntry {
+	if value, ok := s.qcowChains.Load(key); ok {
+		chain, _ := value.([]qcowChainEntry)
+		return chain
+	}
+	return nil
+}
+
+// appendQcowChain records a newly published generation. A parentless row
+// (first generation or a flattened publish) is self-contained and supersedes
+// the whole previous chain.
+func (s *Worker) appendQcowChain(key string, entry qcowChainEntry) []qcowChainEntry {
+	chain := s.qcowChain(key)
+	if entry.row.ParentSnapshotId == "" {
+		chain = []qcowChainEntry{entry}
+	} else {
+		chain = append(chain, entry)
+	}
+	s.qcowChains.Store(key, chain)
+	return chain
+}
+
+// reportQcowChainContent reports every layer of the live chain tagged with
+// the head generation. The recency index keeps only a disk's newest
+// generation, and qcow layers are deltas: tagging parents with the head
+// generation keeps the whole restore chain protected and locality-replicated
+// until a flatten or newer chain supersedes it, at which point the old chain
+// ages out through the normal recency prune.
+func (s *Worker) reportQcowChainContent(request *types.ContainerRequest, chain []qcowChainEntry) {
+	if len(chain) == 0 {
+		return
+	}
+	head := chain[len(chain)-1].row.Generation
+	for _, entry := range chain {
+		s.reportDurableDiskSnapshotContent(request, entry.row, entry.manifest, head)
+	}
+}
+
+// qcowUploadChunks retains existing object keys for identical chunks in this
+// workspace's bucket, including a fork's parent disk, and returns only the
+// chunks still needing an upload. The full manifest keeps every chunk.
+func (s *Worker) qcowUploadChunks(key string, layer *types.DiskSnapshotFile, bucket string) *types.DiskSnapshotFile {
+	existing := make(map[string]types.DiskSnapshotChunk)
+	for _, entry := range s.qcowChain(key) {
+		if entry.manifest == nil || entry.row.Public || entry.row.BucketName != bucket {
+			continue
+		}
+		for _, file := range entry.manifest.Files {
+			for _, chunk := range file.Chunks {
+				existing[chunk.Digest] = chunk
+			}
+		}
+	}
+	if len(existing) == 0 {
+		return layer
+	}
+	upload := *layer
+	upload.Chunks = nil
+	for i, chunk := range layer.Chunks {
+		if known, ok := existing[chunk.Digest]; ok && chunk.Digest != "" && known.SizeBytes == chunk.SizeBytes {
+			layer.Chunks[i].ObjectKey = known.ObjectKey
+		} else {
+			upload.Chunks = append(upload.Chunks, chunk)
+		}
+	}
+	return &upload
+}
+
+// resolveQcowSnapshotChain walks ParentSnapshotId links from the newest
+// generation (or a seed snapshot for forks) back to a parentless root and
+// returns the rows base first.
+func (s *Worker) resolveQcowSnapshotChain(ctx context.Context, request *types.ContainerRequest, mount *types.Mount, newest *types.DiskSnapshot) ([]*types.DiskSnapshot, error) {
+	if (newest == nil || newest.ManifestKey == "") && mount.DurableDisk.SourceSnapshotId != "" {
+		// Fork: seed a brand new disk from another disk's snapshot chain.
+		seed, err := s.seedDurableDiskSnapshot(ctx, request, mount)
+		if err != nil {
+			return nil, err
+		}
+		newest = seed
+	}
+	if newest == nil || newest.ManifestKey == "" {
+		return nil, nil
+	}
+
+	var rows []*types.DiskSnapshot
+	row := newest
+	for {
+		if row.Format != types.DiskSnapshotFormatQcowV1 {
+			return nil, fmt.Errorf("disk %q has snapshot %s in format %q; the qcow driver cannot restore it",
+				mount.DurableDisk.Name, row.ExternalId, row.Format)
+		}
+		rows = append(rows, row)
+		if row.ParentSnapshotId == "" {
+			break
+		}
+		if len(rows) > disk.DefaultMaxChainDepth {
+			return nil, fmt.Errorf("disk %q snapshot chain exceeds %d generations", mount.DurableDisk.Name, disk.DefaultMaxChainDepth)
+		}
+		parent, err := s.diskSnapshotByID(ctx, request, row.ParentSnapshotId)
+		if err != nil {
+			return nil, fmt.Errorf("resolve qcow snapshot parent %s: %w", row.ParentSnapshotId, err)
+		}
+		row = parent
+		if row == nil || row.ManifestKey == "" {
+			return nil, fmt.Errorf("qcow snapshot parent %s is missing", rows[len(rows)-1].ParentSnapshotId)
+		}
+	}
+	// Reverse into base-first order.
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows, nil
+}
+
+func qcowManifestLayer(manifest *types.DiskSnapshotManifest) (*types.DiskSnapshotFile, error) {
+	if manifest == nil || manifest.Format != types.DiskSnapshotFormatQcowV1 {
+		return nil, fmt.Errorf("manifest is not %s", types.DiskSnapshotFormatQcowV1)
+	}
+	if len(manifest.Files) != 1 || manifest.Files[0].Path != disk.LayerFileName {
+		return nil, fmt.Errorf("manifest does not contain exactly one %s entry", disk.LayerFileName)
+	}
+	return &manifest.Files[0], nil
+}
+
+func qcowChainVirtualSize(manifests []*types.DiskSnapshotManifest) int64 {
+	var size int64
+	for _, manifest := range manifests {
+		size = max(size, manifest.LogicalSizeBytes)
+	}
+	return size
+}
+
+// snapshotQcowDurableDiskMount seals the volume and publishes every pending
+// layer, oldest first, as ordinary DiskSnapshot generations.
+func (s *Worker) snapshotQcowDurableDiskMount(ctx context.Context, request *types.ContainerRequest, mount *types.Mount, mode durableDiskSyncMode) (*types.DiskSnapshot, error) {
+	if mount.ReadOnly {
+		return nil, nil
+	}
+	key := s.qcowVolumeKey(request, mount)
+	volume, ok := s.diskManager.Volume(key)
+	if !ok {
+		return nil, fmt.Errorf("qcow durable disk %q is not attached", mount.DurableDisk.Name)
+	}
+	if mode == durableDiskSyncFailed && volume.Journaled() {
+		log.Info().Str("container_id", request.ContainerId).Str("disk", mount.DurableDisk.Name).
+			Msg("container failed; its disk writes stay in the journal without a new generation")
+		return nil, nil
+	}
+
+	if err := s.ensureDurableDiskSnapshotStorage(ctx, request); err != nil {
+		return nil, err
+	}
+	store, err := newDurableDiskSnapshotWriteStore(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	latest, err := s.latestQcowSnapshotRow(ctx, request, mount)
+	if err != nil {
+		return nil, err
+	}
+
+	var published *types.DiskSnapshot
+	publish := func(sealed []disk.SealedLayer) error {
+		parentID := sealed[0].ParentSnapshotID
+		for _, layer := range sealed {
+			row, manifest, err := s.publishQcowLayer(ctx, request, mount, volume, store, layer.Path, parentID, latest)
+			if err != nil {
+				return err
+			}
+			if err := volume.MarkPublished(layer.Path, row.ExternalId); err != nil {
+				if errors.Is(err, disk.ErrNotCheckpointed) {
+					s.withdrawQcowSnapshot(ctx, request, row, err)
+				}
+				return err
+			}
+			s.reportQcowChainContent(request, s.appendQcowChain(key, qcowChainEntry{row: row, manifest: manifest}))
+			published, latest, parentID = row, row, row.ExternalId
+		}
+		return nil
+	}
+	if err := snapshotQcowVolume(ctx, volume, mode, latest == nil, publish); err != nil {
+		return published, err
+	}
+	// A flatten can overtake a background merge, leaving fewer published
+	// layers than local ones even below the normal compaction threshold.
+	if !volume.Journaled() && len(s.qcowChain(key))+1 < volume.Depth() {
+		if err := volume.Compact(ctx); err != nil {
+			log.Warn().Err(err).Msg("failed to compact qcow backing chain")
+		}
+	}
+	if mode == durableDiskSyncExplicit && !volume.Journaled() {
+		s.scheduleQcowMerge(request, mount, key)
+	}
+	return latest, nil
+}
+
+type qcowSnapshotVolume interface {
+	Unpublished(context.Context) ([]disk.SealedLayer, error)
+	Seal(context.Context, bool) ([]disk.SealedLayer, bool, error)
+	Compact(context.Context) error
+	Depth() int
+	Journaled() bool
+}
+
+// Drain failed publications before another pivot can fill the local chain.
+// Explicit and final snapshots must also capture the current head: publishing
+// a backlog alone would omit writes made since the last successful seal.
+func snapshotQcowVolume(ctx context.Context, volume qcowSnapshotVolume, mode durableDiskSyncMode, force bool, publish func([]disk.SealedLayer) error) error {
+	checkpoint := func(sealed []disk.SealedLayer) error {
+		if err := publish(sealed); err != nil {
+			return err
+		}
+		// Compaction collapses the local chain behind a flattened publish; a
+		// disk that merges flattens only at the forced depth.
+		compactDepth := disk.DefaultMaxChainDepth / 2
+		if volume.Journaled() {
+			compactDepth = disk.DefaultFlattenDepth
+		}
+		if volume.Depth() > compactDepth {
+			if err := volume.Compact(ctx); err != nil {
+				log.Warn().Err(err).Msg("failed to compact qcow backing chain")
+			}
+		}
+		return nil
+	}
+	pending, err := volume.Unpublished(ctx)
+	if err != nil {
+		return err
+	}
+	if len(pending) > 0 {
+		if err := checkpoint(pending); err != nil {
+			return err
+		}
+		if mode == durableDiskSyncCheckpoint {
+			return nil
+		}
+		force = false // Publishing the backlog established the first generation.
+	}
+	sealed, skipped, err := sealQcowVolume(ctx, volume, force)
+	if err != nil || skipped {
+		return err
+	}
+	return checkpoint(sealed)
+}
+
+// sealQcowVolume seals the volume, compacting first when its chain is at the
+// depth cap: compaction follows each publish, so nothing else would retry the
+// failed ones that left it there.
+func sealQcowVolume(ctx context.Context, volume qcowSnapshotVolume, force bool) ([]disk.SealedLayer, bool, error) {
+	sealed, skipped, err := volume.Seal(ctx, force)
+	if !errors.Is(err, disk.ErrMaxChainDepth) {
+		return sealed, skipped, err
+	}
+	if err := volume.Compact(ctx); err != nil {
+		return nil, false, err
+	}
+	return volume.Seal(ctx, force)
+}
+
+const qcowSnapshotWithdrawTimeout = 30 * time.Second
+
+// withdrawQcowSnapshot marks failed a generation its journal never recorded,
+// or one a merge created before failing to publish. As an available row it
+// could stand as the disk's latest generation, and every later publish would
+// fork the chain around it. A checkpoint that did commit despite its error
+// stays restorable: attach looks up the journal's snapshot by ID, whatever
+// its status.
+func (s *Worker) withdrawQcowSnapshot(ctx context.Context, request *types.ContainerRequest, row *types.DiskSnapshot, cause error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), qcowSnapshotWithdrawTimeout)
+	defer cancel()
+	_, err := handleGRPCResponse(s.backendRepoClient.FailDiskSnapshot(ctx, &pb.FailDiskSnapshotRequest{
+		WorkspaceId: cacheRequestWorkspaceID(request),
+		SnapshotId:  row.ExternalId,
+		Reason:      cause.Error(),
+	}))
+	if err != nil {
+		log.Warn().Err(err).Str("container_id", request.ContainerId).Str("disk", row.DiskName).
+			Str("snapshot_id", row.ExternalId).Msg("failed to withdraw a qcow snapshot")
+	}
+}
+
+// A warm VM restores the immutable disk head paired with RAM. Consulting the
+// latest head here would race a publication after gateway validation.
+func (s *Worker) restoreQcowSnapshotRow(ctx context.Context, request *types.ContainerRequest, mount *types.Mount) (*types.DiskSnapshot, error) {
+	if !request.IsPersistentVM() || request.Checkpoint == nil {
+		return s.latestQcowSnapshotRow(ctx, request, mount)
+	}
+	id := mount.DurableDisk.SourceSnapshotId
+	if id == "" {
+		return nil, fmt.Errorf("VM memory checkpoint has no paired disk %s", mount.DurableDisk.Name)
+	}
+	row, err := s.diskSnapshotByID(ctx, request, id)
+	if err != nil {
+		return nil, fmt.Errorf("get paired VM disk snapshot: %w", err)
+	}
+	if row == nil || row.ExternalId != id || row.DiskName != mount.DurableDisk.Name || row.ManifestKey == "" || row.Format != types.DiskSnapshotFormatQcowV1 {
+		return nil, fmt.Errorf("paired VM disk snapshot %s is unavailable or incompatible", id)
+	}
+	return row, nil
+}
+
+func (s *Worker) latestQcowSnapshotRow(ctx context.Context, request *types.ContainerRequest, mount *types.Mount) (*types.DiskSnapshot, error) {
+	resp, err := handleGRPCResponse(s.backendRepoClient.GetLatestDiskSnapshot(ctx, &pb.GetLatestDiskSnapshotRequest{
+		WorkspaceId: cacheRequestWorkspaceID(request),
+		DiskName:    mount.DurableDisk.Name,
+	}))
+	if err != nil {
+		if durableDiskSnapshotNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get latest qcow disk snapshot: %w", err)
+	}
+	if resp == nil {
+		return nil, nil
+	}
+	return durableDiskSnapshotFromProto(resp.Snapshot), nil
+}
+
+// flattenQcowChain reports whether a publish at this published chain depth
+// uploads the whole flattened chain instead of the sealed layer. A backlogged
+// journal keeps growing until the publish lands, so it publishes the small
+// layer and defers the flatten, though never past half the chain attach
+// accepts.
+func flattenQcowChain(depth int, backlogged bool) bool {
+	if depth+1 < disk.DefaultFlattenDepth {
+		return false
+	}
+	return !backlogged || flattenQcowChainForced(depth)
+}
+
+func flattenQcowChainForced(depth int) bool {
+	return depth+1 >= disk.DefaultMaxChainDepth/2
+}
+
+// errQcowFlattenDeferred cancels a flatten that would hold up the checkpoint
+// its journal has come to want.
+var errQcowFlattenDeferred = errors.New("the journal wants another checkpoint")
+
+const qcowFlattenBacklogPoll = time.Second
+
+// untilBacklogged derives a context canceled with errQcowFlattenDeferred once
+// the volume's journal takes enough writes to want another checkpoint. A
+// flatten copies the whole disk; one under way when writes pick up would
+// otherwise keep them waiting for room until it finished.
+func untilBacklogged(ctx context.Context, backlogged func() bool) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	go func() {
+		ticker := time.NewTicker(qcowFlattenBacklogPoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if backlogged() {
+					cancel(errQcowFlattenDeferred)
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() { cancel(context.Canceled) }
+}
+
+// publishQcowLayer uploads one sealed layer (or its flattened chain when the
+// published chain is deep) plus its manifest, then creates the repository row.
+// The manifest upload is the durability boundary, mirroring the dir.v1 driver.
+func (s *Worker) publishQcowLayer(ctx context.Context, request *types.ContainerRequest, mount *types.Mount, volume *disk.Volume, store *durableDiskSnapshotBucketStore, sealedPath, parentID string, latest *types.DiskSnapshot) (*types.DiskSnapshot, *types.DiskSnapshotManifest, error) {
+	key := s.qcowVolumeKey(request, mount)
+	depth := len(s.qcowChain(key))
+
+	var layer *types.DiskSnapshotFile
+	// Merges bound any other disk's chain, so only a journaled one flattens
+	// short of the forced depth.
+	flatten := flattenQcowChainForced(depth)
+	if volume.Journaled() {
+		flatten = flattenQcowChain(depth, volume.Backlogged())
+	} else if flatten && depth+1 < disk.DefaultMaxChainDepth {
+		// A committed merge still uploading will shorten this chain. Keep
+		// publishing deltas while that result remains within the restore cap.
+		layers, _ := volume.Published()
+		if merged, ok := qcowMergedLayer(layers, s.qcowChain(key)); ok && merged >= 0 {
+			flatten = false
+		}
+	}
+	if parentID != "" && flatten {
+		// Publish a parentless flattened generation so restore chains stay
+		// short. The local chain is untouched; only the artifact differs.
+		flatPath := sealedPath + ".flat"
+		defer os.Remove(flatPath)
+		flatCtx, stop := ctx, func() {}
+		if !flattenQcowChainForced(depth) {
+			flatCtx, stop = untilBacklogged(ctx, volume.Backlogged)
+		}
+		flat, err := s.uploadFlattenedQcowLayer(flatCtx, mount, volume, store, key, sealedPath, flatPath)
+		stop()
+		switch {
+		case err == nil:
+			layer, parentID = flat, ""
+		case errors.Is(context.Cause(flatCtx), errQcowFlattenDeferred):
+			log.Info().Str("disk", mount.DurableDisk.Name).Int("depth", depth+1).
+				Msg("deferred flattening the qcow chain; the journal wants another checkpoint")
+		default:
+			return nil, nil, err
+		}
+	}
+	if layer == nil {
+		var err error
+		if layer, err = s.uploadQcowLayer(ctx, mount, store, key, sealedPath); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	generation, err := nextDurableDiskSnapshotGeneration(time.Now().UnixNano(), latest)
+	if err != nil {
+		return nil, nil, err
+	}
+	sizeBytes, _ := durableDiskSizeBytes(mount.DurableDisk.Size)
+	return s.createQcowGeneration(ctx, request, mount, store, layer, parentID, generation, sizeBytes, volume.Check)
+}
+
+// createQcowGeneration publishes a layer whose chunks are in the bucket: its
+// manifest, then its repository row unless check fails in between.
+func (s *Worker) createQcowGeneration(ctx context.Context, request *types.ContainerRequest, mount *types.Mount, store *durableDiskSnapshotBucketStore, layer *types.DiskSnapshotFile, parentID string, generation, sizeBytes int64, check func() error) (*types.DiskSnapshot, *types.DiskSnapshotManifest, error) {
+	manifest := &types.DiskSnapshotManifest{
+		Version:          1,
+		Format:           types.DiskSnapshotFormatQcowV1,
+		DiskName:         mount.DurableDisk.Name,
+		Filesystem:       types.DiskFilesystemExt4,
+		Generation:       generation,
+		ParentSnapshotId: parentID,
+		LogicalSizeBytes: sizeBytes,
+		StoredSizeBytes:  disk.StoredBytes(layer),
+		Files:            []types.DiskSnapshotFile{*layer},
+		CreatedAt:        time.Now().UTC(),
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return nil, nil, err
+	}
+	manifestDigest := sha256.Sum256(manifestBytes)
+	objectPrefix := durableDiskSnapshotObjectPrefix(mount, generation)
+	manifestKey := path.Join(objectPrefix, durableDiskManifestFileName)
+	if err := store.Upload(ctx, manifestKey, manifestBytes); err != nil {
+		return nil, nil, fmt.Errorf("upload qcow snapshot manifest: %w", err)
+	}
+
+	snapshot := &types.DiskSnapshot{
+		DiskName:            mount.DurableDisk.Name,
+		Format:              types.DiskSnapshotFormatQcowV1,
+		Status:              types.DiskSnapshotStatusAvailable,
+		ParentSnapshotId:    parentID,
+		Generation:          generation,
+		SizeBytes:           sizeBytes,
+		Filesystem:          types.DiskFilesystemExt4,
+		Driver:              types.DurableDiskDriverQcow,
+		ManifestKey:         manifestKey,
+		ManifestDigest:      "sha256:" + hex.EncodeToString(manifestDigest[:]),
+		ManifestSizeBytes:   int64(len(manifestBytes)),
+		ChunkCount:          int64(len(layer.Chunks)),
+		LogicalSizeBytes:    sizeBytes,
+		StoredSizeBytes:     disk.StoredBytes(layer),
+		BucketName:          store.bucket,
+		ObjectPrefix:        objectPrefix,
+		SourcePool:          s.poolName,
+		SourceWorkerId:      s.workerId,
+		SourceStorageNodeId: s.storageNodeID(),
+	}
+	// A journal that failed during the upload can no longer checkpoint this
+	// layer, so it gets no row. One that fails after this check has its row
+	// withdrawn once the checkpoint is refused.
+	if err := check(); err != nil {
+		return nil, nil, err
+	}
+	resp, err := handleGRPCResponse(s.backendRepoClient.CreateDiskSnapshot(ctx, &pb.CreateDiskSnapshotRequest{
+		WorkspaceId: cacheRequestWorkspaceID(request),
+		StubId:      cacheRequestStubID(request),
+		Snapshot:    durableDiskSnapshotToProto(snapshot),
+	}))
+	if err != nil {
+		return nil, nil, err
+	}
+	if created := durableDiskSnapshotFromProto(resp.Snapshot); created != nil {
+		snapshot = created
+	}
+	reportDurableDiskProgress(ctx, durableDiskProgressEvent{})
+	return snapshot, manifest, nil
+}
+
+func (s *Worker) uploadFlattenedQcowLayer(ctx context.Context, mount *types.Mount, volume *disk.Volume, store *durableDiskSnapshotBucketStore, key, sealedPath, flatPath string) (*types.DiskSnapshotFile, error) {
+	if err := volume.Flatten(ctx, sealedPath, flatPath); err != nil {
+		return nil, fmt.Errorf("flatten qcow chain: %w", err)
+	}
+	return s.uploadQcowLayer(ctx, mount, store, key, flatPath)
+}
+
+// uploadQcowLayer chunks a qcow image and uploads the chunks the published
+// chain does not already hold.
+func (s *Worker) uploadQcowLayer(ctx context.Context, mount *types.Mount, store *durableDiskSnapshotBucketStore, key, imagePath string) (*types.DiskSnapshotFile, error) {
+	chunkPrefix := durableDiskChunkPrefix(mount)
+	layer, err := disk.ScanLayer(ctx, imagePath, func(digest string) string {
+		return path.Join(chunkPrefix, strings.TrimPrefix(digest, "sha256:"))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan qcow layer: %w", err)
+	}
+
+	upload := s.qcowUploadChunks(key, layer, store.bucket)
+	sink := &qcowChunkSink{ctx: ctx, store: store}
+	if err := disk.UploadLayer(ctx, sink, imagePath, upload); err != nil {
+		return nil, err
+	}
+	if skipped := len(layer.Chunks) - len(upload.Chunks); skipped > 0 {
+		log.Info().Str("disk", mount.DurableDisk.Name).Int("skipped", skipped).Int("total", len(layer.Chunks)).
+			Msg("skipped qcow chunks already present in the bucket")
+	}
+	return layer, nil
+}
+
+// detachQcowDurableDiskMount takes the volume offline at the container's
+// durability boundary. Local layers stay cached for the next attachment.
+func (s *Worker) detachQcowDurableDiskMount(ctx context.Context, request *types.ContainerRequest, mount *types.Mount) error {
+	if s.diskManager == nil {
+		return nil
+	}
+	return s.diskManager.DetachOwned(ctx, s.qcowVolumeKey(request, mount), request.ContainerId)
+}
+
+// qcowChunkSink adapts the workspace bucket store, reporting progress so the
+// sync inactivity watchdog sees upload activity.
+type qcowChunkSink struct {
+	ctx   context.Context
+	store *durableDiskSnapshotBucketStore
+}
+
+func (s *qcowChunkSink) WriteChunk(ctx context.Context, key string, data []byte) error {
+	if err := s.store.Upload(ctx, key, data); err != nil {
+		return err
+	}
+	reportDurableDiskProgress(s.ctx, durableDiskProgressEvent{chunks: 1, logicalBytes: int64(len(data))})
+	return nil
+}
+
+// qcowChunkSource reads chunks through the node-local content cache when
+// possible and falls back to the snapshot stores otherwise. This is the same
+// required-content sync path the directory driver uses, so warm nodes restore
+// and fork without touching object storage.
+type qcowChunkSource struct {
+	cacheReader durableDiskSnapshotCacheReader
+	stores      []durableDiskSnapshotStore
+}
+
+const qcowChunkReadAttempts = 3
+
+func (s *qcowChunkSource) ReadChunk(ctx context.Context, chunk types.DiskSnapshotChunk, dest []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	hash := strings.TrimPrefix(chunk.Digest, "sha256:")
+	if s.cacheReader != nil && hash != "" {
+		read, err := s.cacheReader.ReadContentInto(ctx, hash, 0, dest, cache.ClientOptions{})
+		if err == nil && read == int64(len(dest)) {
+			return ctx.Err()
+		}
+	}
+	var lastErr error = fmt.Errorf("no stores available for chunk %s", chunk.ObjectKey)
+	for _, store := range s.stores {
+		for attempt := 1; attempt <= qcowChunkReadAttempts; attempt++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			reader, err := store.DownloadWithReader(ctx, chunk.ObjectKey)
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
+				lastErr = err
+				break
+			}
+			// Restart into the whole destination; fetchLayer verifies its SHA.
+			read, err := io.ReadFull(reader, dest)
+			reader.Close()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err == nil {
+				return nil
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			lastErr = fmt.Errorf("read chunk attempt %d: %d/%d bytes: %w", attempt, read, len(dest), err)
+			if attempt == qcowChunkReadAttempts || !retryableStorageBodyRead(err) {
+				break
+			}
+			if err := waitForRetry(ctx, time.Duration(attempt)*100*time.Millisecond); err != nil {
+				return err
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return lastErr
+}
+
+func retryableStorageBodyRead(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
+}

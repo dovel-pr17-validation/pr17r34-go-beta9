@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+option go_package = "github.com/beam-cloud/beta9/proto";
+import "types.proto";
+
+service ContainerRepositoryService {
+  rpc GetContainerState(GetContainerStateRequest)
+      returns (GetContainerStateResponse);
+  rpc DeleteContainerState(DeleteContainerStateRequest)
+      returns (DeleteContainerStateResponse);
+  rpc UpdateContainerStatus(UpdateContainerStatusRequest)
+      returns (UpdateContainerStatusResponse);
+  rpc SetContainerExitCode(SetContainerExitCodeRequest)
+      returns (SetContainerExitCodeResponse);
+  rpc SetContainerAddress(SetContainerAddressRequest)
+      returns (SetContainerAddressResponse);
+  rpc SetContainerAddressMap(SetContainerAddressMapRequest)
+      returns (SetContainerAddressMapResponse);
+  rpc GetContainerAddressMap(GetContainerAddressMapRequest)
+      returns (GetContainerAddressMapResponse);
+  rpc SetWorkerAddress(SetWorkerAddressRequest)
+      returns (SetWorkerAddressResponse);
+}
+
+message GetContainerStateRequest { string container_id = 1; }
+
+message GetContainerStateResponse {
+  bool ok = 1;
+  string container_id = 2;
+  types.ContainerState state = 3;
+  string error_msg = 4;
+}
+
+message DeleteContainerStateRequest { string container_id = 1; }
+
+message DeleteContainerStateResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message UpdateContainerStatusRequest {
+  string container_id = 1;
+  string status = 2;
+  int64 expiry_seconds = 3;
+}
+
+message UpdateContainerStatusResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  // status is the persisted status after the update. It differs from the
+  // requested status when the transition was refused (STOPPING is terminal).
+  string status = 3;
+}
+
+message SetContainerExitCodeRequest {
+  string container_id = 1;
+  int32 exit_code = 2;
+}
+
+message SetContainerExitCodeResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message SetContainerAddressRequest {
+  string container_id = 1;
+  string address = 2;
+  BackendRoute route = 3;
+}
+
+message SetContainerAddressResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message SetContainerAddressMapRequest {
+  string container_id = 1;
+  map<int32, string> address_map = 2;
+  repeated BackendRoute routes = 3;
+  int32 primary_port = 4;
+}
+
+message SetContainerAddressMapResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message GetContainerAddressMapRequest { string container_id = 1; }
+
+message GetContainerAddressMapResponse {
+  bool ok = 1;
+  map<int32, string> address_map = 2;
+  string error_msg = 3;
+}
+
+message SetWorkerAddressRequest {
+  string container_id = 1;
+  string address = 2;
+  BackendRoute route = 3;
+}
+
+message SetWorkerAddressResponse {
+  bool ok = 1;
+  string error_msg = 2;
+}
+
+message BackendRoute {
+  string route_id = 1;
+  string workspace_id = 2;
+  string pool_name = 3;
+  string machine_id = 4;
+  string worker_id = 5;
+  string container_id = 6;
+  string kind = 7;
+  int32 port = 8;
+  string protocol = 9;
+  string transport = 10;
+  string local_target = 11;
+  string proxy_target = 12;
+  string state = 13;
+  string error = 14;
+  int64 updated_at = 15;
+}

@@ -1,0 +1,30 @@
+# Staging hot reload using the deployed image's Go toolchain.
+# make start-stage selects the current staging image; no custom build is needed.
+# Private module caches can be seeded in ignored hack/stage/gomodcache.
+# Use the deployment's mounted staging configuration and Helm overlays.
+# A copied local configuration can select incompatible worker images or storage.
+dev:
+  beta9-gateway:
+    image: ${STAGE_GATEWAY_IMAGE}
+    command:
+    - sh
+    - -c
+    - exec /workspace/bin/hotreload.sh >/proc/1/fd/1 2>&1
+    sync:
+    - ../:/workspace
+    environment:
+      BUILD_COMMAND: >-
+        mkdir -p /tmp/beta9-dev/gomodcache &&
+        while [ ! -f /workspace/hack/stage/gomodcache.tar ]; do sleep 1; done &&
+        tar -xf /workspace/hack/stage/gomodcache.tar -C /tmp/beta9-dev/gomodcache &&
+        go build -o /tmp/beta9-dev/gateway /workspace/cmd/gateway/main.go
+      BUILD_BINARY_PATH: /tmp/beta9-dev/gateway
+      CONFIG_PATH: /etc/beta9/config.yaml
+      GOMODCACHE: /tmp/beta9-dev/gomodcache
+      GONOSUMDB: github.com/beam-cloud/*
+      GOTOOLCHAIN: auto
+    forward:
+    - 11993:1993
+    - 11994:1994
+    persistentVolume:
+      enabled: false
